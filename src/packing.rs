@@ -1,4 +1,6 @@
-use std::{arch::x86_64::*, time::Instant};
+#[cfg(target_feature = "avx512f")]
+use std::arch::x86_64::*;
+use std::time::Instant;
 
 use log::debug;
 
@@ -678,6 +680,7 @@ pub fn fast_add_into(res: &mut PolyMatrixNTT, a: &PolyMatrixNTT) {
     }
 }
 
+#[cfg(target_feature = "avx512f")]
 pub fn fast_multiply_no_reduce(
     params: &Params,
     res: &mut PolyMatrixNTT,
@@ -728,6 +731,51 @@ pub fn fast_multiply_no_reduce(
     }
 }
 
+#[cfg(not(target_feature = "avx512f"))]
+pub fn fast_multiply_no_reduce(
+    params: &Params,
+    res: &mut PolyMatrixNTT,
+    a: &PolyMatrixNTT,
+    b: &PolyMatrixNTT,
+    _start_inner_dim: usize,
+) {
+    assert_eq!(res.rows, a.rows);
+    assert_eq!(res.cols, b.cols);
+    assert_eq!(res.rows, 1);
+    assert_eq!(res.cols, 1);
+
+    assert_eq!(a.cols, b.rows);
+    assert_eq!(params.crt_count * params.poly_len, 2 * 2048);
+
+    // Fallback scalar implementation
+    let a_slc = a.as_slice();
+    let b_slc = b.as_slice();
+    let res_slc = res.as_mut_slice();
+    let pol_sz = params.poly_len;
+
+    // Zero out result
+    for i in 0..res_slc.len() {
+        res_slc[i] = 0;
+    }
+
+    for k in 0..a.cols {
+        for idx in 0..pol_sz {
+            let a_val = a_slc[k * 2 * pol_sz + idx];
+            let b_val = b_slc[k * 2 * pol_sz + idx];
+
+            // Split into low and high 32 bits
+            let a_lo = a_val & 0xFFFFFFFF;
+            let a_hi = a_val >> 32;
+            let b_lo = b_val & 0xFFFFFFFF;
+            let b_hi = b_val >> 32;
+
+            // Multiply and accumulate
+            res_slc[idx] = res_slc[idx].wrapping_add(a_lo.wrapping_mul(b_lo));
+            res_slc[pol_sz + idx] = res_slc[pol_sz + idx].wrapping_add(a_hi.wrapping_mul(b_hi));
+        }
+    }
+}
+
 pub fn condense_matrix<'a>(params: &'a Params, a: &PolyMatrixNTT<'a>) -> PolyMatrixNTT<'a> {
     let mut res = PolyMatrixNTT::zero(params, a.rows, a.cols);
     for i in 0..a.rows {
@@ -757,6 +805,7 @@ pub fn uncondense_matrix<'a>(params: &'a Params, a: &PolyMatrixNTT<'a>) -> PolyM
     res
 }
 
+#[cfg(target_feature = "avx512f")]
 pub fn multiply_add_poly_avx(_params: &Params, res: &mut [u64], a: &[u64], b: &[u64]) {
     unsafe {
         let a_ptr = a.as_ptr();
@@ -779,6 +828,15 @@ pub fn multiply_add_poly_avx(_params: &Params, res: &mut [u64], a: &[u64], b: &[
     }
 }
 
+#[cfg(not(target_feature = "avx512f"))]
+pub fn multiply_add_poly_avx(_params: &Params, res: &mut [u64], a: &[u64], b: &[u64]) {
+    for i in 0..res.len() {
+        let product = (a[i] & 0xFFFFFFFF).wrapping_mul(b[i] & 0xFFFFFFFF);
+        res[i] = res[i].wrapping_add(product);
+    }
+}
+
+#[cfg(target_feature = "avx512f")]
 pub fn multiply_poly_avx(_params: &Params, res: &mut [u64], a: &[u64], b: &[u64]) {
     unsafe {
         let a_ptr = a.as_ptr();
@@ -797,6 +855,13 @@ pub fn multiply_poly_avx(_params: &Params, res: &mut [u64], a: &[u64], b: &[u64]
 
             _mm512_store_si512(p_z as *mut _, product);
         }
+    }
+}
+
+#[cfg(not(target_feature = "avx512f"))]
+pub fn multiply_poly_avx(_params: &Params, res: &mut [u64], a: &[u64], b: &[u64]) {
+    for i in 0..res.len() {
+        res[i] = (a[i] & 0xFFFFFFFF).wrapping_mul(b[i] & 0xFFFFFFFF);
     }
 }
 

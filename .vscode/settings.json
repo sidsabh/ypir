@@ -5,5 +5,8 @@
   ],
   "rust-analyzer.runnables.extraEnv": {
     "RUST_LOG": "debug"
+  },
+  "files.watcherExclude": {
+    "**/target": true
   }
 }

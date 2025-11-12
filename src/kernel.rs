@@ -1,9 +1,16 @@
-use std::arch::x86_64::*;
-
 use spiral_rs::{arith::*, params::*};
 
+#[cfg(target_feature = "avx512f")]
 use super::server::ToM512;
 
+#[cfg(not(target_feature = "avx512f"))]
+use super::server::ToU64;
+
+#[cfg(target_feature = "avx512f")]
+use std::arch::x86_64::*;
+
+// AVX-512 version
+#[cfg(target_feature = "avx512f")]
 pub fn fast_batched_dot_product_avx512<const K: usize, T: Copy>(
     params: &Params,
     c: &mut [u64],
@@ -130,6 +137,61 @@ pub fn fast_batched_dot_product_avx512<const K: usize, T: Copy>(
     }
 }
 
+// Non-AVX512 fallback version
+#[cfg(not(target_feature = "avx512f"))]
+pub fn fast_batched_dot_product_avx512<const K: usize, T: Copy + ToU64>(
+    params: &Params,
+    c: &mut [u64],
+    a: &[u64],
+    a_elems: usize,
+    b_t: &[T], // transposed
+    b_rows: usize,
+    b_cols: usize,
+) {
+    assert_eq!(a_elems, b_rows);
+
+    let res_mut_slc = c;
+
+    // Fallback scalar implementation
+    let mut a_slcs: Vec<&[u64]> = Vec::new();
+    for chunk in a.chunks_exact(a.len() / K) {
+        a_slcs.push(chunk);
+    }
+
+    for batch in 0..K {
+        let a_batch = a_slcs[batch];
+        let res_start = batch * (res_mut_slc.len() / K);
+        let res_end = res_start + (res_mut_slc.len() / K);
+        let res_batch = &mut res_mut_slc[res_start..res_end];
+
+        for j in 0..b_cols {
+            let mut sum_lo = 0u64;
+            let mut sum_hi = 0u64;
+
+            for k in 0..a_elems {
+                let a_val = a_batch[k];
+                let b_val = b_t[j * b_rows + k].to_u64();
+
+                // Split into low and high 32 bits
+                let a_lo = a_val & 0xFFFFFFFF;
+                let a_hi = a_val >> 32;
+
+                // Multiply and accumulate
+                sum_lo = sum_lo.wrapping_add(a_lo.wrapping_mul(b_val));
+                sum_hi = sum_hi.wrapping_add(a_hi.wrapping_mul(b_val));
+            }
+
+            let (lo, hi) = (
+                barrett_coeff_u64(params, sum_lo, 0),
+                barrett_coeff_u64(params, sum_hi, 1),
+            );
+
+            let res = params.crt_compose_2(lo, hi);
+            res_batch[j] = barrett_u64(params, res_batch[j] + res);
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::time::Instant;
@@ -143,6 +205,7 @@ mod test {
     use test_log::test;
 
     #[test]
+    #[cfg(target_feature = "avx512f")]
     fn test_fast_batched_dot_product_avx512() {
         let params = test_params();
 

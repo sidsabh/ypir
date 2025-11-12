@@ -1,4 +1,4 @@
-#![feature(stdarch_x86_avx512)]
+#![cfg_attr(target_feature = "avx512f", feature(stdarch_x86_avx512))]
 
 pub mod bits;
 pub mod client;

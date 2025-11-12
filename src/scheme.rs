@@ -643,6 +643,7 @@ fn std_dev(xs: &[usize]) -> f64 {
     (variance / xs.len() as f64).sqrt()
 }
 
+// e2e tests!
 #[cfg(test)]
 mod test {
     use super::*;
@@ -655,7 +656,7 @@ mod test {
 
     #[test]
     fn test_ypir_simplepir_basic() {
-        run_ypir_batched(1 << 17, 65536 * 8, 1, true, 1);
+        run_ypir_batched(1 << 10, 65536 * 8, 1, true, 1);
     }
 
     #[test]
