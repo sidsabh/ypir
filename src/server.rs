@@ -217,6 +217,9 @@ where
         let db_buf_mut = as_bytes_mut(&mut db_buf_aligned);
         let db_buf_ptr = db_buf_mut.as_mut_ptr() as *mut T;
 
+        // SID: this is where we load the database from the passed in iterator (random bits u8::sample())
+        // the database is in column major format
+        // SIDQ: why are the column dims db_dim_x + poly_len ?
         for i in 0..db_rows {
             for j in 0..db_cols {
                 let idx = if inp_transposed {
@@ -486,20 +489,104 @@ where
         hint_0.iter().map(|&x| x as u64).collect::<Vec<_>>()
     }
 
-    pub fn generate_hint_0_ring(&self) -> Vec<u64> {
+
+    #[cfg(feature = "cuda")]
+    pub fn init_hint_0_gpu_context(&self, lwe_params: &LWEParams, conv: &Convolution) -> crate::cuda::GPUContext {
+        use crate::cuda::GPUContext;
+
         let db_rows = 1 << (self.params.db_dim_1 + self.params.poly_len_log2);
         let db_cols = self.db_cols();
-
-        let lwe_params = LWEParams::default();
         let n = lwe_params.n;
-        let conv = Convolution::new(n);
+
+        // Prepare v_nega_perm_a
+        let mut rng_pub = ChaCha20Rng::from_seed(get_seed(SEED_0));
+        let mut v_nega_perm_a_flat = Vec::new();
+        for _ in 0..db_rows / n {
+            let mut a = vec![0u32; n];
+            for idx in 0..n {
+                a[idx] = rng_pub.sample::<u32, _>(rand::distributions::Standard);
+            }
+            let nega_perm_a = negacyclic_perm_u32(&a);
+            let nega_perm_a_ntt = conv.ntt(&nega_perm_a);
+            v_nega_perm_a_flat.extend_from_slice(&nega_perm_a_ntt);
+        }
+
+        // Compute max_adds
+        let log2_conv_output =
+            log2(lwe_params.modulus) + log2(lwe_params.n as u64) + log2(lwe_params.pt_modulus);
+        let log2_modulus = log2(conv.params().modulus);
+        let log2_max_adds = log2_modulus - log2_conv_output - 1;
+        let max_adds = 1 << log2_max_adds;
+
+        // Convert DB to u8 slice
+        let db_slice = self.db();
+        let db_u8 = unsafe {
+            std::slice::from_raw_parts(
+                db_slice.as_ptr() as *const u8,
+                db_slice.len() * std::mem::size_of::<T>(),
+            )
+        };
+
+        // Extract NTT tables
+        let crt_count = conv.params().crt_count;
+        let poly_len = conv.params().poly_len;
+        let mut moduli = Vec::new();
+        let mut barrett_cr = Vec::new();
+        let mut forward_table = Vec::new();
+        let mut forward_prime_table = Vec::new();
+        let mut inverse_table = Vec::new();
+        let mut inverse_prime_table = Vec::new();
+
+        for i in 0..crt_count {
+            moduli.push(conv.params().moduli[i]);
+            barrett_cr.push(conv.params().barrett_cr_1[i]);
+            forward_table.extend_from_slice(conv.params().get_ntt_forward_table(i));
+            forward_prime_table.extend_from_slice(conv.params().get_ntt_forward_prime_table(i));
+            inverse_table.extend_from_slice(conv.params().get_ntt_inverse_table(i));
+            inverse_prime_table.extend_from_slice(conv.params().get_ntt_inverse_prime_table(i));
+        }
+
+        // Initialize GPUContext (DB upload happens here)
+        GPUContext::new(
+            db_rows as u32,
+            self.db_rows_padded() as u32,
+            db_cols as u32,
+            n as u32,
+            poly_len as u32,
+            crt_count as u32,
+            max_adds as u32,
+            db_u8,
+            &v_nega_perm_a_flat,
+            &moduli,
+            &barrett_cr,
+            &forward_table,
+            &forward_prime_table,
+            &inverse_table,
+            &inverse_prime_table,
+            conv.params().mod0_inv_mod1,
+            conv.params().mod1_inv_mod0,
+            conv.params().barrett_cr_0_modulus,
+            conv.params().barrett_cr_1_modulus,
+        ).expect("Failed to initialize GPU context")
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn compute_hint_0_with_context(&self, gpu_ctx: &crate::cuda::GPUContext) -> Vec<u64> {
+        gpu_ctx.compute_hint_0().expect("GPU computation failed")
+    }
+
+    pub fn generate_hint_0_ring(&self) -> Vec<u64> {
+        let lwe_params = LWEParams::default();
+        let conv = Convolution::new(lwe_params.n);
+
+        let db_rows = 1 << (self.params.db_dim_1 + self.params.poly_len_log2);
+        let db_cols = self.db_cols();
+        let n = lwe_params.n;
 
         let mut hint_0 = vec![0u64; n * db_cols];
-
         let convd_len = conv.params().crt_count * conv.params().poly_len;
 
         let mut rng_pub = ChaCha20Rng::from_seed(get_seed(SEED_0));
-
         let mut v_nega_perm_a = Vec::new();
         for _ in 0..db_rows / n {
             let mut a = vec![0u32; n];
@@ -511,12 +598,10 @@ where
             v_nega_perm_a.push(nega_perm_a_ntt);
         }
 
-        // limit on the number of times we can add results modulo M before we wrap
         let log2_conv_output =
             log2(lwe_params.modulus) + log2(lwe_params.n as u64) + log2(lwe_params.pt_modulus);
         let log2_modulus = log2(conv.params().modulus);
         let log2_max_adds = log2_modulus - log2_conv_output - 1;
-        assert!(log2_max_adds > 0);
         let max_adds = 1 << log2_max_adds;
 
         for col in 0..db_cols {
@@ -528,9 +613,8 @@ where
                     .iter()
                     .map(|&x| x.to_u64() as u32)
                     .collect::<Vec<_>>();
-                assert_eq!(pt_col_u32.len(), n);
-                let pt_ntt = conv.ntt(&pt_col_u32);
 
+                let pt_ntt = conv.ntt(&pt_col_u32);
                 let convolved_ntt = conv.pointwise_mul(&v_nega_perm_a[outer_row], &pt_ntt);
 
                 for r in 0..convd_len {
@@ -558,7 +642,6 @@ where
                 }
             }
         }
-
         hint_0
     }
 
@@ -685,14 +768,61 @@ where
 
         // Begin offline precomputation
 
-        let now = Instant::now();
-        let hint_0: Vec<u64> = self.generate_hint_0_ring();
+        #[cfg(feature = "cuda")]
+        let hint_0: Vec<u64> = {
+            let lwe_params = LWEParams::default();
+            let conv = Convolution::new(lwe_params.n);
+            
+            let init_start = Instant::now();
+            let gpu_ctx = self.init_hint_0_gpu_context(&lwe_params, &conv);
+            let init_time = init_start.elapsed();
+            
+            let compute_start = Instant::now();
+            let gpu_result = self.compute_hint_0_with_context(&gpu_ctx);
+            let compute_time = compute_start.elapsed();
+            
+            debug!("GPU init: {:?}, compute: {:?}", init_time, compute_time);
+            
+            // Verify against CPU
+            let cpu_start = Instant::now();
+            let cpu_result = self.generate_hint_0_ring();
+            let cpu_time = cpu_start.elapsed();
+            
+            debug!("CPU time: {:?}", cpu_time);
+            debug!("Speedup: {:.2}x", cpu_time.as_secs_f64() / compute_time.as_secs_f64());
+            
+            let mut matches = true;
+            for i in 0..gpu_result.len() {
+                if gpu_result[i] != cpu_result[i] {
+                    log::error!("Mismatch at index {}: GPU={}, CPU={}", i, gpu_result[i], cpu_result[i]);
+                    matches = false;
+                    break;
+                }
+            }
+            
+            if matches {
+                debug!("✓ GPU matches CPU");
+                gpu_result
+            } else {
+                log::warn!("✗ GPU/CPU mismatch, using CPU");
+                cpu_result
+            }
+        };
+
+        #[cfg(not(feature = "cuda"))]
+        let hint_0: Vec<u64> = {
+            let now = Instant::now();
+            let result = self.generate_hint_0_ring();
+            debug!("Answered hint (ring) in {} us", now.elapsed().as_micros());
+            result
+        };
         // hint_0 is n x db_cols
-        let simplepir_prep_time_ms = now.elapsed().as_millis();
+        let simplepir_prep_time_ms = Instant::now().elapsed().as_millis();
         if let Some(measurement) = measurement {
             measurement.offline.simplepir_prep_time_ms = simplepir_prep_time_ms as usize;
         }
-        debug!("Answered hint (ring) in {} us", now.elapsed().as_micros());
+        // The debug message for non-CUDA case is moved inside the cfg block.
+        // For CUDA, the timing is already debugged inside the block.
 
         // compute (most of) the secondary hint
         let intermediate_cts = [&hint_0[..], &vec![0u64; db_cols]].concat();

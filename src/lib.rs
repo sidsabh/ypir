@@ -1,6 +1,8 @@
 #![cfg_attr(target_feature = "avx512f", feature(stdarch_x86_avx512))]
 
 pub mod bits;
+#[cfg(feature = "cuda")]
+pub mod cuda;
 pub mod client;
 pub mod convolution;
 pub mod kernel;
