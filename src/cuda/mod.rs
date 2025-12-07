@@ -146,3 +146,190 @@ impl GPUContext {
         Err("CUDA support not compiled".to_string())
     }
 }
+
+#[cfg(all(feature = "cuda", feature = "toeplitz"))]
+extern "C" {
+    fn init_toeplitz_context(
+        db: *const u8,
+        v_nega_perm_a: *const u32,
+        moduli: *const u64,
+        barrett_cr: *const u64,
+        db_rows: u32,
+        db_rows_padded: u32,
+        db_cols: u32,
+        n: u32,
+        crt_count: u32,
+        max_adds: u32,
+        mod0_inv_mod1: u64,
+        mod1_inv_mod0: u64,
+        barrett_cr_0_modulus: u64,
+        barrett_cr_1_modulus: u64,
+    ) -> *mut std::ffi::c_void;
+
+    fn compute_hint_0_toeplitz(context: *mut std::ffi::c_void, hint_0: *mut u64) -> i32;
+
+    fn free_toeplitz_context(context: *mut std::ffi::c_void);
+}
+
+#[cfg(all(feature = "cuda", feature = "toeplitz"))]
+pub struct ToeplitzContext {
+    ctx: *mut std::ffi::c_void,
+    n: u32,
+    db_cols: u32,
+}
+
+#[cfg(all(feature = "cuda", feature = "toeplitz"))]
+impl ToeplitzContext {
+    pub fn new(
+        db_rows: u32,
+        db_rows_padded: u32,
+        db_cols: u32,
+        n: u32,
+        crt_count: u32,
+        max_adds: u32,
+        db: &[u8],
+        v_nega_perm_a: &[u32],
+        moduli: &[u64],
+        barrett_cr: &[u64],
+        mod0_inv_mod1: u64,
+        mod1_inv_mod0: u64,
+        barrett_cr_0_modulus: u64,
+        barrett_cr_1_modulus: u64,
+    ) -> Result<Self, String> {
+        let ctx = unsafe {
+            init_toeplitz_context(
+                db.as_ptr(),
+                v_nega_perm_a.as_ptr(),
+                moduli.as_ptr(),
+                barrett_cr.as_ptr(),
+                db_rows,
+                db_rows_padded,
+                db_cols,
+                n,
+                crt_count,
+                max_adds,
+                mod0_inv_mod1,
+                mod1_inv_mod0,
+                barrett_cr_0_modulus,
+                barrett_cr_1_modulus,
+            )
+        };
+
+        if ctx.is_null() {
+            Err("Failed to initialize Toeplitz GPU context".to_string())
+        } else {
+            Ok(ToeplitzContext { ctx, n, db_cols })
+        }
+    }
+
+    pub fn compute_hint_0(&self) -> Result<Vec<u64>, String> {
+        let hint_size = (self.n * self.db_cols) as usize;
+        let mut hint_0 = vec![0u64; hint_size];
+
+        let result = unsafe { compute_hint_0_toeplitz(self.ctx, hint_0.as_mut_ptr()) };
+
+        if result == 0 {
+            Ok(hint_0)
+        } else {
+            Err("CUDA Toeplitz kernel failed".to_string())
+        }
+    }
+}
+
+#[cfg(all(feature = "cuda", feature = "toeplitz"))]
+impl Drop for ToeplitzContext {
+    fn drop(&mut self) {
+        unsafe {
+            free_toeplitz_context(self.ctx);
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+extern "C" {
+    fn ypir_online_init(
+        db: *const u32,
+        db_rows: usize,
+        db_cols: usize,
+        max_batch_size: usize,
+        A2t: *const u32,
+        A2t_rows: usize,
+        A2t_cols: usize,
+    ) -> *mut std::ffi::c_void;
+
+    fn ypir_online_compute_step1(
+        context: *mut std::ffi::c_void,
+        queries: *const u32,
+        num_queries: usize,
+        output: *mut u32,
+    ) -> i32;
+
+    fn ypir_online_free(context: *mut std::ffi::c_void);
+}
+
+#[cfg(feature = "cuda")]
+pub struct OnlineComputeContext {
+    ctx: *mut std::ffi::c_void,
+    db_cols: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl OnlineComputeContext {
+    pub fn new(
+        db: &[u32],
+        db_rows: usize,
+        db_cols: usize,
+        max_batch_size: usize,
+        A2t: &[u32],
+        A2t_rows: usize,
+        A2t_cols: usize,
+    ) -> Result<Self, String> {
+        let ctx = unsafe {
+            ypir_online_init(
+                db.as_ptr(),
+                db_rows,
+                db_cols,
+                max_batch_size,
+                A2t.as_ptr(),
+                A2t_rows,
+                A2t_cols,
+            )
+        };
+
+        if ctx.is_null() {
+            Err("Failed to initialize Online GPU context".to_string())
+        } else {
+            Ok(OnlineComputeContext { ctx, db_cols })
+        }
+    }
+
+    pub fn compute_step1(&self, queries: &[u32], num_queries: usize) -> Result<Vec<u32>, String> {
+        // Output size: num_queries * db_cols * 4 bytes (u32)
+        let output_size_u32 = num_queries * self.db_cols;
+        let mut output_u32 = vec![0u32; output_size_u32];
+
+        let result = unsafe {
+            ypir_online_compute_step1(
+                self.ctx,
+                queries.as_ptr(),
+                num_queries,
+                output_u32.as_mut_ptr(),
+            )
+        };
+
+        if result != 0 {
+            return Err("CUDA online compute step 1 failed".to_string());
+        }
+
+        Ok(output_u32)
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for OnlineComputeContext {
+    fn drop(&mut self) {
+        unsafe {
+            ypir_online_free(self.ctx);
+        }
+    }
+}

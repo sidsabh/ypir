@@ -22,7 +22,8 @@ __global__ void compute_hint_0_kernel(
     const NTTParams* ntt_params,
     const HintParams* params
 ) {
-    const uint32_t col = blockIdx.x;
+    uint32_t col = blockIdx.x + blockIdx.y * gridDim.x;
+    if (col >= params->db_cols) return;
     const uint32_t tid = threadIdx.x;
     const uint32_t poly_len = ntt_params->poly_len;
     const uint32_t crt_count = ntt_params->crt_count;
@@ -215,8 +216,8 @@ void* init_gpu_context(
     ctx->crt_count = crt_count;
     ctx->convd_len = crt_count * poly_len;
 
-    const size_t db_size = db_rows_padded * db_cols * sizeof(uint8_t);
-    const size_t nega_size = (db_rows / n) * crt_count * poly_len * sizeof(uint32_t);
+    const size_t db_size = (size_t)db_rows_padded * db_cols * sizeof(uint8_t);
+    const size_t nega_size = (size_t)(db_rows / n) * crt_count * poly_len * sizeof(uint32_t);
     const size_t table_size = crt_count * poly_len * sizeof(uint64_t);
 
     // Allocate device memory
@@ -297,9 +298,9 @@ int compute_hint_0_cuda(void* context, uint64_t* hint_0) {
         ctx->d_ntt_params,
         ctx->d_hint_params
     );
-
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
+        printf("Launch error: %s\n", cudaGetErrorString(err));
         return -1;
     }
 

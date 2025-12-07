@@ -28,6 +28,7 @@ fn main() {
 
 fn compile_cuda() {
     println!("cargo:rerun-if-changed=src/cuda/hint_kernel.cu");
+    println!("cargo:rerun-if-changed=src/cuda/online_kernel.cu");
     println!("cargo:rerun-if-changed=src/cuda/ntt.cuh");
 
     let out_dir = env::var("OUT_DIR").unwrap();
@@ -37,16 +38,31 @@ fn compile_cuda() {
     let arch = detect_gpu_arch().unwrap_or("sm_61".to_string());
     println!("cargo:warning=Compiling CUDA code for architecture: {}", arch);
 
+    // Check if toeplitz feature is enabled
+    let toeplitz_enabled = env::var("CARGO_FEATURE_TOEPLITZ").is_ok();
+
+    let arch_flag = format!("-arch={}", arch);
+    let mut nvcc_args = vec![
+        "-O3",
+        arch_flag.as_str(),
+        "-Xcompiler", "-fPIC",
+        "-shared",
+        "src/cuda/hint_kernel.cu",
+        "src/cuda/online_kernel.cu",
+    ];
+
+    // Add toeplitz kernel if feature is enabled
+    if toeplitz_enabled {
+        println!("cargo:rerun-if-changed=src/cuda/toeplitz_kernel.cu");
+        nvcc_args.push("src/cuda/toeplitz_kernel.cu");
+        nvcc_args.push("-lcublas");
+    }
+
+    nvcc_args.push("-o");
+    nvcc_args.push(lib_path.to_str().unwrap());
+
     let status = Command::new("nvcc")
-        .args(&[
-            "-O3",
-            &format!("-arch={}", arch),
-            "-Xcompiler", "-fPIC",
-            "-shared",
-            "src/cuda/hint_kernel.cu",
-            "-o",
-            lib_path.to_str().unwrap(),
-        ])
+        .args(&nvcc_args)
         .status()
         .expect("Failed to execute nvcc");
 
@@ -66,6 +82,12 @@ fn compile_cuda() {
         println!("cargo:rustc-link-search=native=/opt/cuda/lib64");
     }
     println!("cargo:rustc-link-lib=cudart");
+
+    // Link cuBLAS if toeplitz is enabled
+    let toeplitz_enabled = env::var("CARGO_FEATURE_TOEPLITZ").is_ok();
+    if toeplitz_enabled {
+        println!("cargo:rustc-link-lib=cublas");
+    }
 }
 
 fn detect_gpu_arch() -> Option<String> {

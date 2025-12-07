@@ -52,6 +52,16 @@ pub fn run_ypir_batched(
         _ => panic!("Unsupported number of clients: {}", num_clients),
     };
     debug!("{:#?}", measurement);
+    // println!("Throughput: {:.2} items/sec", 
+    //     (num_items * num_clients) as f64 / 
+    //     ((measurement.online.server_time_ms) as f64 / 1000.0)
+    // );
+    // throughput: DB size / online server time- GB/sec
+    let db_size_bytes = (num_items * item_size_bits + 7) / 8;
+    println!(
+        "Throughput: {:.2} GB/sec",
+        (db_size_bytes as f64) / ((measurement.online.server_time_ms) as f64 / 1000.0) / (1 << 30) as f64
+    );
     measurement
 }
 
@@ -681,8 +691,21 @@ mod test {
 
     #[test]
     #[ignore]
+    fn test_ypir_small() {
+        run_ypir_batched(1 << 20, 1, 1, false, 5);
+    }
+
+    #[test]
+    #[ignore]
     fn test_ypir_1gb() {
         run_ypir_batched(1 << 33, 1, 1, false, 5);
+    }
+
+    #[test]
+    #[ignore]
+    // add a test for Toeplitz matrix (8 GB GPU RAM limit)
+    fn test_ypir_toeplitz() {
+        run_ypir_batched(1 << 32, 1, 1, false, 5);
     }
 
     #[test]

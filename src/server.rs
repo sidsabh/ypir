@@ -163,6 +163,8 @@ pub struct YServer<'a, T> {
     phantom: PhantomData<T>,
     pad_rows: bool,
     ypir_params: YPIRParams,
+    #[cfg(feature = "cuda")]
+    online_cuda_context: Option<std::sync::Arc<crate::cuda::OnlineComputeContext>>,
 }
 
 pub trait DbRowsPadded {
@@ -259,6 +261,55 @@ where
             smaller_params
         };
 
+        #[cfg(feature = "cuda")]
+        let online_cuda_context = {
+            // Only initialize for main server (u32) and if we have data
+            // We use a heuristic: if bytes_per_pt_el == 4, it's likely the main DB
+            if bytes_per_pt_el == 4 {
+                let db_u32 = unsafe {
+                    std::slice::from_raw_parts(
+                        db_buf_aligned.as_ptr() as *const u32,
+                        db_buf_aligned.len() * 8 / 4,
+                    )
+                };
+                
+                // Note: DB is transposed, so rows=db_cols, cols=db_rows_padded/4 (packed)
+                let db_rows = if is_simplepir {
+                    params.instances * params.poly_len
+                } else {
+                    1 << (params.db_dim_2 + params.poly_len_log2)
+                };
+                
+                let db_rows_padded_val = if pad_rows {
+                    params.db_rows_padded()
+                } else {
+                    1 << (params.db_dim_1 + params.poly_len_log2)
+                };
+                
+                let db_cols_packed = db_rows_padded_val / 4;
+                
+                debug!("Initializing CUDA context: rows={}, cols={} (packed)", db_rows, db_cols_packed);
+                
+                match crate::cuda::OnlineComputeContext::new(
+                    db_u32, 
+                    db_rows, 
+                    db_cols_packed, 
+                    256, // Max batch size
+                    &[], // Dummy A2t
+                    0,   // Dummy A2t_rows
+                    0    // Dummy A2t_cols
+                ) {
+                    Ok(ctx) => Some(std::sync::Arc::new(ctx)),
+                    Err(e) => {
+                        debug!("Failed to init CUDA context: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        };
+
         Self {
             params,
             smaller_params,
@@ -266,6 +317,8 @@ where
             phantom: PhantomData,
             pad_rows,
             ypir_params,
+            #[cfg(feature = "cuda")]
+            online_cuda_context,
         }
     }
 
@@ -575,6 +628,77 @@ where
         gpu_ctx.compute_hint_0().expect("GPU computation failed")
     }
 
+    /// Initialize Toeplitz GPU context for matrix-based multiplication
+    /// Uses coefficient-form polynomials instead of NTT
+    #[cfg(all(feature = "cuda", feature = "toeplitz"))]
+    pub fn init_toeplitz_context(&self, lwe_params: &LWEParams, conv: &Convolution) -> crate::cuda::ToeplitzContext {
+        let db_rows = 1 << (self.params.db_dim_1 + self.params.poly_len_log2);
+        let db_cols = self.db_cols();
+        let n = lwe_params.n;
+
+        // Prepare database as u8
+        let db_u8: Vec<u8> = self
+            .db()
+            .iter()
+            .map(|&x| x.to_u64() as u8)
+            .collect();
+
+        // Compute max_adds
+        let log2_conv_output =
+            log2(lwe_params.modulus) + log2(lwe_params.n as u64) + log2(lwe_params.pt_modulus);
+        let log2_modulus = log2(conv.params().modulus);
+        let log2_max_adds = log2_modulus - log2_conv_output - 1;
+        let max_adds = 1 << log2_max_adds;
+
+        // Generate v_nega_perm_a in COEFFICIENT FORM (not NTT'd)
+        let mut rng_pub = ChaCha20Rng::from_seed(get_seed(SEED_0));
+        let mut v_nega_perm_a_flat = Vec::new();
+
+        for _ in 0..db_rows / n {
+            let mut a = vec![0u32; n];
+            for idx in 0..n {
+                a[idx] = rng_pub.sample::<u32, _>(rand::distributions::Standard);
+            }
+
+            // For Toeplitz: apply negacyclic permutation to match CPU reference
+            let nega_perm_a = negacyclic_perm_u32(&a);
+            v_nega_perm_a_flat.extend_from_slice(&nega_perm_a);
+        }
+        
+        // Extract NTT tables and parameters
+        let crt_count = conv.params().crt_count;
+        let mut moduli = Vec::new();
+        let mut barrett_cr = Vec::new();
+
+        for i in 0..crt_count {
+            moduli.push(conv.params().moduli[i]);
+            barrett_cr.push(conv.params().barrett_cr_1[i]);
+        }
+
+        // Initialize ToeplitzContext (note: poly_len is passed as crt_count param, but ignored in Toeplitz)
+        crate::cuda::ToeplitzContext::new(
+            db_rows as u32,
+            self.db_rows_padded() as u32,
+            db_cols as u32,
+            n as u32,
+            crt_count as u32,
+            max_adds as u32,
+            &db_u8,
+            &v_nega_perm_a_flat,
+            &moduli,
+            &barrett_cr,
+            conv.params().mod0_inv_mod1,
+            conv.params().mod1_inv_mod0,
+            conv.params().barrett_cr_0_modulus,
+            conv.params().barrett_cr_1_modulus,
+        ).expect("Failed to initialize Toeplitz GPU context")
+    }
+
+    #[cfg(all(feature = "cuda", feature = "toeplitz"))]
+    pub fn compute_hint_0_with_toeplitz(&self, toeplitz_ctx: &crate::cuda::ToeplitzContext) -> Vec<u64> {
+        toeplitz_ctx.compute_hint_0().expect("Toeplitz GPU computation failed")
+    }
+
     pub fn generate_hint_0_ring(&self) -> Vec<u64> {
         let lwe_params = LWEParams::default();
         let conv = Convolution::new(lwe_params.n);
@@ -772,17 +896,37 @@ where
         let hint_0: Vec<u64> = {
             let lwe_params = LWEParams::default();
             let conv = Convolution::new(lwe_params.n);
-            
-            let init_start = Instant::now();
-            let gpu_ctx = self.init_hint_0_gpu_context(&lwe_params, &conv);
-            let init_time = init_start.elapsed();
-            
-            let compute_start = Instant::now();
-            let gpu_result = self.compute_hint_0_with_context(&gpu_ctx);
-            let compute_time = compute_start.elapsed();
-            
-            debug!("GPU init: {:?}, compute: {:?}", init_time, compute_time);
-            
+
+            #[cfg(feature = "toeplitz")]
+            let res = {
+                let init_start = Instant::now();
+                let toeplitz_ctx = self.init_toeplitz_context(&lwe_params, &conv);
+                let init_time = init_start.elapsed();
+
+                let compute_start = Instant::now();
+                let gpu_result = self.compute_hint_0_with_toeplitz(&toeplitz_ctx);
+                let compute_time = compute_start.elapsed();
+
+                debug!("GPU (Toeplitz) init: {:?}, compute: {:?}", init_time, compute_time);
+                (gpu_result, compute_time)
+            };
+
+            #[cfg(not(feature = "toeplitz"))]
+            let res = {
+                let init_start = Instant::now();
+                let gpu_ctx = self.init_hint_0_gpu_context(&lwe_params, &conv);
+                let init_time = init_start.elapsed();
+
+                let compute_start = Instant::now();
+                let gpu_result = self.compute_hint_0_with_context(&gpu_ctx);
+                let compute_time = compute_start.elapsed();
+
+                debug!("GPU (NTT) init: {:?}, compute: {:?}", init_time, compute_time);
+                (gpu_result, compute_time)
+            };
+
+            let (gpu_result, compute_time) = res;
+
             // Verify against CPU
             let cpu_start = Instant::now();
             let cpu_result = self.generate_hint_0_ring();
@@ -1042,11 +1186,23 @@ where
 
         let online_phase = Instant::now();
         let first_pass = Instant::now();
+        
+        #[cfg(feature = "cuda")]
+        let intermediate = if let Some(ctx) = &self.online_cuda_context {
+            ctx.compute_step1(first_dim_queries_packed, K).expect("CUDA compute failed")
+        } else {
+            // Fallback if context creation failed or not initialized
+            self.lwe_multiply_batched_with_db_packed::<K>(first_dim_queries_packed)
+        };
+
+        #[cfg(not(feature = "cuda"))]
         let intermediate = self.lwe_multiply_batched_with_db_packed::<K>(first_dim_queries_packed);
+        
         let simplepir_resp_bytes = intermediate.len() / K * (lwe_q_prime_bits as usize) / 8;
         debug!("simplepir_resp_bytes {} bytes", simplepir_resp_bytes);
         let first_pass_time_ms = first_pass.elapsed().as_millis();
         debug!("First pass took {} us", first_pass.elapsed().as_micros());
+
 
         if let Some(ref mut m) = measurement {
             m.online.first_pass_time_ms = first_pass_time_ms as usize;
@@ -1057,11 +1213,12 @@ where
         let mut second_pass_time_ms = 0;
         let mut ring_packing_time_ms = 0;
         let mut responses = Vec::new();
-        for (intermediate_chunk, (packed_query_col, pack_pub_params_row_1s)) in intermediate
+        for (intermediate_chunk, query_tuple) in intermediate
             .as_slice()
             .chunks(db_cols)
             .zip(second_dim_queries.iter())
         {
+            let (packed_query_col, pack_pub_params_row_1s) = *query_tuple;
             let second_pass = Instant::now();
             let intermediate_cts_rescaled = intermediate_chunk
                 .iter()

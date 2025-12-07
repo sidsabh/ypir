@@ -89,7 +89,7 @@ __device__ __forceinline__ uint64_t barrett_reduction_u128(
 
 // Forward NTT (parallelized across all threads)
 
-__device__ void ntt_forward_kernel_parallel(
+__device__ __forceinline__ void ntt_forward_kernel_parallel(
     uint64_t* operand,
     const NTTParams* params,
     uint32_t coeff_mod,
@@ -158,7 +158,7 @@ __device__ void ntt_forward_kernel_parallel(
 
 // Inverse NTT (parallelized across all threads)
 
-__device__ void ntt_inverse_kernel_parallel(
+__device__ __forceinline__ void ntt_inverse_kernel_parallel(
     uint64_t* operand,
     const NTTParams* params,
     uint32_t coeff_mod,
