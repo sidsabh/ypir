@@ -40,6 +40,7 @@ fn compile_cuda() {
 
     // Check if toeplitz feature is enabled
     let toeplitz_enabled = env::var("CARGO_FEATURE_TOEPLITZ").is_ok();
+    let toeplitz_crt_enabled = env::var("CARGO_FEATURE_TOEPLITZ_CRT").is_ok();
 
     let arch_flag = format!("-arch={}", arch);
     let mut nvcc_args = vec![
@@ -51,11 +52,14 @@ fn compile_cuda() {
         "src/cuda/online_kernel.cu",
     ];
 
-    // Add toeplitz kernel if feature is enabled
-    if toeplitz_enabled {
+    // Add toeplitz kernel - check CRT first since it implies toeplitz
+    if toeplitz_crt_enabled {
+        println!("cargo:rerun-if-changed=src/cuda/toeplitz_kernel_crt.cu");
+        nvcc_args.push("src/cuda/toeplitz_kernel_crt.cu");
+        nvcc_args.push("-lcublas");
+    } else if toeplitz_enabled {
         println!("cargo:rerun-if-changed=src/cuda/toeplitz_kernel.cu");
         nvcc_args.push("src/cuda/toeplitz_kernel.cu");
-        nvcc_args.push("-lcublas");
     }
 
     nvcc_args.push("-o");
@@ -83,9 +87,9 @@ fn compile_cuda() {
     }
     println!("cargo:rustc-link-lib=cudart");
 
-    // Link cuBLAS if toeplitz is enabled
-    let toeplitz_enabled = env::var("CARGO_FEATURE_TOEPLITZ").is_ok();
-    if toeplitz_enabled {
+    // Link cuBLAS only for CRT variant
+    let toeplitz_crt_enabled = env::var("CARGO_FEATURE_TOEPLITZ_CRT").is_ok();
+    if toeplitz_crt_enabled {
         println!("cargo:rustc-link-lib=cublas");
     }
 }

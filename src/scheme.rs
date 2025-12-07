@@ -692,7 +692,7 @@ mod test {
     #[test]
     #[ignore]
     fn test_ypir_small() {
-        run_ypir_batched(1 << 20, 1, 1, false, 5);
+        run_ypir_batched(1 << 20, 8, 1, false, 5);
     }
 
     #[test]
