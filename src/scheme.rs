@@ -513,6 +513,23 @@ pub fn run_ypir_on_params<const K: usize>(
         // ================================================================
 
         let start_online_comp = Instant::now();
+
+        // Use CUDA-accelerated path if available
+        #[cfg(feature = "cuda")]
+        let responses = {
+            debug!("Using CUDA-accelerated online computation");
+            y_server.perform_online_computation_cuda::<K>(
+                &mut offline_values,
+                &all_queries_packed,
+                &queries
+                    .iter()
+                    .map(|x| (x.3.as_slice(), x.4.as_slice()))
+                    .collect::<Vec<_>>(),
+                Some(&mut measurement),
+            )
+        };
+
+        #[cfg(not(feature = "cuda"))]
         let responses = y_server.perform_online_computation::<K>(
             &mut offline_values,
             &all_queries_packed,
@@ -522,6 +539,7 @@ pub fn run_ypir_on_params<const K: usize>(
                 .collect::<Vec<_>>(),
             Some(&mut measurement),
         );
+
         let online_server_time_ms = start_online_comp.elapsed().as_millis();
         let online_download_bytes = get_size_bytes(&responses); // TODO: this is not quite right for multiple clients
 

@@ -27,7 +27,7 @@ fn main() {
 }
 
 fn compile_cuda() {
-    println!("cargo:rerun-if-changed=src/cuda/hint_kernel.cu");
+    println!("cargo:rerun-if-changed=src/cuda/offline_kernel.cu");
     println!("cargo:rerun-if-changed=src/cuda/online_kernel.cu");
     println!("cargo:rerun-if-changed=src/cuda/ntt.cuh");
 
@@ -48,18 +48,18 @@ fn compile_cuda() {
         arch_flag.as_str(),
         "-Xcompiler", "-fPIC",
         "-shared",
-        "src/cuda/hint_kernel.cu",
+        "src/cuda/offline_kernel.cu",
         "src/cuda/online_kernel.cu",
     ];
 
     // Add toeplitz kernel - check CRT first since it implies toeplitz
     if toeplitz_crt_enabled {
-        println!("cargo:rerun-if-changed=src/cuda/toeplitz_kernel_crt.cu");
-        nvcc_args.push("src/cuda/toeplitz_kernel_crt.cu");
+        println!("cargo:rerun-if-changed=src/cuda/offline_toeplitz_kernel_crt.cu");
+        nvcc_args.push("src/cuda/offline_toeplitz_kernel_crt.cu");
         nvcc_args.push("-lcublas");
     } else if toeplitz_enabled {
-        println!("cargo:rerun-if-changed=src/cuda/toeplitz_kernel.cu");
-        nvcc_args.push("src/cuda/toeplitz_kernel.cu");
+        println!("cargo:rerun-if-changed=src/cuda/offline_toeplitz_kernel.cu");
+        nvcc_args.push("src/cuda/offline_toeplitz_kernel.cu");
     }
 
     nvcc_args.push("-o");

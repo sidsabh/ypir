@@ -163,8 +163,6 @@ pub struct YServer<'a, T> {
     phantom: PhantomData<T>,
     pad_rows: bool,
     ypir_params: YPIRParams,
-    #[cfg(feature = "cuda")]
-    online_cuda_context: Option<std::sync::Arc<crate::cuda::OnlineComputeContext>>,
 }
 
 pub trait DbRowsPadded {
@@ -221,7 +219,7 @@ where
 
         // SID: this is where we load the database from the passed in iterator (random bits u8::sample())
         // the database is in column major format
-        // SIDQ: why are the column dims db_dim_x + poly_len ?
+        // SIDQ: why are the column dims db_dim_x + poly_len ? A: we want to compute the mat-vec product so the hint+result are DoublePIR-ready (must include mut space for the SimplePIR response)
         for i in 0..db_rows {
             for j in 0..db_cols {
                 let idx = if inp_transposed {
@@ -261,54 +259,6 @@ where
             smaller_params
         };
 
-        #[cfg(feature = "cuda")]
-        let online_cuda_context = {
-            // Only initialize for main server (u32) and if we have data
-            // We use a heuristic: if bytes_per_pt_el == 4, it's likely the main DB
-            if bytes_per_pt_el == 4 {
-                let db_u32 = unsafe {
-                    std::slice::from_raw_parts(
-                        db_buf_aligned.as_ptr() as *const u32,
-                        db_buf_aligned.len() * 8 / 4,
-                    )
-                };
-                
-                // Note: DB is transposed, so rows=db_cols, cols=db_rows_padded/4 (packed)
-                let db_rows = if is_simplepir {
-                    params.instances * params.poly_len
-                } else {
-                    1 << (params.db_dim_2 + params.poly_len_log2)
-                };
-                
-                let db_rows_padded_val = if pad_rows {
-                    params.db_rows_padded()
-                } else {
-                    1 << (params.db_dim_1 + params.poly_len_log2)
-                };
-                
-                let db_cols_packed = db_rows_padded_val / 4;
-                
-                debug!("Initializing CUDA context: rows={}, cols={} (packed)", db_rows, db_cols_packed);
-                
-                match crate::cuda::OnlineComputeContext::new(
-                    db_u32, 
-                    db_rows, 
-                    db_cols_packed, 
-                    256, // Max batch size
-                    &[], // Dummy A2t
-                    0,   // Dummy A2t_rows
-                    0    // Dummy A2t_cols
-                ) {
-                    Ok(ctx) => Some(std::sync::Arc::new(ctx)),
-                    Err(e) => {
-                        debug!("Failed to init CUDA context: {}", e);
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        };
 
         Self {
             params,
@@ -317,8 +267,6 @@ where
             phantom: PhantomData,
             pad_rows,
             ypir_params,
-            #[cfg(feature = "cuda")]
-            online_cuda_context,
         }
     }
 
@@ -1186,23 +1134,11 @@ where
 
         let online_phase = Instant::now();
         let first_pass = Instant::now();
-        
-        #[cfg(feature = "cuda")]
-        let intermediate = if let Some(ctx) = &self.online_cuda_context {
-            ctx.compute_step1(first_dim_queries_packed, K).expect("CUDA compute failed")
-        } else {
-            // Fallback if context creation failed or not initialized
-            self.lwe_multiply_batched_with_db_packed::<K>(first_dim_queries_packed)
-        };
-
-        #[cfg(not(feature = "cuda"))]
         let intermediate = self.lwe_multiply_batched_with_db_packed::<K>(first_dim_queries_packed);
-        
         let simplepir_resp_bytes = intermediate.len() / K * (lwe_q_prime_bits as usize) / 8;
         debug!("simplepir_resp_bytes {} bytes", simplepir_resp_bytes);
         let first_pass_time_ms = first_pass.elapsed().as_millis();
         debug!("First pass took {} us", first_pass.elapsed().as_micros());
-
 
         if let Some(ref mut m) = measurement {
             m.online.first_pass_time_ms = first_pass_time_ms as usize;
@@ -1213,12 +1149,11 @@ where
         let mut second_pass_time_ms = 0;
         let mut ring_packing_time_ms = 0;
         let mut responses = Vec::new();
-        for (intermediate_chunk, query_tuple) in intermediate
+        for (intermediate_chunk, (packed_query_col, pack_pub_params_row_1s)) in intermediate
             .as_slice()
             .chunks(db_cols)
             .zip(second_dim_queries.iter())
         {
-            let (packed_query_col, pack_pub_params_row_1s) = *query_tuple;
             let second_pass = Instant::now();
             let intermediate_cts_rescaled = intermediate_chunk
                 .iter()
@@ -1385,6 +1320,18 @@ where
         }
 
         responses
+    }
+
+    /// CUDA-accelerated online computation
+    #[cfg(feature = "cuda")]
+    pub fn perform_online_computation_cuda<const K: usize>(
+        &self,
+        offline_vals: &mut OfflinePrecomputedValues<'a>,
+        first_dim_queries_packed: &[u32],
+        second_dim_queries: &[(&[u64], &[PolyMatrixNTT<'a>])],
+        mut measurement: Option<&mut Measurement>,
+    ) -> Vec<Vec<Vec<u8>>> {
+        self.perform_online_computation::<K>(offline_vals, first_dim_queries_packed, second_dim_queries, measurement)
     }
 
     // generic function that returns a u8 or u16:
