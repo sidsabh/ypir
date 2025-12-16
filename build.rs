@@ -32,7 +32,7 @@ fn compile_cuda() {
     println!("cargo:rerun-if-changed=src/cuda/ntt.cuh");
 
     let out_dir = env::var("OUT_DIR").unwrap();
-    let lib_path = PathBuf::from(&out_dir).join("libhint_cuda.so");
+    let lib_path = PathBuf::from(&out_dir).join("libypir_cuda.so");
 
     // Detect GPU architecture
     let arch = detect_gpu_arch().unwrap_or("sm_61".to_string());
@@ -76,7 +76,7 @@ fn compile_cuda() {
 
     // Set up linking
     println!("cargo:rustc-link-search=native={}", out_dir);
-    println!("cargo:rustc-link-lib=hint_cuda");
+    println!("cargo:rustc-link-lib=ypir_cuda");
 
     // Link CUDA runtime
     if Path::new("/usr/local/cuda/lib64").exists() {
