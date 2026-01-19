@@ -5,6 +5,7 @@ use spiral_rs::{arith::*, params::*};
 
 use super::lwe::LWEParams;
 
+// CRT moduli for RLWE modulus (~= 2^56)
 static DEFAULT_MODULI: [u64; 2] = [268369921u64, 249561089u64];
 const DEF_MOD_STR: &str = "[\"268369921\", \"249561089\"]";
 
@@ -74,6 +75,8 @@ fn internal_params_for(
     t_exp_left: usize,
     moduli: &str,
 ) -> Params {
+    // 16.042421 = 6.4 * sqrt(2*pi)
+    // n == 1 is the same as N = 2^8
     ext_params_from_json(&format!(
         r#"
         {{
@@ -104,6 +107,9 @@ pub fn params_for_scenario(num_items: usize, item_size_bits: usize) -> Params {
     let num_tiles_usize = num_tiles.ceil() as usize;
     let num_tiles_log2 = (num_tiles_usize as f64).log2().ceil() as usize;
 
+    // the reason we pad in this way instead of just padding up to the nearest multiple of poly_len is so our DB dims are powers of 2!
+    // why is that important?
+
     let (nu_1, nu_2) = if num_tiles_log2 % 2 == 0 {
         (num_tiles_log2 / 2, num_tiles_log2 / 2)
     } else {
@@ -112,13 +118,14 @@ pub fn params_for_scenario(num_items: usize, item_size_bits: usize) -> Params {
 
     debug!("chose nu_1: {}, nu_2: {}", nu_1, nu_2);
 
-    let p = 32768;
+    let p = 32768; // == 2^15 stored as params.pt_modulus
     let q2_bits = 28;
-    let t_exp_left = 3;
+    let t_exp_left = 3; // 𝑡 = ⌊log𝑧𝑞2⌋ + 1 -> ⌊log_(z=2^19)(q2=2^56)⌋+1 = 3
 
     internal_params_for(nu_1, nu_2, p, q2_bits, t_exp_left, DEF_MOD_STR)
 }
 
+// for some reason, YPIR-SP uses RLWE plaintext space as 2^14 instead of 2^15 like YPIR. doesn't matter, because either way N = 2^8 << p
 pub fn params_for_scenario_simplepir(num_items: usize, item_size_bits: usize) -> Params {
     let db_rows = num_items;
     let db_cols = (item_size_bits as f64 / (2048.0 * 14.0)).ceil() as usize;
@@ -128,9 +135,9 @@ pub fn params_for_scenario_simplepir(num_items: usize, item_size_bits: usize) ->
     let nu_1 = (db_rows.next_power_of_two().trailing_zeros() as usize).checked_sub(11).unwrap_or(0);
     debug!("chose nu_1: {}", nu_1);
 
-    let p = 1 << 14;
+    let p = 1 << 14; // == 2^14
     let q2_bits = 28;
-    let t_exp_left = 3;
+    let t_exp_left = 3; // 𝑡 = ⌊log𝑧𝑞2⌋ + 1 -> ⌊log_(z=2^19)(q2=2^56)⌋+1 = 3
 
     let mut params = internal_params_for(nu_1, 1, p, q2_bits, t_exp_left, DEF_MOD_STR);
     params.instances = db_cols;

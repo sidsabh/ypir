@@ -223,7 +223,7 @@ where
 
         // SID: this is where we load the database from the passed in iterator (random bits u8::sample())
         // the database is in column major format
-        // SIDQ: why are the column dims db_dim_x + poly_len ? A: we want to compute the mat-vec product so the hint+result are DoublePIR-ready (must include mut space for the SimplePIR response)
+        // SIDQ: why are the column dims db_dim_x + poly_len ? just because we need l1, l2 to be multiples of ring dim for NTT
         for i in 0..db_rows {
             for j in 0..db_cols {
                 let idx = if inp_transposed {
@@ -706,7 +706,7 @@ where
 
     pub fn generate_hint_0_ring(&self) -> Vec<u64> {
         let lwe_params = LWEParams::default();
-        let conv = Convolution::new(lwe_params.n);
+        let conv = Convolution::new(lwe_params.n); // wrapper around NTT operations
 
         let db_rows = 1 << (self.params.db_dim_1 + self.params.poly_len_log2);
         let db_cols = self.db_cols();
@@ -722,19 +722,41 @@ where
             for idx in 0..n {
                 a[idx] = rng_pub.sample::<u32, _>(rand::distributions::Standard);
             }
-            let nega_perm_a = negacyclic_perm_u32(&a);
+            let nega_perm_a = negacyclic_perm_u32(&a); // re-write a so that an LWE can be interpreted as an RLWE under the same key—yes, negacylic_matrix_u32 is the Toeplitz analogue of negacylic_perm_u32
             let nega_perm_a_ntt = conv.ntt(&nega_perm_a);
             v_nega_perm_a.push(nega_perm_a_ntt);
         }
 
+        // this is where we handle the 4.1."Modulus Selection" section
+        // q = 2^32 is not an NTT friendly modulus, so we instead work over a much larger group that doesn't overflow
+        // in the Toeplitz regime:
+        // to avoid overflow, we essentially sum products of Zq, ZN. so the max element is q*N*d (== lwe_params.modulus, lwe_params.pt_modulus, lwe_params.n, respectively)
+        // we are working in the coefficient space, so we can just work with uin64_t >> log(q*N*d) and mod 2^32 whenever to avoid overflow on the column
+        // recall, per polymut, we are bounded by the q*N*d overflow. but we want to sum m_1 of these (l1/d1) at a time per coefficient, so the potential overflow is
+        // l1 * q (2^32) * 2^8. if l1 > 2^22, then we overflow, which is a super large DB (>512 GB if 1bit)
+        // the real overflow we saw was with trying to use GEMM32, so we needed to do CRT, etc. etc.
+        
+        // anyways!!!
+        // we are actually doing NTT, so we are solving a different problem here.
+        // we are working over the Ring space with modulus ~=2^56 - forget CRT for now, it's a detail
+        // if we have coefficients bounded by 2^32 and 2^8, the maximum coefficient for a polynomial multiply will be: (N)(2^8)(2^32)
+        // this is denoted as log2_conv_output
+        // the idea is that: we are in R_q with q=2^32 right now with d=1024. this is not NTT_friendly (the 2n-th root of unity does not exist in the multiplicative grp)
+        // but we can just pretend we are working over the integers as long as we never mod, do the INTT, then mod after.
+
+        // in order to pretend we work in the integers, we work in the larger group
+        // Q/A: it's quite neat that we can work in the larger group that exactly works for the RLWE automorphorisms!?
+        // so we work in Z_q2[x]/(X^d2) with q2_bits >> log2_conv_output, INTT when we get close to overflowing the group!
+        // TADA
+
         let log2_conv_output =
             log2(lwe_params.modulus) + log2(lwe_params.n as u64) + log2(lwe_params.pt_modulus);
-        let log2_modulus = log2(conv.params().modulus);
-        let log2_max_adds = log2_modulus - log2_conv_output - 1;
+        let log2_modulus = log2(conv.params().modulus); // ~= 2^56
+        let log2_max_adds = log2_modulus - log2_conv_output - 1; // -1 so we stay BELOW the 2^56
         let max_adds = 1 << log2_max_adds;
 
         for col in 0..db_cols {
-            let mut tmp_col = vec![0u64; convd_len];
+            let mut tmp_col = vec![0u64; convd_len]; // for each column, we compute one polynomial, stored in CRT format
             for outer_row in 0..db_rows / n {
                 let start_idx = col * self.db_rows_padded() + outer_row * n;
                 let pt_col = &self.db()[start_idx..start_idx + n];
@@ -744,14 +766,17 @@ where
                     .collect::<Vec<_>>();
 
                 let pt_ntt = conv.ntt(&pt_col_u32);
-                let convolved_ntt = conv.pointwise_mul(&v_nega_perm_a[outer_row], &pt_ntt);
+                let convolved_ntt = conv.pointwise_mul(&v_nega_perm_a[outer_row], &pt_ntt); // pointwise mul over CRT-based NTT representation
 
                 for r in 0..convd_len {
                     tmp_col[r] += convolved_ntt[r] as u64;
                 }
 
+                // write to hint_0
                 if outer_row % max_adds == max_adds - 1 || outer_row == db_rows / n - 1 {
                     let mut col_poly_u32 = vec![0u32; convd_len];
+
+                    // re-mod by CRT moduli
                     for i in 0..conv.params().crt_count {
                         for j in 0..conv.params().poly_len {
                             let val = barrett_coeff_u64(
@@ -762,10 +787,12 @@ where
                             col_poly_u32[i * conv.params().poly_len + j] = val as u32;
                         }
                     }
+                    
                     let col_poly_raw = conv.raw(&col_poly_u32);
+
                     for i in 0..n {
                         hint_0[i * db_cols + col] += col_poly_raw[i] as u64;
-                        hint_0[i * db_cols + col] %= 1u64 << 32;
+                        hint_0[i * db_cols + col] %= 1u64 << 32; // mod to Zq
                     }
                     tmp_col.fill(0);
                 }
@@ -899,6 +926,7 @@ where
 
         // Begin offline precomputation
 
+        let simplepir_prep_time_ms: u128;
         #[cfg(feature = "cuda")]
         let hint_0: Vec<u64> = {
             let lwe_params = LWEParams::default();
@@ -933,7 +961,7 @@ where
             };
 
             let (gpu_result, compute_time) = res;
-
+            simplepir_prep_time_ms = compute_time.as_millis();
             gpu_result
             // // Verify against CPU
             // let cpu_start = Instant::now();
@@ -965,11 +993,10 @@ where
         let hint_0: Vec<u64> = {
             let now = Instant::now();
             let result = self.generate_hint_0_ring();
-            debug!("Answered hint (ring) in {} us", now.elapsed().as_micros());
+            simplepir_prep_time_ms = now.elapsed().as_millis();
             result
         };
         // hint_0 is n x db_cols
-        let simplepir_prep_time_ms = Instant::now().elapsed().as_millis();
         if let Some(measurement) = measurement {
             measurement.offline.simplepir_prep_time_ms = simplepir_prep_time_ms as usize;
         }
@@ -977,11 +1004,15 @@ where
         // For CUDA, the timing is already debugged inside the block.
 
         // compute (most of) the secondary hint
-        let intermediate_cts = [&hint_0[..], &vec![0u64; db_cols]].concat();
+        let intermediate_cts = [&hint_0[..], &vec![0u64; db_cols]].concat(); // concat so we add space for the SimplePIR repsonse in Z_q^l2
         let intermediate_cts_rescaled = intermediate_cts
             .iter()
             .map(|x| rescale(*x, lwe_params.modulus, lwe_q_prime))
             .collect::<Vec<_>>();
+
+        // now we have hint_0, we just modulus shift it down
+
+        // SID: not sure why we're storing it as a Vec<u64> if we already computed the hint, modded by q (2^32), then again modulus switched down to 2^28
 
         // split and do a second PIR over intermediate_cts
         // split into blowup_factor=q/p instances (so that all values are now mod p)
@@ -1291,6 +1322,7 @@ where
         packed_mod_switched
     }
 
+    #[cfg(not(feature = "cuda"))]
     pub fn perform_online_computation<const K: usize>(
         &self,
         offline_vals: &mut OfflinePrecomputedValues<'a>,
@@ -1317,25 +1349,35 @@ where
         let pt_bits = (params.pt_modulus as f64).log2().floor() as usize;
         // assert_eq!(pt_bits, 16);
 
-        // The factor by which ciphertext values are bigger than plaintext values
+        // The factor by which ciphertext values are bigger than plaintext values  // SID: calling this blowup_factor is misleading because it's comparing Zp to Zq' instead of Zn to Zq'
         let blowup_factor = lwe_q_prime_bits as f64 / pt_bits as f64;
         debug!("blowup_factor: {}", blowup_factor);
         // assert!(blowup_factor.ceil() - blowup_factor >= 0.05);
 
         // The starting index of the final value (the '1' in lwe_params.n + 1)
         // This is rounded to start on a pt_bits boundary
+        // used in DoublePIR packing step to differentiate the H2/c2*H1 from the T*A2/c2*T
         let special_offs =
             ((lwe_params.n * lwe_q_prime_bits) as f64 / pt_bits as f64).ceil() as usize;
 
         // Parameters for the second round (the "DoublePIR" round)
         let mut smaller_params = params.clone();
         smaller_params.db_dim_1 = params.db_dim_2;
+        // realistically, this is (d1+1)*K
+        // we always divide by poly_len so that we can pad to a power of 2 multiple of poly_len 
+        // so why is K the correct decomposition?
+        // well, we defintely are operating on p (2^15) as the plaintext space so we have to decompose our 2^32 vals into that
+        // before we decompose, we modulus switch down, so this is accurate
         smaller_params.db_dim_2 = ((blowup_factor * (lwe_params.n + 1) as f64)
             / params.poly_len as f64)
             .log2()
             .ceil() as usize;
 
         let out_rows = 1 << (smaller_params.db_dim_2 + params.poly_len_log2);
+        // number of blocks of RLWE that we pack
+        // notice that d1 != d2, so we actually pack d2 LWEs (each of dim d1+1) into one RLWE ct where the ring is is mod by (X^d_2 + 1)
+            // that is, the first step of the FFT-tree will have RLWE's with only d1 coefficients
+        // implicility padded by the log2 $ ceil composition
         let rho = 1 << smaller_params.db_dim_2;
         assert_eq!(smaller_params.db_dim_1, params.db_dim_2);
         assert!(out_rows as f64 >= (blowup_factor * (lwe_params.n + 1) as f64));
@@ -1350,6 +1392,8 @@ where
         let precomp = &offline_vals.precomp;
 
         // Begin online computation
+
+        // SID: TODO CARRY ON HERE AFTER GROK OFFLINE
 
         let online_phase = Instant::now();
         let first_pass = Instant::now();
@@ -1543,7 +1587,7 @@ where
 
     /// CUDA-accelerated online computation
     #[cfg(feature = "cuda")]
-    pub fn perform_online_computation_cuda<const K: usize>(
+    pub fn perform_online_computation<const K: usize>(
         &self,
         offline_vals: &mut OfflinePrecomputedValues<'a>,
         first_dim_queries_packed: &[u32],

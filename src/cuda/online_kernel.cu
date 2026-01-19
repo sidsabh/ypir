@@ -184,13 +184,6 @@ __global__ void rescale_and_expand_kernel(
     
     uint64_t rescaled = (uint64_t)((d_val * d_qp) / d_mod + 0.5);
     
-    if (idx == 0) {
-        printf("GPU DEBUG: idx=0 val=%llu mod=%llu qp=%llu rescaled=%llu\n", 
-               (unsigned long long)val, (unsigned long long)lwe_modulus, 
-               (unsigned long long)lwe_q_prime, (unsigned long long)rescaled);
-        printf("GPU DEBUG: d_val=%f d_mod=%f d_qp=%f\n", d_val, d_mod, d_qp);
-    }
-    
     // Expand into smaller_db
     // smaller_db is column-major? 
     // Rust: smaller_db_mut[out_idx] = val_part

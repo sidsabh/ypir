@@ -124,7 +124,8 @@ pub fn naive_negacyclic_convolve(a: &[u32], b: &[u32]) -> Vec<u32> {
     }
     res
 }
-
+// negacyclic_perm_u32 just permutes an RLWE a so that it can encode an LWE sample in the constant term under the same secret key
+// negacyclic_matrix_u32 builds the full  n×n matrix representing polynomial multiplication in Z[X]/(Xn+1) for that polynomial
 pub fn negacyclic_matrix_u32(b: &[u32]) -> Vec<u32> {
     let n = b.len();
     let mut res = vec![0u32; n * n];

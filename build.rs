@@ -78,6 +78,9 @@ fn compile_cuda() {
     println!("cargo:rustc-link-search=native={}", out_dir);
     println!("cargo:rustc-link-lib=ypir_cuda");
 
+    // Runtime path so tests/debugger can load it
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", out_dir);
+
     // Link CUDA runtime
     if Path::new("/usr/local/cuda/lib64").exists() {
         println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");

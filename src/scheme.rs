@@ -34,8 +34,10 @@ pub fn run_ypir_batched(
     let params = if is_simplepir {
         params_for_scenario_simplepir(num_items, item_size_bits)
     } else {
+        assert!(item_size_bits <= 8, "Standard YPIR supports item sizes of 1-8 bits.");
         params_for_scenario(num_items, item_size_bits)
     };
+    // TODO: why is clients as a generic instead of a parameter? i think it was an attempt at adding cross-client batching and minimizing code changes, or maybe an AVX-512 thing
     let measurement = match num_clients {
         1 => run_ypir_on_params::<1>(params, is_simplepir, trials),
         2 => run_ypir_on_params::<2>(params, is_simplepir, trials),
@@ -52,12 +54,13 @@ pub fn run_ypir_batched(
         _ => panic!("Unsupported number of clients: {}", num_clients),
     };
     debug!("{:#?}", measurement);
-    // println!("Throughput: {:.2} items/sec", 
-    //     (num_items * num_clients) as f64 / 
-    //     ((measurement.online.server_time_ms) as f64 / 1000.0)
-    // );
-    // throughput: DB size / online server time- GB/sec
     let db_size_bytes = (num_items * item_size_bits + 7) / 8;
+    // hint preprocessing throughput: DB size / hint preprocessing time - GB/sec
+    println!(
+        "Hint Prep. Throughput {:.2} GB/sec",
+        (db_size_bytes as f64) / ((measurement.offline.simplepir_prep_time_ms) as f64 / 1000.0) / (1 << 30) as f64
+    );
+    // throughput: DB size / online server time- GB/sec
     println!(
         "Throughput: {:.2} GB/sec",
         (db_size_bytes as f64) / ((measurement.online.server_time_ms) as f64 / 1000.0) / (1 << 30) as f64
@@ -309,7 +312,7 @@ pub fn run_ypir_on_params<const K: usize>(
     let lwe_params = LWEParams::default();
 
     let db_rows = 1 << (params.db_dim_1 + params.poly_len_log2);
-    let db_rows_padded = params.db_rows_padded();
+    let db_rows_padded = params.db_rows_padded(); // == db_rows as defined above
     let db_cols = 1 << (params.db_dim_2 + params.poly_len_log2);
 
     let sqrt_n_bytes = db_cols * (lwe_params.pt_modulus as f64).log2().floor() as usize / 8;
@@ -317,10 +320,10 @@ pub fn run_ypir_on_params<const K: usize>(
     let mut rng = thread_rng();
 
     // RLWE reduced moduli
-    let rlwe_q_prime_1 = params.get_q_prime_1();
-    let rlwe_q_prime_2 = params.get_q_prime_2();
+    let rlwe_q_prime_1 = params.get_q_prime_1(); // (2^28)
+    let rlwe_q_prime_2 = params.get_q_prime_2(); // (2^20)
 
-    // LWE reduced moduli
+    // LWE reduced moduli (2^28)
     let lwe_q_prime_bits = lwe_params.q2_bits as usize;
 
     // The number of bits represented by a plaintext RLWE coefficient
@@ -384,18 +387,15 @@ pub fn run_ypir_on_params<const K: usize>(
     // --
 
     let now = Instant::now();
-    let pt_iter = std::iter::repeat_with(|| u8::sample());
+    let pt_iter = std::iter::repeat_with(|| u8::sample()); // TODO: can substitute the correct database here.
     let y_server = YServer::<u8>::new(&params, pt_iter, is_simplepir, false, true);
     debug!("Created server in {} us", now.elapsed().as_micros());
     debug!(
         "Database of {} bytes",
         y_server.db().len() * std::mem::size_of::<u8>()
     );
-    let db_pt_modulus = if is_simplepir {
-        params.pt_modulus
-    } else {
-        lwe_params.pt_modulus
-    };
+    let db_pt_modulus = lwe_params.pt_modulus;
+    
     assert_eq!(
         y_server.db().len() * std::mem::size_of::<u8>(),
         db_rows_padded * db_cols * (db_pt_modulus as f64).log2().ceil() as usize / 8
@@ -407,6 +407,7 @@ pub fn run_ypir_on_params<const K: usize>(
     let mut measurements = vec![Measurement::default(); trials + 1];
 
     let start_offline_comp = Instant::now();
+    // server precomputed state (silent preprocessing)
     let offline_values = y_server.perform_offline_precomputation(Some(&mut measurements[0]));
     let offline_server_time_ms = start_offline_comp.elapsed().as_millis();
 
@@ -414,7 +415,6 @@ pub fn run_ypir_on_params<const K: usize>(
     // let mut all_queries_packed = AlignedMemory64::new(K * packed_query_row_sz);
 
     for trial in 0..trials + 1 {
-        debug!("trial: {}", trial);
         let mut measurement = &mut measurements[trial];
         measurement.offline.server_time_ms = offline_server_time_ms as usize;
         measurement.offline.simplepir_hint_bytes = simplepir_hint_bytes;
@@ -452,6 +452,11 @@ pub fn run_ypir_on_params<const K: usize>(
                 &mut ChaCha20Rng::from_entropy(),
                 &mut ChaCha20Rng::from_seed(STATIC_SEED_2),
             );
+
+            // generated the key switching (automorphism) keys
+
+            // now we are applying some CRT optimizations (all NTTs are consisting of two sets of coefficients for the two moduli) and dropping the random portion (YPIR 4.2)
+
             // let pub_params_size = get_vec_pm_size_bytes(&pack_pub_params) / 2;
             let mut pack_pub_params_row_1s = pack_pub_params.to_vec();
             for i in 0..pack_pub_params.len() {
@@ -463,8 +468,13 @@ pub fn run_ypir_on_params<const K: usize>(
             debug!("pub params size: {} bytes", pub_params_size);
 
             let y_client = YClient::new(client, &params);
-            let query_row = y_client.generate_query(SEED_0, params.db_dim_1, false, target_row);
+            let query_row = y_client.generate_query(SEED_0, params.db_dim_1, false, target_row); // SimplePIR query on the column
+            // represents a matrix (n+1) × dim, where each column is an LWE ciphertext, stored in row major
+            // therefore, the last row is the non-random portion of the ct
             let query_row_last_row: &[u64] = &query_row[lwe_params.n * db_rows..];
+
+            // then we align the allocation on a 64-byte boundary using rust allocator
+            // interestingly, AVX-512 works as a SIMD operation with 8 64-byte values, but we only have a 32-bit modulus so NOT optimal, but still solid
             let mut aligned_query_packed = AlignedMemory64::new(query_row_last_row.len());
             aligned_query_packed
                 .as_mut_slice()
@@ -475,15 +485,20 @@ pub fn run_ypir_on_params<const K: usize>(
                 .iter()
                 .map(|x| *x as u32)
                 .collect::<Vec<_>>();
+            // this isn't really packed
 
+            // remember, we only need queries that are of size db_dim1, db_dim2, because for DoublePIR we transponse our 2nd DB
             let query_col = y_client.generate_query(SEED_1, params.db_dim_2, true, target_col);
             let query_col_last_row = &query_col;
+            // recall, we have a larger modulus for DoublePIR (~=2^56)
+            // we decompose the larger modulus into two moduli <2^32, then pack them into a single 64-bit word
             let packed_query_col = pack_query(&params, query_col_last_row);
+            // the reason we use RLWE then convert them back to LWE is we want to stick to two clients: LWE client and RLWE client
 
             let query_size = query_row_last_row.len() * 4 + query_col_last_row.len() * 8;
 
             measurement.online.client_query_gen_time_ms = start.elapsed().as_millis() as usize;
-            debug!("Generated query in {} us", start.elapsed().as_micros());
+            debug!("Generated query in {} us", start.elapsed().as_micros()); // if this was important, we would do this different (LWE matrix multiply)
 
             online_upload_bytes = query_size + pub_params_size;
             debug!("Query size: {} bytes", online_upload_bytes);
@@ -505,6 +520,7 @@ pub fn run_ypir_on_params<const K: usize>(
         {
             (&mut chunk_mut[..db_rows]).copy_from_slice(queries[i].2.as_slice());
         }
+        // all_queries_packed stores only the SimplePIR queries (u32 * db_dim_1 bytes)
 
         let mut offline_values = offline_values.clone();
 
@@ -514,22 +530,6 @@ pub fn run_ypir_on_params<const K: usize>(
 
         let start_online_comp = Instant::now();
 
-        // Use CUDA-accelerated path if available
-        #[cfg(feature = "cuda")]
-        let responses = {
-            debug!("Using CUDA-accelerated online computation");
-            y_server.perform_online_computation_cuda::<K>(
-                &mut offline_values,
-                &all_queries_packed,
-                &queries
-                    .iter()
-                    .map(|x| (x.3.as_slice(), x.4.as_slice()))
-                    .collect::<Vec<_>>(),
-                Some(&mut measurement),
-            )
-        };
-
-        #[cfg(not(feature = "cuda"))]
         let responses = y_server.perform_online_computation::<K>(
             &mut offline_values,
             &all_queries_packed,

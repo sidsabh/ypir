@@ -70,9 +70,10 @@ impl LWEClient {
         ct
     }
 
+    // encrypts n values using a single polynomial (Toeplitz matrix expands to n rows)
     pub fn encrypt_many(&self, rng_pub: &mut ChaCha20Rng, v_pt: &[u32]) -> Vec<u32> {
         assert_eq!(v_pt.len(), self.lwe_params.n);
-        let mut rng = ChaCha20Rng::from_entropy();
+        let mut rng = ChaCha20Rng::from_entropy(); // noise fully random, not seeded
         let dg = DiscreteGaussian::init(self.lwe_params.noise_width);
 
         let mut a = Vec::new();

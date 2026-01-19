@@ -1,5 +1,4 @@
 #include <cuda_runtime.h>
-#include <cublas_v2.h>
 #include <cstdint>
 #include <cstdio>
 
@@ -77,7 +76,7 @@ __global__ void gemm_mod32_tiled_u8(
                    (uint64_t)Ds[k][threadIdx.x];
         }
 
-        acc = (uint32_t)acc;  // periodic mod 2^32
+        acc = (uint32_t)acc;  // periodic mod 2^32 - unnecessary unless DB dim > 2^22
         __syncthreads();
     }
 
@@ -101,7 +100,6 @@ __global__ void result_to_uint64(
 // Context
 
 struct ToeplitzContext {
-    cublasHandle_t handle;
 
     uint32_t* d_A;     // n × l1 Toeplitz, column major
     uint8_t*  d_D;     // l1 × l2 DB **stored as bytes now**
@@ -145,10 +143,6 @@ void* init_toeplitz_context(
     ToeplitzContext* ctx = new ToeplitzContext();
     if (!ctx) return nullptr;
 
-    if (cublasCreate(&ctx->handle) != CUBLAS_STATUS_SUCCESS) {
-        delete ctx;
-        return nullptr;
-    }
 
     ctx->n  = n;
     ctx->l1 = db_rows;
@@ -255,7 +249,6 @@ void free_toeplitz_context(void* context) {
     if (ctx->d_D)      cudaFree(ctx->d_D);   // now uint8_t*
     if (ctx->d_result) cudaFree(ctx->d_result);
 
-    cublasDestroy(ctx->handle);
     delete ctx;
 }
 

@@ -90,14 +90,15 @@ pub fn raw_generate_expansion_params<'a>(
     let g_exp_ntt = g_exp.ntt();
     let mut res = Vec::new();
 
-    for i in 0..num_exp {
+    for i in 0..num_exp { // generates log D automorphism keys
         let t = (params.poly_len / (1 << i)) + 1;
         let tau_sk_reg = automorph_alloc(&sk_reg, t);
-        let prod = &tau_sk_reg.ntt() * &g_exp_ntt;
+        let prod = &tau_sk_reg.ntt() * &g_exp_ntt; // PolyMatrixNTT mult overloaded
 
         // let w_exp_i = client.encrypt_matrix_reg(&prod, rng, rng_pub);
         let sample = get_fresh_reg_public_key(params, &sk_reg, m_exp, rng, rng_pub);
-        let w_exp_i = &sample + &prod.pad_top(1);
+        let w_exp_i = &sample + &prod.pad_top(1); //PolyMatrixNTT add overloaded
+        // why is this padded? we are just adding our automorphed secret key times the integral vector, so we want to add to the non-random portion
         res.push(w_exp_i);
     }
 
@@ -210,6 +211,7 @@ impl<'a> YClient<'a> {
         let scale_k = self.params.modulus / self.params.pt_modulus;
 
         for i in 0..(1 << dim_log2) {
+            // create a single polynomial of all zeroes (num_coeffs = rows * cols * params.poly_len)
             let mut scalar = PolyMatrixRaw::zero(self.params, 1, 1);
             let is_nonzero = i == (index / self.params.poly_len);
 
@@ -220,11 +222,14 @@ impl<'a> YClient<'a> {
             if packing {
                 let factor =
                     invert_uint_mod(self.params.poly_len as u64, self.params.modulus).unwrap();
+                // say we have a PolyMatrix. this is a matrix of polynomials. 1x1 matrix means we have one polynomial
+                // converting a PolyMatrixRaw to PolyMatrixNTT would be an isomorphic transformation (1x1 matrix -> 1x1 matrix), but each element is an NTT instead of a polynomial (should be same size, but we do CRT so num_crt times larger)
                 scalar = scalar_multiply_alloc(
                     &PolyMatrixRaw::single_value(self.params, factor).ntt(),
                     &scalar.ntt(),
                 )
                 .raw();
+                // at this point we have a polynomial in NTT form where (if is_nonzero) the desired index encrypts the value 1 (times the modulus scale (q/p) and divided by the inverse of the polynomial length for the NTT)
             }
 
             // if public_seed_idx == SEED_0 {
@@ -233,6 +238,10 @@ impl<'a> YClient<'a> {
             // }
 
             let ct = if multiply_ct {
+                // recall a RLWE CT: (a, -s*a + e + µ*floor(q/p))
+                // when we do negacyclic NTT/iNTT, we scale the result by the dimension of the polynomial (recall: q \equiv 1 mod 2N)
+                // upon decryption, we cancel -s*a, so the scale doesn't matter for those term. to correctly get µ, we have to downscale
+                // both the µ and noise e have to be pre-scaled, hence these scalar_mutliply_alloc and encrypt_matrix_scaled_reg calls
                 let factor =
                     invert_uint_mod(self.params.poly_len as u64, self.params.modulus).unwrap();
 
@@ -243,12 +252,16 @@ impl<'a> YClient<'a> {
                     factor,
                 )
             } else {
+                // this just encrypts the single polynomial using RLWE (output: ct in Rq^2)
                 self.inner.encrypt_matrix_reg(
                     &scalar.ntt(),
                     &mut ChaCha20Rng::from_entropy(),
                     &mut rng_pub,
                 )
             };
+
+            let ct_raw = ct.raw();
+            out.push(ct_raw);
 
             // let mut ct = self.inner.encrypt_matrix_reg(
             //     &scalar.ntt(),
@@ -274,7 +287,6 @@ impl<'a> YClient<'a> {
             //     );
             // }
 
-            let ct_raw = ct.raw();
             // let ct_0_nega = negacyclic_perm(ct_raw.get_poly(0, 0), 0, self.params.modulus);
             // let ct_1_nega = negacyclic_perm(ct_raw.get_poly(1, 0), 0, self.params.modulus);
             // let mut ct_nega = PolyMatrixRaw::zero(self.params, 2, 1);
@@ -293,7 +305,6 @@ impl<'a> YClient<'a> {
             //     assert_eq!(result[0], 7);
             // }
 
-            out.push(ct_raw);
         }
 
         out
@@ -334,9 +345,17 @@ impl<'a> YClient<'a> {
                 }
             }
 
-            lwes
+            lwes // (n+1) × dim, where each column is an LWE ciphertext
         } else {
+            // only do this if we're packing. what is packing?
+            // weirdly I think this conditional is just a way of having the same interface for generating the two queries, even though the operation is entirely separate (different moduli space, encryption method)
             let out = self.generate_query_impl(public_seed_idx, dim_log2, packing, index_row);
+            // at this point, we have fully encrypted the vector with all 0s and 1 at index using RLWE.
+            // say the length of that vector is l_2, and the length of the RLWE poly is d_2. then we have m_2 = l_2/d_2 RLWE CTs
+            // out matrix dims: 2 x m_2
+            // what do we do now?
+            // we just pull out all the RLWE non-random components, and stack them as u64s
+            // the exact same as if we had done LWE with the Toeplitz matrix of the polynomial
             let lwes = self.rlwes_to_lwes(&out);
             lwes
         }
