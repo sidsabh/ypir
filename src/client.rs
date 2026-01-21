@@ -98,7 +98,6 @@ pub fn raw_generate_expansion_params<'a>(
         // let w_exp_i = client.encrypt_matrix_reg(&prod, rng, rng_pub);
         let sample = get_fresh_reg_public_key(params, &sk_reg, m_exp, rng, rng_pub);
         let w_exp_i = &sample + &prod.pad_top(1); //PolyMatrixNTT add overloaded
-        // why is this padded? we are just adding our automorphed secret key times the integral vector, so we want to add to the non-random portion
         res.push(w_exp_i);
     }
 

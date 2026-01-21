@@ -6,6 +6,7 @@ use spiral_rs::{arith::*, params::*};
 use super::lwe::LWEParams;
 
 // CRT moduli for RLWE modulus (~= 2^56)
+// NTT-friendly: (268369921*249561089)%(2*2048) = 1
 static DEFAULT_MODULI: [u64; 2] = [268369921u64, 249561089u64];
 const DEF_MOD_STR: &str = "[\"268369921\", \"249561089\"]";
 

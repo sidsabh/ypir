@@ -285,6 +285,7 @@ pub fn precompute_pack<'a>(
     assert_eq!(params.crt_count, 2);
 
     let mut working_set = rlwe_cts.to_vec();
+    assert_eq!(working_set.len(), 1 << ell);
 
     let mut y_times_ct_odd = PolyMatrixNTT::zero(params, 2, 1);
     let mut neg_y_times_ct_odd = PolyMatrixNTT::zero(params, 2, 1);
@@ -309,12 +310,16 @@ pub fn precompute_pack<'a>(
 
     let mut res = Vec::new();
 
+
+    // Algo2, but we skip the base case
     for cur_ell in 1..=ell {
+        // last step: two RLWEs in, one RLWE out
         let num_in = 1 << (ell - cur_ell + 1);
         let num_out = num_in >> 1;
 
         let (first_half, second_half) = (&mut working_set[..num_in]).split_at_mut(num_out);
 
+        // for each call to Algo2 at this level of the tree
         for i in 0..num_out {
             let now = Instant::now();
             let ct_even = &mut first_half[i];
@@ -322,6 +327,9 @@ pub fn precompute_pack<'a>(
 
             let (y, neg_y) = (&y_constants.0[cur_ell - 1], &y_constants.1[cur_ell - 1]);
 
+            // ct <- LHS + automorph(RHS, 2^curr_ell+1)
+            // LHS: ct_even + y_times_ct_odd
+            // RHS: ct_even + neg_y_times_ct_odd
             scalar_multiply_avx(&mut y_times_ct_odd, &y, &ct_odd);
             scalar_multiply_avx(&mut neg_y_times_ct_odd, &neg_y, &ct_odd);
 
@@ -330,9 +338,10 @@ pub fn precompute_pack<'a>(
             fast_add_into_no_reduce(ct_even, &y_times_ct_odd);
             total_3 += now.elapsed().as_micros();
 
+            // all this is to calculate the automorphism, so we can add it into ct_even
             {
-                let ct: &PolyMatrixNTT<'_> = &ct_sum_1;
-                let t = (1 << cur_ell) + 1;
+                let ct: &PolyMatrixNTT<'_> = &ct_sum_1; // we want to automorph him
+                let t = (1 << cur_ell) + 1; // tau
                 let t_exp = params.t_exp_left;
                 let (cur_ginv_ct_ntt, cur_ct_auto_1_ntt) = {
                     let now = Instant::now();
@@ -341,14 +350,20 @@ pub fn precompute_pack<'a>(
                     // nb: scratch has 2nd row of ct in uncrtd form,
                     //     ct_raw has only first row
                     from_ntt_scratch(&mut ct_raw, scratch_mut_slc, ct);
+                    // ct_raw now stores the random portion in raw form
+                    // 2 NTTs because 2 CRT moduli
+                    // only counting for the base level, just for debug purposes
                     if cur_ell == 1 {
                         num_ntts += 2;
                     }
                     total_0 += now.elapsed().as_micros();
                     let now = Instant::now();
+                    // we had to get in raw because the first part of the automorphism before calling KeySwitch applies the automorphism in the raw
+                    // ct_auto stores automorph(ct_raw, t)
                     automorph(&mut ct_auto, &ct_raw, t);
                     total_1 += now.elapsed().as_micros();
 
+                    // we'll now copy the automorphed ct into t_exp_left (log_z(q2)) many rows using base_z decomposition
                     gadget_invert_rdim(&mut ginv_ct, &ct_auto, 1);
 
                     let skip_first_gadget_dim = false;
@@ -369,7 +384,11 @@ pub fn precompute_pack<'a>(
                         // num_ntts += ginv_ct_ntt.rows * ginv_ct_ntt.cols;
                     }
 
+                    // ginv_ct_ntt stores the g^-1(ct_auto) in NTT form
+
                     let now = Instant::now();
+                    // scratch_mut_slc stored the CRT-level raw form of the polynomial
+                    // we then automorph this CRT-raw form, then we put it back in NTT form
                     automorph_poly_uncrtd(params, ct_auto_1_ntt.as_mut_slice(), scratch_mut_slc, t);
                     ntt_forward(params, ct_auto_1_ntt.as_mut_slice());
                     // num_ntts += 1;
@@ -384,17 +403,26 @@ pub fn precompute_pack<'a>(
                 //     &ct_auto_1_ntt.raw().as_slice()[..30]
                 // );
 
+
+                // we are caching g^−1𝑧(𝜏 (𝑐0)), so once we get the real KS matrix we can compute the final
                 res.push(condense_matrix(params, cur_ginv_ct_ntt));
 
+                // the correct KS key? we have log(d2) many keys
+                // at the current level, we multiplied with y_constant[curr_ell - 1]. y_constants are stored as X^(d2/2^L) from L = [1..log2(d2)]
+                // we have, as input, 2^(ell-cur_ell+1) many CTs, so t =ell-cur_ell+1 which coresponds to key t and -1 for 1-indexing
                 let pub_param = &fake_pub_params[params.poly_len_log2 - 1 - (cur_ell - 1)];
                 // let ginv_ct_ntt = ginv_ct.ntt();
                 // let w_times_ginv_ct = pub_param * &ginv_ct_ntt;
                 w_times_ginv_ct.as_mut_slice().fill(0);
+                // we multiply to get the full W_t*g^-1(auto(ct_sum_1))
+                // we only need the random portion, but the pub_param is an KS key on a key of zeroes? so it at least has noise? is this ignored?
                 multiply_no_reduce(&mut w_times_ginv_ct, &pub_param, &cur_ginv_ct_ntt, 0);
 
                 // &ct_auto_1_ntt.pad_top(1) + &w_times_ginv_ct
                 let now = Instant::now();
-                add_into_at_no_reduce(ct_even, &cur_ct_auto_1_ntt, 1, 0);
+                // i have no clue why we are adding cur_ct_auto_1_ntt into the non-random portion?
+                // add_into_at_no_reduce(ct_even, &cur_ct_auto_1_ntt, 1, 0);
+                // yep! this line is a bug..., but ignored because the online portion just overwrites it.
                 add_into(ct_even, &w_times_ginv_ct);
                 total_2 += now.elapsed().as_micros();
             };
@@ -410,6 +438,7 @@ pub fn precompute_pack<'a>(
         debug!("total_4: {} us", total_4);
     }
 
+    // After computing W · g −1 𝑧 (𝜏 (𝑐0)), the server needs to apply the automorphism 𝜏 to the message-embedding component of the ciphertext (i.e., compute 𝜏 (𝑐1)). If 𝑐1 is in NTT representation, then the NTT representation of 𝜏 (𝑐1) is simply a permutation on the NTT representation of 𝑐1. In our implementation, the server simply pre-computes and caches the log𝑑2 permutations used by CDKS.Pack. This way, the server does not need to perform additional NTTs when computing CDKS.Pack.
     let tables = generate_automorph_tables_brute_force(&params);
 
     (working_set[0].clone(), res, tables)
@@ -926,7 +955,7 @@ pub fn prep_pack_lwes<'a>(
     lwe_cts: &[u64],
     cols_to_do: usize,
 ) -> Vec<PolyMatrixNTT<'a>> {
-    let lwe_cts_size = params.poly_len * (params.poly_len + 1);
+    let lwe_cts_size = params.poly_len * (params.poly_len + 1); // CDKS square
     assert_eq!(lwe_cts.len(), lwe_cts_size);
 
     assert!(cols_to_do == params.poly_len);
@@ -941,6 +970,7 @@ pub fn prep_pack_lwes<'a>(
         for j in 0..params.poly_len {
             poly.push(lwe_cts[j * params.poly_len + i])
         }
+        // rotate per CDKS 3.2 / JeremyKun (sign-flip and reorder them)
         let nega = negacyclic_perm(&poly, 0, params.modulus);
 
         for j in 0..params.poly_len {
@@ -962,15 +992,19 @@ pub fn prep_pack_many_lwes<'a>(
     let lwe_cts_size = (params.poly_len + 1) * (num_rlwe_outputs * params.poly_len);
     assert_eq!(lwe_cts.len(), lwe_cts_size);
 
+    // vecs stores rho LWE squares
+    // each LWE square is of dim d2x(d2+1) (each column is a single LWE)
     let mut vecs = Vec::new();
     for i in 0..num_rlwe_outputs {
         let mut v = Vec::new();
+        // for each row
         for j in 0..params.poly_len + 1 {
+            // grab d2 many elements
             v.extend(
-                &lwe_cts[j * (num_rlwe_outputs * params.poly_len) + i * params.poly_len..]
-                    [..params.poly_len],
+                &lwe_cts[j * (num_rlwe_outputs * params.poly_len) + i * params.poly_len..][..params.poly_len],
             );
         }
+        // v stores poly_len x poly_len+1 
         vecs.push(v);
     }
 
@@ -1169,6 +1203,14 @@ pub fn automorph_ntt_tables(poly_len: usize, log2_poly_len: usize) -> Vec<Vec<us
     tables
 }
 
+// this is a really neat trick
+// in NTT space, an automorphism is just a permutation of the NTT values (unlike in coefficient space)
+// so:
+// we randomly sample a poly, get its NTT
+// we automorph the poly (for each possible tau (#log(d2))), get its NTT
+// we match NTT values to find which slot mapped to which
+// since NTT values are (hopefully) unique, equal values reveal the permutation
+// if there's a collision (two slots with same value), retry with a new random poly
 pub fn generate_automorph_tables_brute_force(params: &Params) -> Vec<Vec<usize>> {
     let mut tables = Vec::new();
     for i in (1..=params.poly_len_log2).rev() {

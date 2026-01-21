@@ -75,12 +75,14 @@ pub fn split_alloc(
         // read this column
         let mut bit_offs = 0;
         for i in 0..rows {
+            // even though hint was stored in u64, it only needed u32, then mod switch down to u28, so we grab the value and only store those 28 bits
             let inp = buf[i * cols + j];
             // if j < 10 {
             //     debug!("({},{}) inp: {}", i, j, inp);
             // }
 
             if i == rows - 1 {
+                // the reason we explicitly set this is because we ceil'd the division for the offset in each 
                 bit_offs = special_bit_offs;
             }
 
@@ -130,6 +132,7 @@ pub fn split_alloc(
 }
 
 pub fn generate_fake_pack_pub_params<'a>(params: &'a Params) -> Vec<PolyMatrixNTT<'a>> {
+    // sk is 0, since this is server pre-processing no client
     let pack_pub_params = raw_generate_expansion_params(
         &params,
         &PolyMatrixRaw::zero(&params, 1, 1),
@@ -455,10 +458,10 @@ where
                 }
                 to_ntt(&mut db_elem_ntt, &db_elem_poly);
 
-                multiply(&mut prod, &preprocessed_query[row], &db_elem_ntt);
+                multiply(&mut prod, &preprocessed_query[row], &db_elem_ntt); // CRT-based modulo multiply
 
                 if row == db_rows_poly - 1 {
-                    add_into(&mut sum, &prod);
+                    add_into(&mut sum, &prod); // can take modulo since NTT-friendly
                 } else {
                     add_into_no_reduce(&mut sum, &prod);
                 }
@@ -485,9 +488,15 @@ where
 
     pub fn generate_pseudorandom_query(&self, public_seed_idx: u8) -> Vec<PolyMatrixNTT<'a>> {
         let mut client = Client::init(&self.params);
-        client.generate_secret_keys();
+        client.generate_secret_keys(); // short-secret LWE for automorphisms
         let y_client = YClient::new(&mut client, &self.params);
+
+        // recall - for the query over DB2 (DoublePIR), we used this same call
+        // it generates RLWE encryption of a column, which is equivalent to an LWE encryption under the negacyclic matrix
         let query = y_client.generate_query_impl(public_seed_idx, self.params.db_dim_1, true, 0);
+
+        // this is basically just grabbing the random portion (A2)
+        // correct, but not efficient
         let query_mapped = query
             .iter()
             .map(|x| x.submatrix(0, 0, 1, 1))
@@ -722,7 +731,7 @@ where
             for idx in 0..n {
                 a[idx] = rng_pub.sample::<u32, _>(rand::distributions::Standard);
             }
-            let nega_perm_a = negacyclic_perm_u32(&a); // re-write a so that an LWE can be interpreted as an RLWE under the same key—yes, negacylic_matrix_u32 is the Toeplitz analogue of negacylic_perm_u32
+            let nega_perm_a = negacyclic_perm_u32(&a); // re-write a so that an LWE can be interpreted as an RLWE under the same key—yes, negacyclic_matrix_u32 is the Toeplitz analogue of negacyclic_perm_u32
             let nega_perm_a_ntt = conv.ntt(&nega_perm_a);
             v_nega_perm_a.push(nega_perm_a_ntt);
         }
@@ -790,6 +799,7 @@ where
                     
                     let col_poly_raw = conv.raw(&col_poly_u32);
 
+                    // writes one column of the row-major matrix
                     for i in 0..n {
                         hint_0[i * db_cols + col] += col_poly_raw[i] as u64;
                         hint_0[i * db_cols + col] %= 1u64 << 32; // mod to Zq
@@ -1011,7 +1021,6 @@ where
             .collect::<Vec<_>>();
 
         // now we have hint_0, we just modulus shift it down
-
         // SID: not sure why we're storing it as a Vec<u64> if we already computed the hint, modded by q (2^32), then again modulus switched down to 2^28
 
         // split and do a second PIR over intermediate_cts
@@ -1024,10 +1033,14 @@ where
 
         debug!("Splitting intermediate cts...");
 
+        // smaller_db: [H1 | T]: Z_p^(~(k*(d1+1)) + ~DB_dim_2) (~ because poly padded)
+        // have to expand over the row-space because the column space is fixed
+        // write now T is all zeroes per the concat
+        // u16 because the plaintext space for the RLWE is 2^15
         let smaller_db = split_alloc(
             &intermediate_cts_rescaled,
             special_bit_offs,
-            lwe_params.n + 1,
+            lwe_params.n + 1, // n represents H1, 1 is for T
             db_cols,
             out_rows,
             lwe_q_prime_bits,
@@ -1038,6 +1051,9 @@ where
         debug!("Done splitting intermediate cts.");
 
         // This is the 'intermediate' db after the first pass of PIR and expansion
+        // INP TRANSPOSED == TRUE!!!
+        // smaller_db is row-major matrix of out_rows x db_cols
+        // its stored as row-major as well
         let smaller_server: YServer<u16> = YServer::<u16>::new(
             &self.smaller_params,
             smaller_db.into_iter(),
@@ -1047,27 +1063,70 @@ where
         );
         debug!("gen'd smaller server.");
 
+
+        // we just want to calculate H2 = A2 * H1 (recall, we padded H1 num_rows to poly_len)
+        // this is an alternate way of generating a hint
+        // for hint_0, we called generate_hint_0_ring, which the whole NTT thing
+        // in perform_offline_precomputation_simplepir, we use this method to generate hint_0, so they must be functionally equivalent 
+
+        // there is an identify between the encryption of query_row and the computation of hint_0
+            // we work in the LWE space
+            // query_row was encrypted by sampling a polynomial in q1=2^32 modulus, then getting the negacyclic_matrix and encrypting d1 pt at a time
+            // hint_0 was computed using NTTs by sampling the same polynomial, using negacyclic_perm
+            // negacyclic isn't really necessary since we don't pack this (it is for YPIR-SP)
+        // there is an identify between the encryption of query_col and the computation of hint_1
+            // we work in RLWE space
+            // query_col was encrypted using the polynomial in q2=2^56 modulus, encrypting d2 pt at a time
+            // hint_1 is computed using the same same poylnomial
+            // neither was negacyclic, so in order to pack and unpack that has to be done at some point (CDKS 3.2 /JeremyKun)
+            // yes-confirmed the random portions for the preprocess are negacyclically transformed in prepack_many_lwes, and the random portion for on the SimplePIR response encryption is negacyclically transformed before packing!!
+
+        // gets A2 in NTT form through obfuscated method
+        // then does same NTT multiply as in generate_hint_0_ring, but NTT-friendly so no modulo concerns
+        // PolyMatrixRaw/NTT are stored in u64, so there was no overflow concern on adds (mods at the end)
+        
+        
+        // fascinatingly, they pass the rows as the cols, but the DB was stored as row-major, so the column major access will actually be a row-based access
+        // we initialized smaller_server with the transpose, so it didn't change it to column major, we also set its params to be swapped just like we pass in here
+        // we compute DB2 * A2, iterating each row by poly and multiplying by A2's poly, giving H2 stored row-major: out_rows x poly_len
+        // at the end, they transpose, getting a row-major poly_len x out_rows
         let hint_1 = smaller_server.answer_hint_ring(
             SEED_1,
             1 << (smaller_server.params.db_dim_2 + smaller_server.params.poly_len_log2),
         );
         assert_eq!(hint_1.len(), params.poly_len * out_rows);
+        // T was 0, so transp(T*A2) will also be 0
         assert_eq!(hint_1[special_offs], 0);
         assert_eq!(hint_1[special_offs + 1], 0);
 
+        // A2 in NTT form (we already generated this in the creation of hint_1)
         let pseudorandom_query_1 = smaller_server.generate_pseudorandom_query(SEED_1);
+
+        // generates the possible rotations needed for the CDKS FFT tree algorithm
         let y_constants = generate_y_constants(&params);
 
-        let combined = [&hint_1[..], &vec![0u64; out_rows]].concat();
-        assert_eq!(combined.len(), out_rows * (params.poly_len + 1));
+        // now we just add the last row to store the DoublePIR response
+        let combined = [&hint_1[..], &vec![0u64; out_rows]].concat(); // stored in row major
+        assert_eq!(combined.len(), out_rows * (params.poly_len + 1)); // full DoublePIR response, 0s everywhere besides H2
+
+        // all this does is get the rho many CDKS RLWE squares, drops the b (0), negacylic perms them, then puts them in NTT form. it is a full CT, but the non-random portion is empty
         let prepacked_lwe = prep_pack_many_lwes(&params, &combined, rho);
+        assert_eq!(prepacked_lwe.len(), rho);
+        assert_eq!(prepacked_lwe[0].len(), params.poly_len);
 
         let now = Instant::now();
+        // generates automorphism keys, doesn't actually encrypt sk, so only random portion is valid
         let fake_pack_pub_params = generate_fake_pack_pub_params(&params);
 
         let mut precomp: Precomp = Vec::new();
         for i in 0..prepacked_lwe.len() {
-            let tup = precompute_pack(
+            // for each CDKS square, we compute the final RLWE random portion
+            // Algo2 from CDKS, only on the random portion
+            // input: d2 many polynomials, log(d2) many automorphism keys, Y constants in NTT for multiplication-based rotations (the value of 1X^(d2/(2^l)) for l in [1..log(d2)])
+            // output.0 is the 1 RLWE for the random portion
+            // output.1 is the cached NTT for g−1𝑧(𝜏 (𝑐0)) at each level
+            // output.2 is the cached lookup tables for the automorphism. tau->{(i, remap_i)}
+            let tup: (PolyMatrixNTT<'_>, Vec<PolyMatrixNTT<'_>>, Vec<Vec<usize>>) = precompute_pack(
                 params,
                 params.poly_len_log2,
                 &prepacked_lwe[i],
@@ -1375,9 +1434,6 @@ where
 
         let out_rows = 1 << (smaller_params.db_dim_2 + params.poly_len_log2);
         // number of blocks of RLWE that we pack
-        // notice that d1 != d2, so we actually pack d2 LWEs (each of dim d1+1) into one RLWE ct where the ring is is mod by (X^d_2 + 1)
-            // that is, the first step of the FFT-tree will have RLWE's with only d1 coefficients
-        // implicility padded by the log2 $ ceil composition
         let rho = 1 << smaller_params.db_dim_2;
         assert_eq!(smaller_params.db_dim_1, params.db_dim_2);
         assert!(out_rows as f64 >= (blowup_factor * (lwe_params.n + 1) as f64));
@@ -1394,6 +1450,7 @@ where
         // Begin online computation
 
         // SID: TODO CARRY ON HERE AFTER GROK OFFLINE
+        // 1/22
 
         let online_phase = Instant::now();
         let first_pass = Instant::now();
