@@ -444,6 +444,10 @@ pub fn precompute_pack<'a>(
     (working_set[0].clone(), res, tables)
 }
 
+// online packing, given the tuple
+// res: random portion
+// vals: NTT of the ginv(a) at each non-leaf in FFT tree
+// tables: table[tau][idx] -> new_idx
 pub fn pack_using_precomp_vals<'a>(
     params: &'a Params,
     ell: usize,
@@ -454,8 +458,13 @@ pub fn pack_using_precomp_vals<'a>(
     precomp_tables: &[Vec<usize>],
     y_constants: &(Vec<PolyMatrixNTT<'a>>, Vec<PolyMatrixNTT<'a>>),
 ) -> PolyMatrixNTT<'a> {
-    // let now = Instant::now();
-    // let mut working_set = vec![PolyMatrixNTT::zero(params, 1, 1); 1 << ell];
+    // packing algorithm  for n = 2^ell ciphertexts require (n − 1) automorphisms
+    // FFT tree's height is log2(2048)+1 = 12, 2^12-1 nodes, each non-leaf node does one automorphism -> 4095-2048=2047
+    assert_eq!(precomp_vals.len(), (1 << ell)-1);
+
+    // Q: working set initialized to half of what it was in precompute_pack??
+    // A: the reason is because we are working only with the non-random portion of the RLWE ct
+    // we initialize the entire working_set to the 0 polynomial (NTT form), then we do the FFT to calculate the 
     let mut working_set = Vec::with_capacity(1 << (ell - 1));
     for _ in 0..(1 << (ell - 1)) {
         working_set.push(PolyMatrixNTT::zero(params, 1, 1));
@@ -465,8 +474,6 @@ pub fn pack_using_precomp_vals<'a>(
     let mut neg_y_times_ct_odd = PolyMatrixNTT::zero(params, 1, 1);
     let mut ct_sum_1 = PolyMatrixNTT::zero(params, 1, 1);
     let mut w_times_ginv_ct = PolyMatrixNTT::zero(params, 1, 1);
-
-    // println!("time_-1: {} us", now.elapsed().as_micros());
 
     let mut time_0 = 0;
     let mut time_1 = 0;
@@ -508,8 +515,6 @@ pub fn pack_using_precomp_vals<'a>(
             }
             time_1 += now.elapsed().as_micros();
 
-            // --
-
             let now = Instant::now();
             let ct: &PolyMatrixNTT<'_> = &ct_sum_1;
             let t = (1 << cur_ell) + 1;
@@ -518,10 +523,7 @@ pub fn pack_using_precomp_vals<'a>(
             idx_precomp += 1;
 
             let w = &pub_params[params.poly_len_log2 - 1 - (cur_ell - 1)];
-            // let w = pub_param.submatrix(1, 0, 1, pub_param.cols);
-            // let w_times_ginv_ct = &w * cur_ginv_ct_ntt;
-            // multiply(&mut w_times_ginv_ct, &w, &cur_ginv_ct_ntt);
-            // w_times_ginv_ct.as_mut_slice().fill(0);
+            // both w and g^-1(ct) are in condensed form
             fast_multiply_no_reduce(params, &mut w_times_ginv_ct, &w, &cur_ginv_ct_ntt, 0);
             num_muls += 1;
             time_2 += now.elapsed().as_micros();
@@ -535,6 +537,7 @@ pub fn pack_using_precomp_vals<'a>(
                 let now = Instant::now();
 
                 // second condition prevents overflow
+                // SID TODO: this is the only random "crypto" magic in this entire repo lol
                 if i < num_out / 2 && ((cur_ell - 1) % 5 != 0) {
                     fast_add_into_no_reduce(ct_even, &w_times_ginv_ct);
                 } else {
@@ -553,7 +556,6 @@ pub fn pack_using_precomp_vals<'a>(
             }
         }
     }
-    // let now = Instant::now();
 
     if false {
         println!("time_0: {} us", time_0);
@@ -573,45 +575,29 @@ pub fn pack_using_precomp_vals<'a>(
     let resulting_row_1 = resulting_row_1.as_slice();
 
     let mut res = precomp_res.clone();
-    // {
-    //     let r = res.raw();
-    //     println!("res row 0: {:?}", &r.get_poly(0, 0)[..30]);
-    //     println!("res row 1: {:?}", &r.get_poly(1, 0)[..30]);
-    // }
     res.get_poly_mut(1, 0).copy_from_slice(resulting_row_1);
 
-    // println!(
-    //     "precomp_res     row 1: {:?}",
-    //     &precomp_res.raw().get_poly(1, 0)[..30]
-    // );
-    // println!(
-    //     "resulting_row_1 row 1: {:?}",
-    //     &working_set[0].raw().get_poly(1, 0)[..30]
-    // );
-
-    // let mut res = precomp_res.clone();
 
     let mut out_raw = res.raw();
+    // all the packing magic is just about the random portion and how it re-encodes with the automorphism keys (affects both a and b)
+    // if we have a (R)LWE ct encoded under the secret key, we can always just add it into the phase without worrying!
+    // recall the LWEs that are packed are scaled by inv(d2) by generate_query_impl
+    // because the b's didn't go through that automorphism, we reverse that scaling!
     for z in 0..params.poly_len {
         let val = barrett_reduction_u128(params, b_values[z] as u128 * params.poly_len as u128);
-        let idx = params.poly_len + z;
+        let idx = params.poly_len + z; // second row
         out_raw.data[idx] += val;
+        // works only if you can guarantee out_raw.data[idx] + val < 2*modulus (true because each already % modulus)
         if out_raw.data[idx] >= params.modulus {
             out_raw.data[idx] -= params.modulus;
         }
     }
     let out = out_raw.ntt();
-    // println!("time_5: {} us", now.elapsed().as_micros());
-
-    // for z in 0..params.poly_len {
-    //     let b_value = b_values[z];
-    //     let val = barrett_u64(params, res.get_poly(1, 0)[z] + b_value);
-    //     res.get_poly_mut(1, 0)[z] = val;
-    // }
 
     out
 }
 
+// Algo1 CDKS, n = 1, N=poly_len
 pub fn pack_single_lwe<'a>(
     params: &'a Params,
     pub_params: &[PolyMatrixNTT<'a>],
@@ -805,6 +791,7 @@ pub fn fast_multiply_no_reduce(
     }
 }
 
+// combines two CRT moduli < 2^32 into a 64 bit word, element wise
 pub fn condense_matrix<'a>(params: &'a Params, a: &PolyMatrixNTT<'a>) -> PolyMatrixNTT<'a> {
     let mut res = PolyMatrixNTT::zero(params, a.rows, a.cols);
     for i in 0..a.rows {
@@ -1135,6 +1122,7 @@ pub fn pack_many_lwes<'a>(
     res
 }
 
+// similar to generate_y_constants
 fn rotation_poly<'a>(params: &'a Params, amount: usize) -> PolyMatrixNTT<'a> {
     let mut res = PolyMatrixRaw::zero(params, 1, 1);
     res.data[amount] = 1;

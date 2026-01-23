@@ -138,6 +138,7 @@ pub fn fast_batched_dot_product_avx512<const K: usize, T: Copy>(
 }
 
 // Non-AVX512 fallback version
+// a is CRT packed
 #[cfg(not(target_feature = "avx512f"))]
 pub fn fast_batched_dot_product_avx512<const K: usize, T: Copy + ToU64>(
     params: &Params,

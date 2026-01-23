@@ -113,6 +113,7 @@ pub fn decrypt_ct_reg_measured<'a>(
     let dec_result = client.decrypt_matrix_reg(ct).raw();
 
     let mut dec_rescaled = PolyMatrixRaw::zero(&params, dec_result.rows, dec_result.cols);
+    // rounding operation
     for z in 0..dec_rescaled.data.len() {
         dec_rescaled.data[z] = rescale(dec_result.data[z], params.modulus, params.pt_modulus);
     }
@@ -351,7 +352,9 @@ impl<'a> YClient<'a> {
             let out = self.generate_query_impl(public_seed_idx, dim_log2, packing, index_row);
             // at this point, we have fully encrypted the vector with all 0s and 1 at index using RLWE.
             // say the length of that vector is l_2, and the length of the RLWE poly is d_2. then we have m_2 = l_2/d_2 RLWE CTs
-            // out matrix dims: 2 x m_2
+            assert_eq!(out.len(), (1<<dim_log2));
+            assert_eq!(out[0].cols, 1);
+            assert_eq!(out[0].rows, 2);
             // what do we do now?
             // we just pull out all the RLWE non-random components, and stack them as u64s
             // the exact same as if we had done LWE with the Toeplitz matrix of the polynomial

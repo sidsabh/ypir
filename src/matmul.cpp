@@ -101,6 +101,7 @@ extern "C" {
 #define BASIS3      24
 #define MASK        0xff
 
+// AVX method
 void matMulVecPacked(uint32_t *out, const uint32_t *a, const uint32_t *b,
     size_t aRows, size_t aCols)
 {

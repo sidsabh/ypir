@@ -37,7 +37,8 @@ pub fn run_ypir_batched(
         assert!(item_size_bits <= 8, "Standard YPIR supports item sizes of 1-8 bits.");
         params_for_scenario(num_items, item_size_bits)
     };
-    // TODO: why is clients as a generic instead of a parameter? i think it was an attempt at adding cross-client batching and minimizing code changes, or maybe an AVX-512 thing
+    // Q: why is clients as a generic instead of a parameter? 
+    // A: CPU YPIR runs the DB-Q1 product using AVX. the supported number of clients: 1, 2, 4, or 8
     let measurement = match num_clients {
         1 => run_ypir_on_params::<1>(params, is_simplepir, trials),
         2 => run_ypir_on_params::<2>(params, is_simplepir, trials),
@@ -452,12 +453,15 @@ pub fn run_ypir_on_params<const K: usize>(
                 &mut ChaCha20Rng::from_entropy(),
                 &mut ChaCha20Rng::from_seed(STATIC_SEED_2),
             );
+            
+
+            assert_eq!(pack_pub_params.len(), params.poly_len_log2);
+            assert_eq!(pack_pub_params[0].cols, params.t_exp_left);
+            assert_eq!(pack_pub_params[0].rows, 2);
 
             // generated the key switching (automorphism) keys
 
             // now we are applying some CRT optimizations (all NTTs are consisting of two sets of coefficients for the two moduli) and dropping the random portion (YPIR 4.2)
-
-            // let pub_params_size = get_vec_pm_size_bytes(&pack_pub_params) / 2;
             let mut pack_pub_params_row_1s = pack_pub_params.to_vec();
             for i in 0..pack_pub_params.len() {
                 pack_pub_params_row_1s[i] =
@@ -475,13 +479,12 @@ pub fn run_ypir_on_params<const K: usize>(
 
             // then we align the allocation on a 64-byte boundary using rust allocator
             // interestingly, AVX-512 works as a SIMD operation with 8 64-byte values, but we only have a 32-bit modulus so NOT optimal, but still solid
-            let mut aligned_query_packed = AlignedMemory64::new(query_row_last_row.len());
-            aligned_query_packed
-                .as_mut_slice()
-                .copy_from_slice(&query_row_last_row);
-            let packed_query_row = aligned_query_packed;
-            let packed_query_row_u32 = packed_query_row
-                .as_slice()
+            // let mut aligned_query_packed = AlignedMemory64::new(query_row_last_row.len());
+            // aligned_query_packed
+            //     .as_mut_slice()
+            //     .copy_from_slice(&query_row_last_row);
+            // let packed_query_row = aligned_query_packed;
+            let packed_query_row_u32 = query_row_last_row
                 .iter()
                 .map(|x| *x as u32)
                 .collect::<Vec<_>>();
@@ -540,6 +543,10 @@ pub fn run_ypir_on_params<const K: usize>(
             Some(&mut measurement),
         );
 
+        assert_eq!(responses.len(), K);
+        assert_eq!(responses[0].len(), rho);
+        assert_eq!(responses[0][0].len(), doublepir_resp_bytes / rho);
+
         let online_server_time_ms = start_online_comp.elapsed().as_millis();
         let online_download_bytes = get_size_bytes(&responses); // TODO: this is not quite right for multiple clients
 
@@ -553,7 +560,7 @@ pub fn run_ypir_on_params<const K: usize>(
             let scheme_params = YPIRSchemeParams::from_params(&params, &lwe_params);
             let log2_corr_err = scheme_params.delta().log2();
             let log2_expected_outer_noise = scheme_params.expected_outer_noise().log2();
-            debug!("log2_correctness_err: {}", log2_corr_err);
+            debug!("log2_correctness_err: {}", log2_corr_err); // 2^-41.751921014932854
             debug!("log2_expected_outer_noise: {}", log2_expected_outer_noise);
 
             let start_decode = Instant::now();
@@ -564,8 +571,10 @@ pub fn run_ypir_on_params<const K: usize>(
                 let ct = PolyMatrixRaw::recover(&params, rlwe_q_prime_1, rlwe_q_prime_2, ct_bytes);
                 response.push(ct);
             }
+            // response now contains a full RLWE in q2 space
 
             debug!("decrypting outer cts...");
+            // monad referenced!
             let outer_ct = response
                 .iter()
                 .flat_map(|ct| {
@@ -576,13 +585,20 @@ pub fn run_ypir_on_params<const K: usize>(
                 .collect::<Vec<_>>();
             assert_eq!(outer_ct.len(), out_rows);
             // debug!("outer_ct: {:?}", &outer_ct[..]);
+            
+            
+            // now we have the column of our DB2
             let outer_ct_t_u8 = u64s_to_contiguous_bytes(&outer_ct, pt_bits);
 
+            // no clue why we're storing this as a PolyMatrixRaw if we're just using it as a vec
             let mut inner_ct = PolyMatrixRaw::zero(&params, 2, 1);
+
             let mut bit_offs = 0;
             let lwe_q_prime = lwe_params.get_q_prime_2();
             let special_offs =
                 ((lwe_params.n * lwe_q_prime_bits) as f64 / pt_bits as f64).ceil() as usize;
+
+            // first n values were packed tightly
             for z in 0..lwe_params.n {
                 let val = read_bits(&outer_ct_t_u8, bit_offs, lwe_q_prime_bits);
                 bit_offs += lwe_q_prime_bits;
@@ -595,10 +611,13 @@ pub fn run_ypir_on_params<const K: usize>(
                 inner_ct.data[z] = rescale(val, lwe_q_prime, lwe_params.modulus);
             }
 
-            let mut val = 0;
-            for i in 0..blowup_factor.ceil() as usize {
-                val |= outer_ct[special_offs + i] << (i * pt_bits);
-            }
+            // the non-random was stored at an offset
+            bit_offs = special_offs * pt_bits; 
+            let val = read_bits(&outer_ct_t_u8, bit_offs, lwe_q_prime_bits);
+            // let mut val = 0;
+            // for i in 0..blowup_factor.ceil() as usize {
+            //     val |= outer_ct[special_offs + i] << (i * pt_bits);
+            // }
             assert!(
                 val < lwe_q_prime,
                 "val: {}, lwe_q_prime: {}",

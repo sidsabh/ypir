@@ -355,6 +355,7 @@ where
         let db_rows_padded = self.db_rows_padded();
         let db_cols = self.db_cols();
         assert_eq!(aligned_query_packed.len(), K * query_rows * db_rows_padded);
+        assert_eq!(K, 1);
         assert_eq!(query_rows, 1);
 
         let now = Instant::now();
@@ -400,6 +401,8 @@ where
         let a_cols = a_true_cols / 4; // order is inverted on purpose, because db is transposed
         let b_rows = a_true_cols;
         let b_cols = K;
+        // this guy just calculates mat A x mat B (vec if K=1) in AVX form
+        // if you swap dimensions, then a column major A rows x cols is equivalent to a row major transposed A cols x rows
         matmul_vec_packed(
             result.as_mut_slice(),
             self.db_u32(),
@@ -410,6 +413,7 @@ where
             b_cols,
         );
         let t = Instant::now();
+        // this op is negligible compared to the matmul_vec_packed, a cost worth it to use SimplePIR's kernel and compute (A x DB) our hint on a column major DB
         let result = transpose_generic(&result, db_cols, K);
         debug!("Transpose in {} us", t.elapsed().as_micros());
         debug!("Fast dot product in {} us", now.elapsed().as_micros());
@@ -471,6 +475,7 @@ where
 
             // do negacyclic permutation (for first mul only)
             if seed_idx == SEED_0 && !self.ypir_params.is_simplepir {
+                // this never happens (negacyclic rules)
                 let sum_raw_transformed =
                     negacyclic_perm(sum_raw.get_poly(0, 0), 0, self.params.modulus);
                 result.extend(&sum_raw_transformed);
@@ -1069,7 +1074,7 @@ where
         // for hint_0, we called generate_hint_0_ring, which the whole NTT thing
         // in perform_offline_precomputation_simplepir, we use this method to generate hint_0, so they must be functionally equivalent 
 
-        // there is an identify between the encryption of query_row and the computation of hint_0
+        // there is an identity between the encryption of query_row and the computation of hint_0
             // we work in the LWE space
             // query_row was encrypted by sampling a polynomial in q1=2^32 modulus, then getting the negacyclic_matrix and encrypting d1 pt at a time
             // hint_0 was computed using NTTs by sampling the same polynomial, using negacyclic_perm
@@ -1125,7 +1130,7 @@ where
             // input: d2 many polynomials, log(d2) many automorphism keys, Y constants in NTT for multiplication-based rotations (the value of 1X^(d2/(2^l)) for l in [1..log(d2)])
             // output.0 is the 1 RLWE for the random portion
             // output.1 is the cached NTT for g−1𝑧(𝜏 (𝑐0)) at each level
-            // output.2 is the cached lookup tables for the automorphism. tau->{(i, remap_i)}
+            // output.2 is the cached lookup tables for the NTT automorphism (reduces to a permutation). tau->{(i, remap_i)}
             let tup: (PolyMatrixNTT<'_>, Vec<PolyMatrixNTT<'_>>, Vec<Vec<usize>>) = precompute_pack(
                 params,
                 params.poly_len_log2,
@@ -1137,174 +1142,187 @@ where
         }
         debug!("Precomp in {} us", now.elapsed().as_micros());
 
+        #[cfg(not(feature = "cuda"))]
+        {
+            OfflinePrecomputedValues {
+                    hint_0,
+                    hint_1,
+                    pseudorandom_query_1,
+                    y_constants,
+                    smaller_server: Some(smaller_server),
+                    prepacked_lwe,
+                    fake_pack_pub_params,
+                    precomp
+            }
+        }
+
         // GPU Upload Hook: Prepare CUDA context for online computation
         #[cfg(feature = "cuda")]
-        let cuda_context = {
-            debug!("Uploading data to GPU for online computation...");
-            let upload_start = Instant::now();
+        {
+            let cuda_context = {
+                debug!("Uploading data to GPU for online computation...");
+                let upload_start = Instant::now();
 
-            // Upload primary database for Step 1 (SimplePIR)
-            // DB is stored column-major: db_cols × db_rows_padded
-            // Pack 4 u8 values into each u32 (BASIS=8 bits)
-            // Keep column-major layout: db[col][row/4] in packed format
+                // Upload primary database for Step 1 (SimplePIR)
+                // DB is stored column-major: db_cols × db_rows_padded
+                // Pack 4 u8 values into each u32 (BASIS=8 bits)
+                // Keep column-major layout: db[col][row/4] in packed format
 
-            let db_rows_padded = self.db_rows_padded();
-            let db_cols = self.db_cols();
-            let db = self.db();
-            let packed_rows = db_rows_padded / 4;
+                let db_rows_padded = self.db_rows_padded();
+                let db_cols = self.db_cols();
+                let db = self.db();
+                let packed_rows = db_rows_padded / 4;
 
-            let mut db_u32_packed = vec![0u32; db_cols * packed_rows];
+                let mut db_u32_packed = vec![0u32; db_cols * packed_rows];
 
-            // Pack while maintaining column-major layout
-            for col in 0..db_cols {
-                for packed_row in 0..packed_rows {
-                    let mut packed = 0u32;
-                    for i in 0..4 {
-                        let row = packed_row * 4 + i;
-                        // Column-major index: col * db_rows_padded + row
-                        let val = db[col * db_rows_padded + row].to_u64() as u32;
-                        packed |= val << (i * 8);
+                // Pack while maintaining column-major layout
+                for col in 0..db_cols {
+                    for packed_row in 0..packed_rows {
+                        let mut packed = 0u32;
+                        for i in 0..4 {
+                            let row = packed_row * 4 + i;
+                            // Column-major index: col * db_rows_padded + row
+                            let val = db[col * db_rows_padded + row].to_u64() as u32;
+                            packed |= val << (i * 8);
+                        }
+                        // Column-major packed index: col * packed_rows + packed_row
+                        db_u32_packed[col * packed_rows + packed_row] = packed;
                     }
-                    // Column-major packed index: col * packed_rows + packed_row
-                    db_u32_packed[col * packed_rows + packed_row] = packed;
                 }
-            }
 
-            debug!("Packed DB (column-major): {} bytes -> {} u32 values ({} cols × {} packed_rows)",
-                db.len(), db_u32_packed.len(), db_cols, packed_rows);
+                debug!("Packed DB (column-major): {} bytes -> {} u32 values ({} cols × {} packed_rows)",
+                    db.len(), db_u32_packed.len(), db_cols, packed_rows);
 
-            // Create dummy A2t for now (Step 2 not implemented yet)
-            let a2t_dummy = vec![0u32; 1];
+                // Create dummy A2t for now (Step 2 not implemented yet)
+                let a2t_dummy = vec![0u32; 1];
 
-            // Get smaller_server DB for upload to GPU
-            let smaller_db = smaller_server.db();
-            let smaller_db_rows = out_rows;
-            let smaller_db_cols = db_cols;
+                // Get smaller_server DB for upload to GPU
+                let smaller_db = smaller_server.db();
+                let smaller_db_rows = out_rows;
+                let smaller_db_cols = db_cols;
 
-            debug!("Uploading smaller_server DB: {} rows × {} cols = {} u16 values",
-                   smaller_db_rows, smaller_db_cols, smaller_db.len());
+                debug!("Uploading smaller_server DB: {} rows × {} cols = {} u16 values",
+                    smaller_db_rows, smaller_db_cols, smaller_db.len());
 
-            match crate::cuda::OnlineComputeContext::new(
-                &db_u32_packed,
-                self.db_cols(),           // db_rows in CUDA = logical db_cols
-                self.db_rows_padded() / 4, // db_cols in CUDA = db_rows_padded / 4 (packed)
-                16,                       // max_batch_size (reasonable default)
-                &a2t_dummy,
-                1,                        // A2t_rows (dummy)
-                1,                        // A2t_cols (dummy)
-                smaller_db,
-                smaller_db_rows,
-                smaller_db_cols,
-            ) {
-                Ok(ctx) => {
-                    let upload_time = upload_start.elapsed();
-                    debug!("GPU upload completed in {:?}", upload_time);
-                    debug!("  DB size: {} MB", db_u32_packed.len() * 4 / (1024 * 1024));
-                    
-                    // Initialize NTT parameters
-                    let sp = &smaller_server.params;
-                    
-                    debug!("Flattening NTT tables...");
-                    let mut forward_table = Vec::with_capacity(sp.crt_count * sp.poly_len);
-                    let mut forward_prime_table = Vec::with_capacity(sp.crt_count * sp.poly_len);
-                    let mut inverse_table = Vec::with_capacity(sp.crt_count * sp.poly_len);
-                    let mut inverse_prime_table = Vec::with_capacity(sp.crt_count * sp.poly_len);
-                    
-                    for i in 0..sp.crt_count {
-                        forward_table.extend_from_slice(&sp.ntt_tables[i][0]);
-                        forward_prime_table.extend_from_slice(&sp.ntt_tables[i][1]);
-                        inverse_table.extend_from_slice(&sp.ntt_tables[i][2]);
-                        inverse_prime_table.extend_from_slice(&sp.ntt_tables[i][3]);
+                match crate::cuda::OnlineComputeContext::new(
+                    &db_u32_packed,
+                    self.db_cols(),           // db_rows in CUDA = logical db_cols
+                    self.db_rows_padded() / 4, // db_cols in CUDA = db_rows_padded / 4 (packed)
+                    16,                       // max_batch_size (reasonable default)
+                    &a2t_dummy,
+                    1,                        // A2t_rows (dummy)
+                    1,                        // A2t_cols (dummy)
+                    smaller_db,
+                    smaller_db_rows,
+                    smaller_db_cols,
+                ) {
+                    Ok(ctx) => {
+                        let upload_time = upload_start.elapsed();
+                        debug!("GPU upload completed in {:?}", upload_time);
+                        debug!("  DB size: {} MB", db_u32_packed.len() * 4 / (1024 * 1024));
+                        
+                        // Initialize NTT parameters
+                        let sp = &smaller_server.params;
+                        
+                        debug!("Flattening NTT tables...");
+                        let mut forward_table = Vec::with_capacity(sp.crt_count * sp.poly_len);
+                        let mut forward_prime_table = Vec::with_capacity(sp.crt_count * sp.poly_len);
+                        let mut inverse_table = Vec::with_capacity(sp.crt_count * sp.poly_len);
+                        let mut inverse_prime_table = Vec::with_capacity(sp.crt_count * sp.poly_len);
+                        
+                        for i in 0..sp.crt_count {
+                            forward_table.extend_from_slice(&sp.ntt_tables[i][0]);
+                            forward_prime_table.extend_from_slice(&sp.ntt_tables[i][1]);
+                            inverse_table.extend_from_slice(&sp.ntt_tables[i][2]);
+                            inverse_prime_table.extend_from_slice(&sp.ntt_tables[i][3]);
+                        }
+                        debug!("Flattening done. Calling init_ntt...");
+                        
+                        ctx.init_ntt(
+                            sp.poly_len as u32,
+                            sp.crt_count as u32,
+                            &sp.moduli,
+                            &sp.barrett_cr_1,
+                            &forward_table,
+                            &forward_prime_table,
+                            &inverse_table,
+                            &inverse_prime_table,
+                            sp.mod0_inv_mod1,
+                            sp.mod1_inv_mod0,
+                            sp.barrett_cr_0_modulus,
+                            sp.barrett_cr_1_modulus,
+                        );
+                        debug!("init_ntt returned.");
+
+                        Some(std::sync::Arc::new(ctx))
                     }
-                    debug!("Flattening done. Calling init_ntt...");
-                    
-                    ctx.init_ntt(
-                        sp.poly_len as u32,
-                        sp.crt_count as u32,
-                        &sp.moduli,
-                        &sp.barrett_cr_1,
-                        &forward_table,
-                        &forward_prime_table,
-                        &inverse_table,
-                        &inverse_prime_table,
-                        sp.mod0_inv_mod1,
-                        sp.mod1_inv_mod0,
-                        sp.barrett_cr_0_modulus,
-                        sp.barrett_cr_1_modulus,
-                    );
-                    debug!("init_ntt returned.");
-
-                    Some(std::sync::Arc::new(ctx))
+                    Err(e) => {
+                        log::warn!("Failed to create CUDA context: {}", e);
+                        None
+                    }
                 }
-                Err(e) => {
-                    log::warn!("Failed to create CUDA context: {}", e);
-                    None
-                }
-            }
-        };
+            };
 
-    #[cfg(feature = "cuda")]
-    if let Some(ref ctx) = cuda_context {
-        debug!("Flattening packing data...");
-        
-        // y_constants
-        let mut y_constants_flat = Vec::new();
-        for m in &y_constants.0 { y_constants_flat.extend_from_slice(m.as_slice()); }
-        for m in &y_constants.1 { y_constants_flat.extend_from_slice(m.as_slice()); }
-        
-        // prepacked_lwe
-        let mut prepacked_lwe_flat = Vec::new();
-        for v in &prepacked_lwe {
-            for m in v {
-                prepacked_lwe_flat.extend_from_slice(m.as_slice());
-            }
-        }
-        
-        // precomp
-        let mut precomp_res_flat = Vec::new();
-        let mut precomp_vals_flat = Vec::new();
-        let mut precomp_tables_flat = Vec::new();
-        
-        for (res, vals, tables) in &precomp {
-            precomp_res_flat.extend_from_slice(res.as_slice());
-            for v in vals {
-                precomp_vals_flat.extend_from_slice(v.as_slice());
-            }
-            for t in tables {
-                for &val in t {
-                    precomp_tables_flat.push(val as u64);
+            if let Some(ref ctx) = cuda_context {
+                debug!("Flattening packing data...");
+                
+                // y_constants
+                let mut y_constants_flat = Vec::new();
+                for m in &y_constants.0 { y_constants_flat.extend_from_slice(m.as_slice()); }
+                for m in &y_constants.1 { y_constants_flat.extend_from_slice(m.as_slice()); }
+                
+                // prepacked_lwe
+                let mut prepacked_lwe_flat = Vec::new();
+                for v in &prepacked_lwe {
+                    for m in v {
+                        prepacked_lwe_flat.extend_from_slice(m.as_slice());
+                    }
                 }
+                
+                // precomp
+                let mut precomp_res_flat = Vec::new();
+                let mut precomp_vals_flat = Vec::new();
+                let mut precomp_tables_flat = Vec::new();
+                
+                for (res, vals, tables) in &precomp {
+                    precomp_res_flat.extend_from_slice(res.as_slice());
+                    for v in vals {
+                        precomp_vals_flat.extend_from_slice(v.as_slice());
+                    }
+                    for t in tables {
+                        for &val in t {
+                            precomp_tables_flat.push(val as u64);
+                        }
+                    }
+                }
+                
+                // fake_pack_pub_params
+                let mut fake_pack_pub_params_flat = Vec::new();
+                for m in &fake_pack_pub_params {
+                    fake_pack_pub_params_flat.extend_from_slice(m.as_slice());
+                }
+                
+                debug!("Flattening done. Uploading packing data...");
+                ctx.init_packing_data(
+                    &y_constants_flat,
+                    &prepacked_lwe_flat,
+                    &precomp_res_flat,
+                    &precomp_vals_flat,
+                    &precomp_tables_flat,
+                    &fake_pack_pub_params_flat
+                );
             }
-        }
-        
-        // fake_pack_pub_params
-        let mut fake_pack_pub_params_flat = Vec::new();
-        for m in &fake_pack_pub_params {
-            fake_pack_pub_params_flat.extend_from_slice(m.as_slice());
-        }
-        
-        debug!("Flattening done. Uploading packing data...");
-        ctx.init_packing_data(
-            &y_constants_flat,
-            &prepacked_lwe_flat,
-            &precomp_res_flat,
-            &precomp_vals_flat,
-            &precomp_tables_flat,
-            &fake_pack_pub_params_flat
-        );
-    }
-
-    OfflinePrecomputedValues {
-            hint_0,
-            hint_1,
-            pseudorandom_query_1,
-            y_constants,
-            smaller_server: Some(smaller_server),
-            prepacked_lwe,
-            fake_pack_pub_params,
-            precomp,
-            #[cfg(feature = "cuda")]
-            cuda_context,
+            OfflinePrecomputedValues {
+                hint_0,
+                hint_1,
+                pseudorandom_query_1,
+                y_constants,
+                smaller_server: Some(smaller_server),
+                prepacked_lwe,
+                fake_pack_pub_params,
+                precomp,
+                cuda_context,
+            }
         }
     }
 
@@ -1449,11 +1467,10 @@ where
 
         // Begin online computation
 
-        // SID: TODO CARRY ON HERE AFTER GROK OFFLINE
-        // 1/22
-
         let online_phase = Instant::now();
         let first_pass = Instant::now();
+        // memory bandwidth right here! but this op is 60% of the time, so we have to optimize E2E
+        // ex: (    "firstPassTimeMs": 148, "secondPassTimeMs": 31,"ringPackingTimeMs": 63,)
         let intermediate = self.lwe_multiply_batched_with_db_packed::<K>(first_dim_queries_packed);
         let simplepir_resp_bytes = intermediate.len() / K * (lwe_q_prime_bits as usize) / 8;
         debug!("simplepir_resp_bytes {} bytes", simplepir_resp_bytes);
@@ -1515,6 +1532,7 @@ where
                 let blowup_factor_ceil = blowup_factor.ceil() as usize;
 
                 let phase = Instant::now();
+                // analogue to the answer_hint_ring call that generated H2 originally, now we generated A2 * T
                 let secondary_hint = smaller_server.multiply_with_db_ring(
                     &pseudorandom_query_1,
                     special_offs..special_offs + blowup_factor_ceil,
@@ -1524,20 +1542,13 @@ where
                     "multiply_with_db_ring took: {} us",
                     phase.elapsed().as_micros()
                 );
-                // let phase = Instant::now();
-                // let secondary_hint =
-                //     smaller_server_clone.answer_hint(SEED_1, special_offs..special_offs + blowup_factor_ceil);
-                // debug!(
-                //     "traditional answer_hint took: {} us",
-                //     phase.elapsed().as_micros()
-                // );
-
                 assert_eq!(secondary_hint.len(), params.poly_len * blowup_factor_ceil);
 
+                // now we write all the 
                 for i in 0..params.poly_len {
                     for j in 0..blowup_factor_ceil {
-                        let inp_idx = i * blowup_factor_ceil + j;
-                        let out_idx = i * out_rows + special_offs + j;
+                        let inp_idx = i * blowup_factor_ceil + j;//agree
+                        let out_idx = i * out_rows + special_offs + j;//agree
 
                         // assert_eq!(hint_1_combined[out_idx], 0); // we no longer clone for each query, just overwrite
                         hint_1_combined[out_idx] = secondary_hint[inp_idx];
@@ -1548,15 +1559,16 @@ where
 
             assert_eq!(hint_1_combined.len(), params.poly_len * out_rows);
 
+            // computing c2* [H1.extend(T)]
             let response: AlignedMemory64 = smaller_server.answer_query(packed_query_col);
+            // the result is in Zq2 (2^56) space (CRT composed), raw form, just a constant polynomial
             
             second_pass_time_ms += second_pass.elapsed().as_millis();
             let ring_packing = Instant::now();
             let now = Instant::now();
             assert_eq!(response.len(), 1 * out_rows);
 
-            // combined is now (poly_len + 1) * (out_rows)
-            // let combined = [&hint_1_combined[..], response.as_slice()].concat();
+            // put all the new "random" RLWEs into NTT form (A2*decomp(T)) ~ 2
             let mut excess_cts = Vec::with_capacity(blowup_factor.ceil() as usize);
             for j in special_offs..special_offs + blowup_factor.ceil() as usize {
                 let mut rlwe_ct = PolyMatrixRaw::zero(&params, 2, 1);
@@ -1583,6 +1595,8 @@ where
 
             // assert_eq!(pack_pub_params_row_1s[0].rows, 1);
 
+            // this will run the full packing over the rho many squares, now we can get all the real responses
+            // but we don't have the precomputed for the A2*decomp(T) RLWEs, so we just work with their b's and add that part of the RLWE in later (other_packed)
             let mut packed = pack_many_lwes(
                 &params,
                 &prepacked_lwe,
@@ -1603,7 +1617,12 @@ where
             let now = Instant::now();
             let other_packed =
                 pack_using_single_with_offset(&params, &pack_pub_params, &excess_cts, special_offs);
+            
+            // wouldn't it be packed[-1], and then modulo special_offs % poly_len? 
+            // well it turns out with our parameter choices in YPIR, we always pack into a single RLWE!!
+            // the other_packed just rotated to that slot
             add_into(&mut packed[0], &other_packed);
+
             debug!(
                 "pack_using_single_with_offset: {} us",
                 now.elapsed().as_micros()
