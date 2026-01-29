@@ -11,7 +11,8 @@ __global__ void build_toeplitz_matrix_negacyclic_u32(
     const uint32_t* __restrict__ poly,
     uint32_t* __restrict__ matrix,
     uint32_t n
-) {
+) 
+{
     uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
     if (col >= n) return;
 
@@ -37,7 +38,8 @@ __global__ void gemm_mod32_tiled_u8(
     uint32_t n,
     uint32_t l1,
     uint32_t l2
-) {
+) 
+{
     uint32_t row = blockIdx.y * TILE + threadIdx.y;
     uint32_t col = blockIdx.x * TILE + threadIdx.x;
 
@@ -90,7 +92,8 @@ __global__ void result_to_uint64(
     const uint32_t* result_u32,
     uint64_t* result_u64,
     uint32_t total
-) {
+) 
+{
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < total) {
         result_u64[idx] = (uint64_t)result_u32[idx];
@@ -99,7 +102,8 @@ __global__ void result_to_uint64(
 
 // Context
 
-struct ToeplitzContext {
+struct ToeplitzContext 
+{
 
     uint32_t* d_A;     // n × l1 Toeplitz, column major
     uint8_t*  d_D;     // l1 × l2 DB **stored as bytes now**
@@ -110,7 +114,18 @@ struct ToeplitzContext {
     uint32_t l2;
 };
 
-void free_toeplitz_context(void* context);
+// free_toeplitz_context
+void free_toeplitz_context(void* context) 
+{
+    ToeplitzContext* ctx = (ToeplitzContext*)context;
+    if (!ctx) return;
+
+    if (ctx->d_A)      cudaFree(ctx->d_A);
+    if (ctx->d_D)      cudaFree(ctx->d_D);   // now uint8_t*
+    if (ctx->d_result) cudaFree(ctx->d_result);
+
+    delete ctx;
+}
 
 // init_toeplitz_context
 
@@ -129,7 +144,8 @@ void* init_toeplitz_context(
     uint64_t mod1_inv_mod0,
     uint64_t barrett_cr_0_modulus,
     uint64_t barrett_cr_1_modulus
-) {
+) 
+{
     (void)moduli;
     (void)barrett_cr;
     (void)db_rows_padded;
@@ -196,7 +212,8 @@ void* init_toeplitz_context(
 
 // compute_hint_0_toeplitz
 
-int compute_hint_0_toeplitz(void* context, uint64_t* hint_0) {
+int compute_hint_0_toeplitz(void* context, uint64_t* hint_0) 
+{
     ToeplitzContext* ctx = (ToeplitzContext*)context;
     if (!ctx) return -1;
 
@@ -238,18 +255,6 @@ int compute_hint_0_toeplitz(void* context, uint64_t* hint_0) {
 
     cudaFree(d_hint_0);
     return 0;
-}
-
-// free_toeplitz_context
-void free_toeplitz_context(void* context) {
-    ToeplitzContext* ctx = (ToeplitzContext*)context;
-    if (!ctx) return;
-
-    if (ctx->d_A)      cudaFree(ctx->d_A);
-    if (ctx->d_D)      cudaFree(ctx->d_D);   // now uint8_t*
-    if (ctx->d_result) cudaFree(ctx->d_result);
-
-    delete ctx;
 }
 
 } // extern "C"

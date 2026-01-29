@@ -24,6 +24,16 @@ pub const STATIC_SEED_2: [u8; 32] = [
     2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 
+
+macro_rules! dispatch_const {
+    ($val:expr, [$($n:literal),+], |$name:ident| $body:expr) => {
+        match $val {
+            $($n => { const $name: usize = $n; $body },)+
+            _ => panic!("Unsupported value: {}", $val),
+        }
+    };
+}
+
 pub fn run_ypir_batched(
     num_items: usize,
     item_size_bits: usize,
@@ -39,21 +49,16 @@ pub fn run_ypir_batched(
     };
     // Q: why is clients as a generic instead of a parameter? 
     // A: CPU YPIR runs the DB-Q1 product using AVX. the supported number of clients: 1, 2, 4, or 8
-    let measurement = match num_clients {
-        1 => run_ypir_on_params::<1>(params, is_simplepir, trials),
-        2 => run_ypir_on_params::<2>(params, is_simplepir, trials),
-        3 => run_ypir_on_params::<3>(params, is_simplepir, trials),
-        4 => run_ypir_on_params::<4>(params, is_simplepir, trials),
-        5 => run_ypir_on_params::<5>(params, is_simplepir, trials),
-        6 => run_ypir_on_params::<6>(params, is_simplepir, trials),
-        7 => run_ypir_on_params::<7>(params, is_simplepir, trials),
-        8 => run_ypir_on_params::<8>(params, is_simplepir, trials),
-        9 => run_ypir_on_params::<9>(params, is_simplepir, trials),
-        10 => run_ypir_on_params::<10>(params, is_simplepir, trials),
-        11 => run_ypir_on_params::<11>(params, is_simplepir, trials),
-        12 => run_ypir_on_params::<12>(params, is_simplepir, trials),
-        _ => panic!("Unsupported number of clients: {}", num_clients),
-    };
+    #[cfg(feature = "cuda")]
+    let measurement = dispatch_const!(num_clients, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16], |N| {
+        run_ypir_on_params::<N>(params, is_simplepir, trials)
+    });
+
+    #[cfg(not(feature = "cuda"))]
+    let measurement = dispatch_const!(num_clients, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], |N| {
+        run_ypir_on_params::<N>(params, is_simplepir, trials)
+    });
+
     debug!("{:#?}", measurement);
     let db_size_bytes = (num_items * item_size_bits + 7) / 8;
     // hint preprocessing throughput: DB size / hint preprocessing time - GB/sec
@@ -64,7 +69,7 @@ pub fn run_ypir_batched(
     // throughput: DB size / online server time- GB/sec
     println!(
         "Throughput: {:.2} GB/sec",
-        (db_size_bytes as f64) / ((measurement.online.server_time_ms) as f64 / 1000.0) / (1 << 30) as f64
+        (num_clients * db_size_bytes) as f64 / ((measurement.online.server_time_ms) as f64 / 1000.0) / (1 << 30) as f64
     );
     measurement
 }
@@ -735,7 +740,7 @@ mod test {
     #[test]
     #[ignore]
     fn test_ypir_1gb() {
-        run_ypir_batched(1 << 33, 1, 1, false, 5);
+        run_ypir_batched(1 << 33, 1, 2, false, 1);
     }
 
     #[test]

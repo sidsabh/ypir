@@ -537,7 +537,8 @@ pub fn pack_using_precomp_vals<'a>(
                 let now = Instant::now();
 
                 // second condition prevents overflow
-                // SID TODO: this is the only random "crypto" magic in this entire repo lol
+                // since we store things in u64, we don't have to worry about reducing everytime
+                // reducing is some fn of the CRT moduli, u64, the multiplication dims (t==3), and the addition
                 if i < num_out / 2 && ((cur_ell - 1) % 5 != 0) {
                     fast_add_into_no_reduce(ct_even, &w_times_ginv_ct);
                 } else {

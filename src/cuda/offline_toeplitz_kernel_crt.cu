@@ -17,7 +17,8 @@ __global__ void build_toeplitz_matrix_negacyclic_double(
     double* __restrict__ matrix,
     uint32_t n,
     uint64_t p
-) {
+) 
+{
     uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
     if (col >= n) return;
 
@@ -39,7 +40,8 @@ __global__ void db_u8_to_double(
     double* __restrict__ dst,
     uint32_t total,
     uint64_t p
-) {
+) 
+{
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < total) {
         dst[idx] = (double)((uint32_t)db[idx] % p);
@@ -55,7 +57,8 @@ __global__ void crt_reconstruct_2_double(
     uint32_t l2,
     uint64_t p1, uint64_t p2,
     uint64_t inv1, uint64_t inv2
-) {
+) 
+{
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t total = n * l2;
     if (idx >= total) return;
@@ -86,7 +89,8 @@ __global__ void crt_reconstruct_2_double(
 }
 
 // Context
-struct ToeplitzContext {
+struct ToeplitzContext 
+{
     cublasHandle_t handle;
 
     uint8_t* d_db_u8;
@@ -105,8 +109,24 @@ struct ToeplitzContext {
     uint64_t inv2;
 };
 
+void free_toeplitz_context(void* context) 
+{
+    ToeplitzContext* ctx = (ToeplitzContext*)context;
+    if (!ctx) return;
+
+    cudaFree(ctx->d_db_u8);
+    cudaFree(ctx->d_A_p1);
+    cudaFree(ctx->d_A_p2);
+    cudaFree(ctx->d_C_p1);
+    cudaFree(ctx->d_C_p2);
+
+    cublasDestroy(ctx->handle);
+    delete ctx;
+}
+
 // Modular inverse using extended Euclidean algorithm
-uint64_t mod_inverse_u64(uint64_t a, uint64_t m) {
+uint64_t mod_inverse_u64(uint64_t a, uint64_t m) 
+{
     int64_t m0 = m;
     int64_t t, q;
     int64_t x0 = 0, x1 = 1;
@@ -124,8 +144,6 @@ uint64_t mod_inverse_u64(uint64_t a, uint64_t m) {
     return x1;
 }
 
-void free_toeplitz_context(void* context);
-
 void* init_toeplitz_context(
     const uint8_t* db,
     const uint32_t* v_nega_perm_a,
@@ -141,7 +159,8 @@ void* init_toeplitz_context(
     uint64_t mod1_inv_mod0,
     uint64_t barrett_cr_0_modulus,
     uint64_t barrett_cr_1_modulus
-) {
+) 
+{
     (void)moduli; (void)barrett_cr; (void)db_rows_padded;
     (void)crt_count; (void)max_adds; (void)mod0_inv_mod1;
     (void)mod1_inv_mod0; (void)barrett_cr_0_modulus; (void)barrett_cr_1_modulus;
@@ -204,7 +223,8 @@ void* init_toeplitz_context(
     return ctx;
 }
 
-int compute_hint_0_toeplitz(void* context, uint64_t* hint_0) {
+int compute_hint_0_toeplitz(void* context, uint64_t* hint_0) 
+{
     ToeplitzContext* ctx = (ToeplitzContext*)context;
     if (!ctx) return -1;
 
@@ -266,18 +286,5 @@ int compute_hint_0_toeplitz(void* context, uint64_t* hint_0) {
     return 0;
 }
 
-void free_toeplitz_context(void* context) {
-    ToeplitzContext* ctx = (ToeplitzContext*)context;
-    if (!ctx) return;
-
-    cudaFree(ctx->d_db_u8);
-    cudaFree(ctx->d_A_p1);
-    cudaFree(ctx->d_A_p2);
-    cudaFree(ctx->d_C_p1);
-    cudaFree(ctx->d_C_p2);
-
-    cublasDestroy(ctx->handle);
-    delete ctx;
-}
 
 } // extern "C"

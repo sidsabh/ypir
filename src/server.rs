@@ -563,8 +563,8 @@ where
 
 
     #[cfg(feature = "cuda")]
-    pub fn init_hint_0_gpu_context(&self, lwe_params: &LWEParams, conv: &Convolution) -> crate::cuda::GPUContext {
-        use crate::cuda::GPUContext;
+    pub fn init_hint_0_gpu_context(&self, lwe_params: &LWEParams, conv: &Convolution) -> crate::cuda::OfflineComputeContext {
+        use crate::cuda::OfflineComputeContext;
 
         let db_rows = 1 << (self.params.db_dim_1 + self.params.poly_len_log2);
         let db_cols = self.db_cols();
@@ -619,7 +619,7 @@ where
         }
 
         // Initialize GPUContext (DB upload happens here)
-        GPUContext::new(
+        OfflineComputeContext::new(
             db_rows as u32,
             self.db_rows_padded() as u32,
             db_cols as u32,
@@ -643,7 +643,7 @@ where
     }
 
     #[cfg(feature = "cuda")]
-    pub fn compute_hint_0_with_context(&self, gpu_ctx: &crate::cuda::GPUContext) -> Vec<u64> {
+    pub fn compute_hint_0_with_context(&self, gpu_ctx: &crate::cuda::OfflineComputeContext) -> Vec<u64> {
         gpu_ctx.compute_hint_0().expect("GPU computation failed")
     }
 
@@ -1194,27 +1194,25 @@ where
                     db.len(), db_u32_packed.len(), db_cols, packed_rows);
 
                 // Create dummy A2t for now (Step 2 not implemented yet)
-                let a2t_dummy = vec![0u32; 1];
+                let flat_query: Vec<u64> = pseudorandom_query_1
+                    .iter()
+                    .flat_map(|m| m.get_poly(0, 0).iter().copied())
+                    .collect();
 
                 // Get smaller_server DB for upload to GPU
                 let smaller_db = smaller_server.db();
                 let smaller_db_rows = out_rows;
-                let smaller_db_cols = db_cols;
 
                 debug!("Uploading smaller_server DB: {} rows × {} cols = {} u16 values",
-                    smaller_db_rows, smaller_db_cols, smaller_db.len());
+                    smaller_db_rows, db_cols, smaller_db.len());
 
                 match crate::cuda::OnlineComputeContext::new(
                     &db_u32_packed,
                     self.db_cols(),           // db_rows in CUDA = logical db_cols
-                    self.db_rows_padded() / 4, // db_cols in CUDA = db_rows_padded / 4 (packed)
-                    16,                       // max_batch_size (reasonable default)
-                    &a2t_dummy,
-                    1,                        // A2t_rows (dummy)
-                    1,                        // A2t_cols (dummy)
+                    self.db_rows_padded(), // db_cols in CUDA = db_rows_padded / 4 (packed)
+                    &flat_query,
                     smaller_db,
                     smaller_db_rows,
-                    smaller_db_cols,
                 ) {
                     Ok(ctx) => {
                         let upload_time = upload_start.elapsed();
@@ -1238,9 +1236,15 @@ where
                         }
                         debug!("Flattening done. Calling init_ntt...");
                         
+                        let pt_bits = (params.pt_modulus as f64).log2().floor() as usize;
                         ctx.init_ntt(
                             sp.poly_len as u32,
                             sp.crt_count as u32,
+                            pt_bits,
+                            lwe_params.modulus,
+                            lwe_q_prime,
+                            special_offs,
+                            blowup_factor.ceil() as usize,
                             &sp.moduli,
                             &sp.barrett_cr_1,
                             &forward_table,
@@ -1711,9 +1715,7 @@ where
 
         // Load offline precomputed values
         let hint_1_combined = &mut offline_vals.hint_1;
-        let pseudorandom_query_1 = &offline_vals.pseudorandom_query_1;
         let y_constants = &offline_vals.y_constants;
-        let smaller_server = offline_vals.smaller_server.as_mut().unwrap();
         let prepacked_lwe = &offline_vals.prepacked_lwe;
         let fake_pack_pub_params = &offline_vals.fake_pack_pub_params;
         let precomp = &offline_vals.precomp;
@@ -1731,14 +1733,6 @@ where
         // Prepare inputs for full batch
         // 1. query (Step 1 input) is first_dim_queries_packed (already prepared)
         
-        // 2. query_ntt (Step 3 input) - flatten pseudorandom_query_1
-        let flat_query: Vec<u64> = pseudorandom_query_1
-            .iter()
-            .flat_map(|m| m.get_poly(0, 0).iter().copied())
-            .collect();
-        let db_rows_poly = 1 << smaller_params.db_dim_1;
-        let db_rows = db_rows_poly * params.poly_len;
-
         // 3. query_q2_batch (Step 4 input) - concatenate all packed_query_col
         let mut query_q2_batch = Vec::with_capacity(second_dim_queries.len() * db_cols);
         for (packed_query_col, _) in second_dim_queries.iter() {
@@ -1753,17 +1747,9 @@ where
         let (all_hints, all_responses) = if let Some(ref ctx) = offline_vals.cuda_context {
             match ctx.compute_full_batch(
                 first_dim_queries_packed,
-                &flat_query,
                 &query_q2_batch,
                 batch_size,
-                db_cols,
-                lwe_params.modulus,
-                lwe_q_prime,
-                pt_bits,
-                special_offs,
-                blowup_factor_ceil,
-                out_rows,
-                db_rows_poly,
+                // for allocating response
                 hint_size,
                 response_size
             ) {

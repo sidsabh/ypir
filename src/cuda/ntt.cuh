@@ -4,22 +4,29 @@
 #include <stdint.h>
 #include <stdio.h>
 
+
+#define CUDA_ALLOC_AND_COPY(dest, src, size) do { \
+    CUDA_ASSERT(cudaMalloc(&(dest), (size))); \
+    CUDA_ASSERT(cudaMemcpy((dest), (src), (size), cudaMemcpyHostToDevice)); \
+} while(0)
+
+
 // NTT parameters
 struct NTTParams {
-    uint32_t poly_len;
-    uint32_t log2_poly_len;
-    uint32_t crt_count;
-    uint64_t* moduli;
-    uint64_t* barrett_cr;  // Barrett constants (cr_1) for 64-bit reduction
-    uint64_t* forward_table;
-    uint64_t* forward_prime_table;
-    uint64_t* inverse_table;
-    uint64_t* inverse_prime_table;
-    uint64_t mod0_inv_mod1;
-    uint64_t mod1_inv_mod0;
-    uint64_t barrett_cr_0_modulus;  // cr_0 for 128-bit CRT reduction
-    uint64_t barrett_cr_1_modulus;  // cr_1 for 128-bit CRT reduction
-    uint64_t modulus;  // Product of all CRT moduli
+    uint32_t poly_len = 0;
+    uint32_t log2_poly_len = 0;
+    uint32_t crt_count = 0;
+    uint64_t* moduli = nullptr;
+    uint64_t* barrett_cr = nullptr;  // Barrett constants (cr_1) for 64-bit reduction
+    uint64_t* forward_table = nullptr;
+    uint64_t* forward_prime_table = nullptr;
+    uint64_t* inverse_table = nullptr;
+    uint64_t* inverse_prime_table = nullptr;
+    uint64_t mod0_inv_mod1 = 0;
+    uint64_t mod1_inv_mod0 = 0;
+    uint64_t barrett_cr_0_modulus = 0;  // cr_0 for 128-bit CRT reduction
+    uint64_t barrett_cr_1_modulus = 0;  // cr_1 for 128-bit CRT reduction
+    uint64_t modulus = 0;  // Product of all CRT moduli
 };
 
 // Barrett Reduction (matches spiral-rs arith.rs)

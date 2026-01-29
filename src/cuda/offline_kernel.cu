@@ -21,7 +21,8 @@ __global__ void compute_hint_0_kernel(
     const uint32_t* v_nega_perm_a,
     const NTTParams* ntt_params,
     const HintParams* params
-) {
+) 
+{
     uint32_t col = blockIdx.x + blockIdx.y * gridDim.x;
     if (col >= params->db_cols) return;
     const uint32_t tid = threadIdx.x;
@@ -50,8 +51,12 @@ __global__ void compute_hint_0_kernel(
         // Load database column chunk and convert to u32
         // Parallel load into pt_ntt (reusing as temp buffer)
         const uint32_t start_idx = col * params->db_rows_padded + outer_row * n;
-        for (uint32_t i = tid; i < n; i += blockDim.x) {
-            pt_ntt[i] = (uint32_t)db[start_idx + i];
+        for (uint32_t i = tid; i < n/4; i += blockDim.x) {
+            uint32_t val = ((uint32_t*)db)[start_idx/4 + i];
+            pt_ntt[i*4] = (val & 0xFF);
+            pt_ntt[i*4+1] = (val >> 8 & 0xFF);
+            pt_ntt[i*4+2] = (val >> 8*2 & 0xFF);
+            pt_ntt[i*4+3] = (val >> 8*3 & 0xFF);
         }
         __syncthreads();
 
@@ -163,7 +168,7 @@ __global__ void compute_hint_0_kernel(
 }
 
 // GPU context structure to hold pre-uploaded data
-struct GPUContext {
+struct OfflineComputeContext {
     uint8_t* d_db;
     uint32_t* d_v_nega_perm_a;
     uint64_t* d_moduli;
@@ -185,7 +190,7 @@ struct GPUContext {
 };
 
 // Initialize GPU context and upload database/parameters
-void* init_gpu_context(
+void* ypir_offline_init(
     const uint8_t* db,
     const uint32_t* v_nega_perm_a,
     const uint64_t* moduli,
@@ -205,8 +210,9 @@ void* init_gpu_context(
     uint64_t mod1_inv_mod0,
     uint64_t barrett_cr_0_modulus,
     uint64_t barrett_cr_1_modulus
-) {
-    GPUContext* ctx = new GPUContext();
+) 
+{
+    OfflineComputeContext* ctx = new OfflineComputeContext();
 
     ctx->db_rows = db_rows;
     ctx->db_rows_padded = db_rows_padded;
@@ -277,8 +283,9 @@ void* init_gpu_context(
 }
 
 // Compute hint_0 using pre-initialized GPU context
-int compute_hint_0_cuda(void* context, uint64_t* hint_0) {
-    GPUContext* ctx = (GPUContext*)context;
+int compute_hint_0_cuda(void* context, uint64_t* hint_0) 
+{
+    OfflineComputeContext* ctx = (OfflineComputeContext*)context;
 
     uint64_t* d_hint_0;
     const size_t hint_size = ctx->n * ctx->db_cols * sizeof(uint64_t);
@@ -319,8 +326,9 @@ int compute_hint_0_cuda(void* context, uint64_t* hint_0) {
 }
 
 // Free GPU context
-void free_gpu_context(void* context) {
-    GPUContext* ctx = (GPUContext*)context;
+void ypir_offline_free(void* context) 
+{
+    OfflineComputeContext* ctx = (OfflineComputeContext*)context;
 
     cudaFree(ctx->d_db);
     cudaFree(ctx->d_v_nega_perm_a);

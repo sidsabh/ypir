@@ -30,3 +30,6 @@ test-log = "0.2.14"
 [profile.release-with-debug]
 inherits = "release"
 debug = true
+
+[profile.test]
+opt-level = 3
