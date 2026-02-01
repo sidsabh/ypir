@@ -91,6 +91,7 @@ impl Sample for u16 {
 }
 
 pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize) -> Measurement {
+    #[cfg(not(feature="cuda"))]
     assert_eq!(K, 1); // for now
 
     let is_simplepir = true;
@@ -220,15 +221,22 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize) 
         // ONLINE PHASE
         // ================================================================
 
+        let query_slices: Vec<&[u64]> = all_queries_packed
+            .as_slice()
+            .chunks(packed_query_row_sz)
+            .collect();
+
         let start_online_comp = Instant::now();
-        let responses = vec![y_server.perform_online_computation_simplepir(
-            all_queries_packed.as_slice(),
+        let p = &queries.iter().map(|x| x.3.as_slice()).collect::<Vec<_>>();
+        let responses = y_server.perform_online_computation_simplepir(
+            &query_slices,
             &offline_values,
-            &queries.iter().map(|x| x.3.as_slice()).collect::<Vec<_>>(),
+            p,
             Some(&mut measurement),
-        )];
+        );
+
         let online_server_time_ms = start_online_comp.elapsed().as_millis();
-        let online_download_bytes = get_size_bytes(&responses); // TODO: this is not quite right for multiple clients
+        let online_download_bytes = get_size_bytes(&responses);
 
         // check correctness
         for (response_switched, (y_client, target_idx, _, _)) in

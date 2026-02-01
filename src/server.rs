@@ -158,6 +158,8 @@ pub struct OfflinePrecomputedValues<'a> {
     pub precomp: Precomp<'a>,
     #[cfg(feature = "cuda")]
     pub cuda_context: Option<std::sync::Arc<crate::cuda::OnlineComputeContext>>,
+    #[cfg(feature = "cuda")]
+    pub sp_cuda_context: Option<std::sync::Arc<crate::cuda::SPOnlineContext>>,
 }
 
 #[derive(Clone)]
@@ -168,8 +170,6 @@ pub struct YServer<'a, T> {
     phantom: PhantomData<T>,
     pad_rows: bool,
     ypir_params: YPIRParams,
-    #[cfg(feature = "cuda")]
-    online_cuda_context: Option<std::sync::Arc<crate::cuda::OnlineComputeContext>>,
 }
 
 pub trait DbRowsPadded {
@@ -266,57 +266,6 @@ where
             smaller_params
         };
 
-        #[cfg(feature = "cuda")]
-        let online_cuda_context = {
-            // Only initialize for main server (u32) and if we have data
-            // We use a heuristic: if bytes_per_pt_el == 4, it's likely the main DB
-            if bytes_per_pt_el == 4 {
-                let db_u32 = unsafe {
-                    std::slice::from_raw_parts(
-                        db_buf_aligned.as_ptr() as *const u32,
-                        db_buf_aligned.len() * 8 / 4,
-                    )
-                };
-                
-                // Note: DB is transposed, so rows=db_cols, cols=db_rows_padded/4 (packed)
-                let db_rows = if is_simplepir {
-                    params.instances * params.poly_len
-                } else {
-                    1 << (params.db_dim_2 + params.poly_len_log2)
-                };
-                
-                let db_rows_padded_val = if pad_rows {
-                    params.db_rows_padded()
-                } else {
-                    1 << (params.db_dim_1 + params.poly_len_log2)
-                };
-                
-                let db_cols_packed = db_rows_padded_val / 4;
-                
-                debug!("Initializing CUDA context: rows={}, cols={} (packed)", db_rows, db_cols_packed);
-                
-                match crate::cuda::OnlineComputeContext::new(
-                    db_u32,
-                    db_rows,
-                    db_cols_packed,
-                    256, // Max batch size
-                    &[], // Dummy A2t
-                    0,   // Dummy A2t_rows
-                    0,   // Dummy A2t_cols
-                    &[], // Dummy smaller_db (will be uploaded later)
-                    0,   // Dummy smaller_db_rows
-                    0    // Dummy smaller_db_cols
-                ) {
-                    Ok(ctx) => Some(std::sync::Arc::new(ctx)),
-                    Err(e) => {
-                        debug!("Failed to init CUDA context: {}", e);
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        };
 
         Self {
             params,
@@ -325,8 +274,6 @@ where
             phantom: PhantomData,
             pad_rows,
             ypir_params,
-            #[cfg(feature = "cuda")]
-            online_cuda_context,
         }
     }
 
@@ -827,22 +774,76 @@ where
         self.multiply_batched_with_db_packed::<K>(aligned_queries_packed, 1)
     }
 
+    #[cfg(feature = "cuda")]
+    pub fn init_hint_0_simplepir_gpu_context(&self) -> crate::cuda::SPOfflineContext {
+        let db_rows = 1 << (self.params.db_dim_1 + self.params.poly_len_log2);
+        let db_cols = self.db_cols();
+        
+        // Generate pseudorandom query and convert to NTT form
+        let preprocessed_query = self.generate_pseudorandom_query(SEED_0);
+        
+        // Flatten query_ntt: db_rows_poly x crt_count x poly_len
+        let db_rows_poly = db_rows / self.params.poly_len;
+        let mut query_ntt_flat = Vec::with_capacity(db_rows_poly * self.params.crt_count * self.params.poly_len);
+        for query_poly in &preprocessed_query {
+            // Each query_poly is a 1x1 PolyMatrixNTT with crt_count * poly_len elements
+            query_ntt_flat.extend_from_slice(query_poly.as_slice());
+        }
+        
+        // Get DB as u8 slice
+        let db_u16: &[u16] = unsafe {
+            std::slice::from_raw_parts(
+                self.db().as_ptr() as *const u16,
+                self.db().len() * std::mem::size_of::<T>(),
+            )
+        };
+        
+        crate::cuda::SPOfflineContext::new(
+            db_u16,
+            db_rows,
+            self.db_rows_padded(),
+            db_cols,
+            &query_ntt_flat,
+            self.params,
+        ).expect("Failed to initialize SimplePIR GPU context")
+    }
+    
+    /// Compute hint_0 using GPU for SimplePIR
+    #[cfg(feature = "cuda")]
+    pub fn compute_hint_0_simplepir_gpu(&self, gpu_ctx: &crate::cuda::SPOfflineContext) -> Vec<u64> {
+        gpu_ctx.compute_hint_0().expect("SimplePIR GPU hint_0 computation failed")
+    }
+
     pub fn perform_offline_precomputation_simplepir(
         &self,
         measurement: Option<&mut Measurement>,
     ) -> OfflinePrecomputedValues {
         // Set up some parameters
-
         let params = self.params;
         assert!(self.ypir_params.is_simplepir);
-
         let db_cols = params.instances * params.poly_len;
         let num_rlwe_outputs = db_cols / params.poly_len;
-
+        
         // Begin offline precomputation
-
         let now = Instant::now();
+        
+        #[cfg(feature = "cuda")]
+        let hint_0: Vec<u64> = {
+            let init_start = Instant::now();
+            let gpu_ctx = self.init_hint_0_simplepir_gpu_context();
+            let init_time = init_start.elapsed();
+            
+            let compute_start = Instant::now();
+            let gpu_result = self.compute_hint_0_simplepir_gpu(&gpu_ctx);
+            let compute_time = compute_start.elapsed();
+
+            debug!("SimplePIR GPU init: {:?}, compute: {:?}", init_time, compute_time);
+            gpu_result
+        };
+        
+        #[cfg(not(feature = "cuda"))]
         let hint_0: Vec<u64> = self.answer_hint_ring(SEED_0, db_cols);
+        
         // hint_0 is poly_len x db_cols
         let simplepir_prep_time_ms = now.elapsed().as_millis();
         if let Some(measurement) = measurement {
@@ -871,17 +872,92 @@ where
         }
         debug!("Precomp in {} us", now.elapsed().as_micros());
 
-        OfflinePrecomputedValues {
-            hint_0,
-            hint_1: vec![],
-            pseudorandom_query_1: vec![],
-            y_constants,
-            smaller_server: None,
-            prepacked_lwe,
-            fake_pack_pub_params,
-            precomp,
-            #[cfg(feature = "cuda")]
-            cuda_context: None,
+        #[cfg(not(feature = "cuda"))]
+        {
+            OfflinePrecomputedValues {
+                hint_0,
+                hint_1: vec![],
+                pseudorandom_query_1: vec![],
+                y_constants,
+                smaller_server: None,
+                prepacked_lwe,
+                fake_pack_pub_params,
+                precomp,
+            }
+        }
+        
+        #[cfg(feature = "cuda")]
+        {
+            // Initialize CUDA online context
+            let sp_cuda_context = {
+                debug!("Initializing SimplePIR CUDA online context...");
+                let db_rows = 1 << (params.db_dim_1 + params.poly_len_log2);
+                
+                match crate::cuda::SPOnlineContext::new(
+                    self.db_u16(),
+                    db_rows,
+                    self.db_rows_padded(),
+                    db_cols,
+                    params.t_exp_left,
+                    params.get_q_prime_1(),
+                    params.get_q_prime_2(),
+                    params,
+                ) {
+                    Ok(ctx) => {
+                        // Flatten packing data
+                        let mut y_constants_flat = Vec::new();
+                        for m in &y_constants.0 { y_constants_flat.extend_from_slice(m.as_slice()); }
+                        for m in &y_constants.1 { y_constants_flat.extend_from_slice(m.as_slice()); }
+                        
+                        let mut precomp_res_flat = Vec::new();
+                        let mut precomp_vals_flat = Vec::new();
+                        let mut precomp_tables_flat = Vec::new();
+                        
+                        for (res, vals, tables) in &precomp {
+                            precomp_res_flat.extend_from_slice(res.as_slice());
+                            for v in vals {
+                                let condensed = condense_matrix(params, v);
+                                for row in 0..v.rows {
+                                    let poly = condensed.get_poly(row, 0);
+                                    precomp_vals_flat.extend_from_slice(&poly[..params.poly_len]);
+                                }
+                            }
+                            for t in tables {
+                                for &val in t {
+                                    precomp_tables_flat.push(val as u64);
+                                }
+                            }
+                        }
+                        
+                        ctx.init_packing(
+                            &y_constants_flat,
+                            &precomp_res_flat,
+                            &precomp_vals_flat,
+                            &precomp_tables_flat,
+                        );
+                        
+                        debug!("SimplePIR CUDA online context initialized");
+                        Some(std::sync::Arc::new(ctx))
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to create SimplePIR CUDA context: {}", e);
+                        None
+                    }
+                }
+            };
+            
+            OfflinePrecomputedValues {
+                hint_0,
+                hint_1: vec![],
+                pseudorandom_query_1: vec![],
+                y_constants,
+                smaller_server: None,
+                prepacked_lwe,
+                fake_pack_pub_params,
+                precomp,
+                cuda_context: None,
+                sp_cuda_context
+            }
         }
     }
 
@@ -1115,6 +1191,8 @@ where
         assert_eq!(combined.len(), out_rows * (params.poly_len + 1)); // full DoublePIR response, 0s everywhere besides H2
 
         // all this does is get the rho many CDKS RLWE squares, drops the b (0), negacylic perms them, then puts them in NTT form. it is a full CT, but the non-random portion is empty
+        // TODO: QUESTION: why did we create the hint in NTT form, convert to RAW, then negacyclic then NTT again?
+        // couldn't we avoid these NTTs and do negacyclic in the NTT domain?
         let prepacked_lwe = prep_pack_many_lwes(&params, &combined, rho);
         assert_eq!(prepacked_lwe.len(), rho);
         assert_eq!(prepacked_lwe[0].len(), params.poly_len);
@@ -1243,7 +1321,10 @@ where
                             pt_bits,
                             lwe_params.modulus,
                             lwe_q_prime,
+                            params.get_q_prime_1(),
+                            params.get_q_prime_2(),
                             special_offs,
+                            params.t_exp_left,
                             blowup_factor.ceil() as usize,
                             &sp.moduli,
                             &sp.barrett_cr_1,
@@ -1291,7 +1372,11 @@ where
                 for (res, vals, tables) in &precomp {
                     precomp_res_flat.extend_from_slice(res.as_slice());
                     for v in vals {
-                        precomp_vals_flat.extend_from_slice(v.as_slice());
+                        let condensed = condense_matrix(params, v);
+                        for row in 0..v.rows {
+                            let poly = condensed.get_poly(row, 0);
+                            precomp_vals_flat.extend_from_slice(&poly[..params.poly_len]);
+                        }
                     }
                     for t in tables {
                         for &val in t {
@@ -1299,7 +1384,7 @@ where
                         }
                     }
                 }
-                
+
                 // fake_pack_pub_params
                 let mut fake_pack_pub_params_flat = Vec::new();
                 for m in &fake_pack_pub_params {
@@ -1326,11 +1411,13 @@ where
                 fake_pack_pub_params,
                 precomp,
                 cuda_context,
+                sp_cuda_context: None
             }
         }
     }
 
     /// Perform SimplePIR-style YPIR
+    #[cfg(not(feature = "cuda"))]
     pub fn perform_online_computation_simplepir(
         &self,
         first_dim_queries_packed: &[u64],
@@ -1400,7 +1487,59 @@ where
             packed_mod_switched.push(res_switched);
         }
 
-        packed_mod_switched
+        vec![packed_mod_switched]
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn perform_online_computation_simplepir(
+        &self,
+        first_dim_queries_packed: &[&[u64]],
+        offline_vals: &OfflinePrecomputedValues<'a>,
+        pack_pub_params_row_1s: &[&[PolyMatrixNTT<'a>]],
+        mut measurement: Option<&mut Measurement>,
+    ) -> Vec<Vec<Vec<u8>>> {
+            assert!(self.ypir_params.is_simplepir);
+        let params = self.params;
+        let batch_size = first_dim_queries_packed.len();
+        
+        let online_start = Instant::now();
+        
+        let ctx = offline_vals.sp_cuda_context.as_ref()
+            .expect("CUDA context not initialized");
+        
+        // Flatten queries: batch_size * db_rows_padded
+        let mut queries_flat: Vec<u64> = Vec::with_capacity(batch_size * self.db_rows_padded());
+        for query in first_dim_queries_packed {
+            queries_flat.extend_from_slice(query);
+        }
+        
+        // Flatten pack_pub_params_row_1s: batch_size * ell * t_exp_left * poly_len
+        let mut pub_params_flat: Vec<u64> = Vec::new();
+        for keys in pack_pub_params_row_1s {
+            for key in keys.iter() {
+                let slc = key.as_slice();
+                for col in 0..params.t_exp_left {
+                    let start = col * 2 * params.poly_len;
+                    pub_params_flat.extend_from_slice(&slc[start..start + params.poly_len]);
+                }
+            }
+        }
+
+        let q_1_bits = (params.get_q_prime_2() as f64).log2().ceil() as usize;
+        let q_2_bits = (params.get_q_prime_1() as f64).log2().ceil() as usize;
+        let response_bytes_per_output = ((q_1_bits + q_2_bits) * params.poly_len + 7) / 8;
+        
+        // Run GPU computation
+        let result = ctx.compute_batch(&queries_flat, &pub_params_flat, response_bytes_per_output, batch_size);
+        
+        let online_time_ms = online_start.elapsed().as_millis();
+        debug!("SimplePIR GPU online time: {} ms", online_time_ms);
+        
+        if let Some(ref mut m) = measurement {
+            m.online.first_pass_time_ms = online_time_ms as usize;
+        }
+        
+        result
     }
 
     #[cfg(not(feature = "cuda"))]
@@ -1587,12 +1726,6 @@ where
 
                 rlwe_ct.get_poly_mut(0, 0).copy_from_slice(&nega);
 
-                // for k in 0..params.poly_len {
-                //     rlwe_ct.get_poly_mut(0, 0)[k] = nega[k];
-                // }
-
-                // let j_within_last = j % params.poly_len;
-                // prepacked_lwe_mut.last_mut().unwrap()[j_within_last] = rlwe_ct.ntt();
                 excess_cts.push(rlwe_ct.ntt());
             }
             debug!("in between: {} us", now.elapsed().as_micros());
@@ -1634,8 +1767,9 @@ where
 
             let now = Instant::now();
             let mut packed_mod_switched = Vec::with_capacity(packed.len());
-            for ct in packed.iter() {
+            for (i, ct) in packed.iter().enumerate() {
                 let res = ct.raw();
+
                 let res_switched = res.switch(rlwe_q_prime_1, rlwe_q_prime_2);
                 packed_mod_switched.push(res_switched);
             }
@@ -1674,186 +1808,49 @@ where
         second_dim_queries: &[(&[u64], &[PolyMatrixNTT<'a>])],
         mut measurement: Option<&mut Measurement>,
     ) -> Vec<Vec<Vec<u8>>> {
-        debug!("=== CUDA-accelerated online computation ===");
-
+        debug!("CUDA-accelerated online computation");
         // Set up parameters (same as CPU version)
         let params = self.params;
-        let lwe_params = LWEParams::default();
         let db_cols = self.db_cols();
 
         // RLWE reduced moduli
         let rlwe_q_prime_1 = params.get_q_prime_1();
         let rlwe_q_prime_2 = params.get_q_prime_2();
 
-        // LWE reduced moduli
-        let lwe_q_prime_bits = lwe_params.q2_bits as usize;
-        let lwe_q_prime = lwe_params.get_q_prime_2();
 
-        // The number of bits represented by a plaintext RLWE coefficient
-        let pt_bits = (params.pt_modulus as f64).log2().floor() as usize;
-
-        // The factor by which ciphertext values are bigger than plaintext values
-        let blowup_factor = lwe_q_prime_bits as f64 / pt_bits as f64;
-        debug!("blowup_factor: {}", blowup_factor);
-
-        // The starting index of the final value (the '1' in lwe_params.n + 1)
-        let special_offs =
-            ((lwe_params.n * lwe_q_prime_bits) as f64 / pt_bits as f64).ceil() as usize;
-
-        // Parameters for the second round (the "DoublePIR" round)
-        let mut smaller_params = params.clone();
-        smaller_params.db_dim_1 = params.db_dim_2;
-        smaller_params.db_dim_2 = ((blowup_factor * (lwe_params.n + 1) as f64)
-            / params.poly_len as f64)
-            .log2()
-            .ceil() as usize;
-
-        let out_rows = 1 << (smaller_params.db_dim_2 + params.poly_len_log2);
-        let rho = 1 << smaller_params.db_dim_2;
-        assert_eq!(smaller_params.db_dim_1, params.db_dim_2);
-        assert!(out_rows as f64 >= (blowup_factor * (lwe_params.n + 1) as f64));
-
-        // Load offline precomputed values
-        let hint_1_combined = &mut offline_vals.hint_1;
-        let y_constants = &offline_vals.y_constants;
-        let prepacked_lwe = &offline_vals.prepacked_lwe;
-        let fake_pack_pub_params = &offline_vals.fake_pack_pub_params;
-        let precomp = &offline_vals.precomp;
-
-        // Initialize NTT parameters on GPU if needed
-        // (Moved to offline phase)
-
-        // Begin online computation
-        let online_phase = Instant::now();
-
-        // ================================================================
-        // STEP 1-4: Full Pipeline (GPU)
-        // ================================================================
-        
-        // Prepare inputs for full batch
-        // 1. query (Step 1 input) is first_dim_queries_packed (already prepared)
-        
-        // 3. query_q2_batch (Step 4 input) - concatenate all packed_query_col
         let mut query_q2_batch = Vec::with_capacity(second_dim_queries.len() * db_cols);
-        for (packed_query_col, _) in second_dim_queries.iter() {
+        let mut pack_pub_params_row_1s_batch: Vec<u64> = Vec::with_capacity(second_dim_queries.len() * params.poly_len_log2 * params.t_exp_left);
+
+        for (packed_query_col, automorph_keys) in second_dim_queries.iter() {
             query_q2_batch.extend_from_slice(packed_query_col);
+            assert_eq!(automorph_keys.len(), params.poly_len_log2);
+            for key in *automorph_keys {
+                let slc = key.as_slice();
+                for col in 0..params.t_exp_left {
+                    let start = col * 2 * params.poly_len;
+                    pack_pub_params_row_1s_batch.extend_from_slice(&slc[start..start + params.poly_len]);
+                }
+            }
         }
 
         let batch_size = second_dim_queries.len();
-        let blowup_factor_ceil = blowup_factor.ceil() as usize;
-        let hint_size = params.poly_len * blowup_factor_ceil;
-        let response_size = out_rows;
-
-        let (all_hints, all_responses) = if let Some(ref ctx) = offline_vals.cuda_context {
-            match ctx.compute_full_batch(
+        
+        let q_1_bits = (rlwe_q_prime_1 as f64).log2().ceil() as usize;
+        let q_2_bits = (rlwe_q_prime_2 as f64).log2().ceil() as usize;
+        let total_sz_bits = (q_1_bits + q_2_bits) * self.params.poly_len;
+        let total_sz_bytes = (total_sz_bits + 7) / 8;
+        let mut responses = vec![0u8; batch_size*total_sz_bytes];
+        
+        // Begin online computation
+        let online_phase = Instant::now();
+        if let Some(ref ctx) = offline_vals.cuda_context {
+            ctx.compute_full_batch(
                 first_dim_queries_packed,
                 &query_q2_batch,
+                &pack_pub_params_row_1s_batch,
                 batch_size,
-                // for allocating response
-                hint_size,
-                response_size
-            ) {
-                Ok(res) => res,
-                Err(e) => panic!("GPU compute_full_batch failed: {}", e),
-            }
-        } else {
-            panic!("CUDA context required for GPU execution");
-        };
-
-
-        // ================================================================
-        // STEP 5: Packing (CPU)
-        // ================================================================
-        
-        let mut second_pass_time_ms = 0;
-        let mut ring_packing_time_ms = 0;
-        let mut responses = Vec::new();
-
-        for i in 0..batch_size {
-            let second_pass = Instant::now();
-            let (_, pack_pub_params_row_1s) = &second_dim_queries[i];
-
-            // Extract hint and response for this query
-            let current_hint = &all_hints[i * hint_size..(i + 1) * hint_size];
-            let current_response = &all_responses[i * response_size..(i + 1) * response_size];
-
-            // Copy secondary hint to hint_1_combined
-            for k in 0..params.poly_len {
-                for j in 0..blowup_factor_ceil {
-                    let inp_idx = k * blowup_factor_ceil + j;
-                    let out_idx = k * out_rows + special_offs + j;
-                    hint_1_combined[out_idx] = current_hint[inp_idx];
-                }
-            }
-
-            // Convert response to AlignedMemory64
-            let mut response = AlignedMemory64::new(current_response.len());
-            for (k, &val) in current_response.iter().enumerate() {
-                response[k] = val;
-            }
-
-            second_pass_time_ms += second_pass.elapsed().as_millis();
-            let ring_packing = Instant::now();
-            let now = Instant::now();
-            assert_eq!(response.len(), 1 * out_rows);
-
-            // Prepare excess_cts
-            let mut excess_cts = Vec::with_capacity(blowup_factor.ceil() as usize);
-            for j in special_offs..special_offs + blowup_factor.ceil() as usize {
-                let mut rlwe_ct = PolyMatrixRaw::zero(&params, 2, 1);
-
-                // 'a' vector
-                // put this in negacyclic order
-                let mut poly = Vec::new();
-                for k in 0..params.poly_len {
-                    poly.push(hint_1_combined[k * out_rows + j]);
-                }
-                let nega = negacyclic_perm(&poly, 0, params.modulus);
-
-                rlwe_ct.get_poly_mut(0, 0).copy_from_slice(&nega);
-                excess_cts.push(rlwe_ct.ntt());
-            }
-            debug!("in between: {} us", now.elapsed().as_micros());
-
-            let mut packed = pack_many_lwes(
-                &params,
-                &prepacked_lwe,
-                &precomp,
-                response.as_slice(),
-                rho,
-                &pack_pub_params_row_1s,
-                &y_constants,
+                &mut responses
             );
-
-            let now = Instant::now();
-            let mut pack_pub_params = fake_pack_pub_params.clone();
-            for i in 0..pack_pub_params.len() {
-                let uncondensed = uncondense_matrix(params, &pack_pub_params_row_1s[i]);
-                pack_pub_params[i].copy_into(&uncondensed, 1, 0);
-            }
-            debug!("uncondense pub params: {} us", now.elapsed().as_micros());
-            let now = Instant::now();
-            let other_packed =
-                pack_using_single_with_offset(&params, &pack_pub_params, &excess_cts, special_offs);
-            add_into(&mut packed[0], &other_packed);
-            debug!(
-                "pack_using_single_with_offset: {} us",
-                now.elapsed().as_micros()
-            );
-
-            let now = Instant::now();
-            let mut packed_mod_switched = Vec::with_capacity(packed.len());
-            for ct in packed.iter() {
-                let res = ct.raw();
-                let res_switched = res.switch(rlwe_q_prime_1, rlwe_q_prime_2);
-                packed_mod_switched.push(res_switched);
-            }
-            debug!("switching: {} us", now.elapsed().as_micros());
-            ring_packing_time_ms += ring_packing.elapsed().as_millis();
-
-            assert_eq!(packed.len(), rho);
-
-            responses.push(packed_mod_switched);
         }
 
         debug!(
@@ -1862,12 +1859,10 @@ where
         );
         debug!("");
 
-        if let Some(ref mut m) = measurement {
-            m.online.second_pass_time_ms = second_pass_time_ms as usize;
-            m.online.ring_packing_time_ms = ring_packing_time_ms as usize;
-        }
-
         responses
+            .chunks(total_sz_bytes)
+            .map(|a| vec![a.to_vec()])
+            .collect()
     }
 
     // generic function that returns a u8 or u16:

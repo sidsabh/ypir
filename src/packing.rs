@@ -578,8 +578,15 @@ pub fn pack_using_precomp_vals<'a>(
     let mut res = precomp_res.clone();
     res.get_poly_mut(1, 0).copy_from_slice(resulting_row_1);
 
-
+    // recall: PolyMatrixRaw is never CRT, always composed
     let mut out_raw = res.raw();
+    debug!("Rust row1 before b_values [0..4]: {} {} {} {}", 
+       out_raw.data[params.poly_len], 
+       out_raw.data[params.poly_len+1],
+       out_raw.data[params.poly_len+2],
+       out_raw.data[params.poly_len+3]);
+
+
     // all the packing magic is just about the random portion and how it re-encodes with the automorphism keys (affects both a and b)
     // if we have a (R)LWE ct encoded under the secret key, we can always just add it into the phase without worrying!
     // recall the LWEs that are packed are scaled by inv(d2) by generate_query_impl

@@ -29,6 +29,8 @@ fn main() {
 fn compile_cuda() {
     println!("cargo:rerun-if-changed=src/cuda/offline_kernel.cu");
     println!("cargo:rerun-if-changed=src/cuda/online_kernel.cu");
+    println!("cargo:rerun-if-changed=src/cuda/offline_kernel_sp.cu");
+    println!("cargo:rerun-if-changed=src/cuda/online_kernel_sp.cu");
     println!("cargo:rerun-if-changed=src/cuda/ntt.cuh");
 
     let out_dir = env::var("OUT_DIR").unwrap();
@@ -48,8 +50,11 @@ fn compile_cuda() {
         arch_flag.as_str(),
         "-Xcompiler", "-fPIC",
         "-shared",
+        "--maxrregcount=64",
         "src/cuda/offline_kernel.cu",
         "src/cuda/online_kernel.cu",
+        "src/cuda/offline_kernel_sp.cu",
+        "src/cuda/online_kernel_sp.cu",
     ];
 
     // Add toeplitz kernel - check CRT first since it implies toeplitz

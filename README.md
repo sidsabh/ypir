@@ -1,3 +1,24 @@
+# YPIR-GPU Acceleration
+
+(NVIDIA 1080 GPU)
+
+YPIR-SP (6 client batching):
+```bash
+RUST_LOG=debug cargo run --release -- 262144 184320 6 1 -i
+```
+Performance Results:
+Hint Prep. Throughput 1.81 GB/sec
+Throughput: 127.36 GB/sec
+
+YPIR (6 client batching):
+```bash
+RUST_LOG=debug cargo run --release -- 4294967296 8 6 1
+```
+Performance Results:
+Hint Prep. Throughput 2.10 GB/sec
+Throughput: 123.08 GB/sec
+
+
 # YPIR
 
 This is an implementation of the YPIR scheme for single-server private information retrieval,

@@ -129,14 +129,14 @@ pub fn params_for_scenario(num_items: usize, item_size_bits: usize) -> Params {
 // for some reason, YPIR-SP uses RLWE plaintext space as 2^14 instead of 2^15 like YPIR. doesn't matter, because either way N = 2^8 << p
 pub fn params_for_scenario_simplepir(num_items: usize, item_size_bits: usize) -> Params {
     let db_rows = num_items;
-    let db_cols = (item_size_bits as f64 / (2048.0 * 14.0)).ceil() as usize;
+    let db_cols = (item_size_bits as f64 / (2048.0 * 15.0)).ceil() as usize;
 
     debug!("db_rows: {}, db_cols: {}", db_rows, db_cols);
 
     let nu_1 = (db_rows.next_power_of_two().trailing_zeros() as usize).checked_sub(11).unwrap_or(0);
     debug!("chose nu_1: {}", nu_1);
 
-    let p = 1 << 14; // == 2^14
+    let p = 1 << 15; // == why not 2^15 here and above?
     let q2_bits = 28;
     let t_exp_left = 3; // 𝑡 = ⌊log𝑧𝑞2⌋ + 1 -> ⌊log_(z=2^19)(q2=2^56)⌋+1 = 3
 

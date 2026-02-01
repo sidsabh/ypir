@@ -4,6 +4,34 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#define CUDA_ASSERT(stmt) do { \
+    cudaError_t err = (stmt);  \
+    if (err != cudaSuccess) {  \
+        fprintf(stderr, "CUDA error: %s (%s:%d)\n", cudaGetErrorString(err), __FILE__, __LINE__); \
+        abort();               \
+    }                          \
+} while (0)
+
+struct GpuTimer {
+  cudaEvent_t start, stop;
+  GpuTimer() {
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+  }
+  ~GpuTimer() {
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+  }
+  void tic(cudaStream_t s = 0) { cudaEventRecord(start, s); }
+  float toc_ms(cudaStream_t s = 0) {
+    cudaEventRecord(stop, s);
+    cudaEventSynchronize(stop);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, start, stop);
+    return ms;
+  }
+};
+
 
 #define CUDA_ALLOC_AND_COPY(dest, src, size) do { \
     CUDA_ASSERT(cudaMalloc(&(dest), (size))); \
@@ -210,6 +238,19 @@ __device__ __forceinline__ void ntt_inverse_kernel_parallel(
         }
         __syncthreads();
     }
+
+    // Final reduction (parallelized)
+    for (uint32_t i = tid; i < n; i += block_size) {
+        uint64_t val = operand[i];
+        if (val >= two_times_modulus) {
+            val -= two_times_modulus;
+        }
+        if (val >= modulus) {
+            val -= modulus;
+        }
+        operand[i] = val;
+    }
+    __syncthreads();
 }
 
 // CRT Reconstruction (matches spiral-rs params.rs::crt_compose_2)

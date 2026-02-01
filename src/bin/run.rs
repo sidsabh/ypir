@@ -59,6 +59,7 @@ fn main() {
         panic!("Items can be at must be at most 8 bits.");
     }
 
+    #[cfg(not(feature="cuda"))]
     if is_simplepir {
         assert_eq!(num_clients, 1, "SimplePIR variant only supports 1 client.");
     }
