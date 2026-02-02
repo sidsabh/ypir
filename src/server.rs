@@ -1420,11 +1420,11 @@ where
     #[cfg(not(feature = "cuda"))]
     pub fn perform_online_computation_simplepir(
         &self,
-        first_dim_queries_packed: &[u64],
+        first_dim_queries_packed: &[&[u64]],
         offline_vals: &OfflinePrecomputedValues<'a>,
         pack_pub_params_row_1s: &[&[PolyMatrixNTT<'a>]],
         mut measurement: Option<&mut Measurement>,
-    ) -> Vec<Vec<u8>> {
+    ) -> Vec<Vec<Vec<u8>>> {
         assert!(self.ypir_params.is_simplepir);
 
         // Set up some parameters
@@ -1442,7 +1442,7 @@ where
         let db_rows = 1 << (params.db_dim_1 + params.poly_len_log2);
         let db_cols = params.instances * params.poly_len;
 
-        assert_eq!(first_dim_queries_packed.len(), params.db_rows_padded());
+        assert_eq!(first_dim_queries_packed[0].len(), params.db_rows_padded());
 
         // Begin online computation
 
@@ -1452,7 +1452,7 @@ where
         fast_batched_dot_product_avx512::<1, T>(
             &params,
             intermediate.as_mut_slice(),
-            first_dim_queries_packed,
+            first_dim_queries_packed[0],
             db_rows,
             self.db(),
             db_rows,

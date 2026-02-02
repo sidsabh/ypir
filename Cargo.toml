@@ -2,6 +2,7 @@
 name = "ypir"
 version = "0.1.0"
 edition = "2021"
+default-run = "run"
 
 [features]
 cuda = []
@@ -33,3 +34,15 @@ debug = true
 
 [profile.test]
 opt-level = 3
+
+[[bin]]
+name = "simplepir-client"
+path = "src/bin/sp_client.rs"
+
+[[bin]]
+name = "simplepir-server"
+path = "src/bin/sp_server.rs"
+
+[[bin]]
+name = "run"
+path = "src/bin/run.rs"

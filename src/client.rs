@@ -125,9 +125,9 @@ pub fn decrypt_ct_reg_measured<'a>(
     dec_rescaled
 }
 
-pub struct YClient<'a> {
-    inner: &'a mut Client<'a>,
-    params: &'a Params,
+pub struct YClient<'p, 'c> {
+    inner: &'c mut Client<'p>,
+    params: &'p Params,
     lwe_client: LWEClient,
 }
 
@@ -169,8 +169,8 @@ pub fn generate_matrix_ring(
     out
 }
 
-impl<'a> YClient<'a> {
-    pub fn new(inner: &'a mut Client<'a>, params: &'a Params) -> Self {
+impl<'p, 'c> YClient<'p, 'c> {
+    pub fn new(inner: &'c mut Client<'p>, params: &'p Params) -> Self {
         Self {
             inner,
             params,
@@ -183,7 +183,7 @@ impl<'a> YClient<'a> {
     }
 
     /// Returns the last row of the LWE ciphertext (the 'b' scalar) for each RLWE ciphertext.
-    fn rlwes_to_lwes(&self, ct: &[PolyMatrixRaw<'a>]) -> Vec<u64> {
+    fn rlwes_to_lwes(&self, ct: &[PolyMatrixRaw<'p>]) -> Vec<u64> {
         let v = ct
             .iter()
             .map(|ct| rlwe_to_lwe_last_row(self.params, ct))
@@ -197,7 +197,7 @@ impl<'a> YClient<'a> {
         dim_log2: usize,
         packing: bool,
         index: usize,
-    ) -> Vec<PolyMatrixRaw<'a>> {
+    ) -> Vec<PolyMatrixRaw<'p>> {
         // let db_cols = 1 << (self.params.db_dim_2 + self.params.poly_len_log2);
         // let idx_dim1 = index / db_cols;
 
@@ -388,7 +388,7 @@ impl<'a> YClient<'a> {
         out
     }
 
-    pub fn client(&self) -> &Client<'a> {
+    pub fn client(&self) -> &Client<'p> {
         self.inner
     }
 }
