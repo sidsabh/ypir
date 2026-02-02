@@ -19,7 +19,7 @@ use ypir::scheme::Sample;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(long, default_value = "127.0.0.1:9000")]
+    #[arg(long, default_value = "127.0.0.1:4242")]
     bind: String,
     #[arg(long, default_value_t = 1 << 17)]
     num_items: usize,

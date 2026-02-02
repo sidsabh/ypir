@@ -445,7 +445,7 @@ where
 
         // recall - for the query over DB2 (DoublePIR), we used this same call
         // it generates RLWE encryption of a column, which is equivalent to an LWE encryption under the negacyclic matrix
-        let query = y_client.generate_query_impl(public_seed_idx, self.params.db_dim_1, true, 0);
+        let query = y_client.generate_query_impl(public_seed_idx, self.params.db_dim_1, true, 0, None, None);
 
         // this is basically just grabbing the random portion (A2)
         // correct, but not efficient

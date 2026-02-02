@@ -184,7 +184,7 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize) 
             debug!("pub params size: {} bytes", pub_params_size);
 
             let y_client = YClient::new(client, &params);
-            let query_row = y_client.generate_query(SEED_0, params.db_dim_1, true, target_row);
+            let query_row = y_client.generate_query(SEED_0, params.db_dim_1, true, target_row, None, None);
             let query_row_last_row: &[u64] = &query_row;
             assert_eq!(query_row_last_row.len(), db_rows);
             let packed_query_row = pack_query(&params, query_row_last_row);
@@ -485,7 +485,7 @@ pub fn run_ypir_on_params<const K: usize>(
             debug!("pub params size: {} bytes", pub_params_size);
 
             let y_client = YClient::new(client, &params);
-            let query_row = y_client.generate_query(SEED_0, params.db_dim_1, false, target_row); // SimplePIR query on the column
+            let query_row = y_client.generate_query(SEED_0, params.db_dim_1, false, target_row, None, None); // SimplePIR query on the column
             // represents a matrix (n+1) × dim, where each column is an LWE ciphertext, stored in row major
             // therefore, the last row is the non-random portion of the ct
             let query_row_last_row: &[u64] = &query_row[lwe_params.n * db_rows..];
@@ -504,7 +504,7 @@ pub fn run_ypir_on_params<const K: usize>(
             // this isn't really packed
 
             // remember, we only need queries that are of size db_dim1, db_dim2, because for DoublePIR we transponse our 2nd DB
-            let query_col = y_client.generate_query(SEED_1, params.db_dim_2, true, target_col);
+            let query_col = y_client.generate_query(SEED_1, params.db_dim_2, true, target_col, None, None);
             let query_col_last_row = &query_col;
             // recall, we have a larger modulus for DoublePIR (~=2^56)
             // we decompose the larger modulus into two moduli <2^32, then pack them into a single 64-bit word

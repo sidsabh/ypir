@@ -284,7 +284,7 @@ mod tests {
         client.generate_secret_keys();
         let y_client = YClient::new(&mut client, &params);
         let target_idx = 0;
-        let query = y_client.generate_query(SEED_0, params.db_dim_1, false, target_idx);
+        let query = y_client.generate_query(SEED_0, params.db_dim_1, false, target_idx, None, None);
 
         let db = (0..upper_n)
             .map(|_| fastrand::u64(0..params.pt_modulus))

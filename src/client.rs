@@ -197,6 +197,8 @@ impl<'p, 'c> YClient<'p, 'c> {
         dim_log2: usize,
         packing: bool,
         index: usize,
+        embedding_width: Option<usize>,
+        weights: Option<&[u64]>,
     ) -> Vec<PolyMatrixRaw<'p>> {
         // let db_cols = 1 << (self.params.db_dim_2 + self.params.poly_len_log2);
         // let idx_dim1 = index / db_cols;
@@ -213,10 +215,31 @@ impl<'p, 'c> YClient<'p, 'c> {
         for i in 0..(1 << dim_log2) {
             // create a single polynomial of all zeroes (num_coeffs = rows * cols * params.poly_len)
             let mut scalar = PolyMatrixRaw::zero(self.params, 1, 1);
-            let is_nonzero = i == (index / self.params.poly_len);
+            if let Some(width) = embedding_width {
+                // Embed a width-sized block starting at (index * width)
+                let ws = weights.unwrap();
+                assert!(self.params.poly_len % width == 0, "poly_len must be divisible by width (for now)");
 
-            if is_nonzero {
-                scalar.data[index % self.params.poly_len] = scale_k;
+                let base = index * width;
+                let poly_idx = base / self.params.poly_len;
+
+                if i == poly_idx {
+                    for j in 0..width {
+                        let pos = (base + j) % self.params.poly_len;
+                        // weight * (q/p) in modulus space
+                        let weight  = ws[j];
+                        assert!(weight < self.params.pt_modulus);
+                        let mu = weight * scale_k;
+                        assert!(mu < self.params.modulus);
+                        scalar.data[pos] = mu;
+                    }
+                }
+            } else {
+                let is_nonzero = i == (index / self.params.poly_len);
+
+                if is_nonzero {
+                    scalar.data[index % self.params.poly_len] = scale_k;
+                }
             }
 
             if packing {
@@ -316,6 +339,8 @@ impl<'p, 'c> YClient<'p, 'c> {
         dim_log2: usize,
         packing: bool,
         index_row: usize,
+        embedding_width: Option<usize>,
+        weights: Option<&[u64]>,
     ) -> Vec<u64> {
         if public_seed_idx == SEED_0 && !packing {
             let lwe_params = LWEParams::default();
@@ -349,7 +374,7 @@ impl<'p, 'c> YClient<'p, 'c> {
         } else {
             // only do this if we're packing. what is packing?
             // weirdly I think this conditional is just a way of having the same interface for generating the two queries, even though the operation is entirely separate (different moduli space, encryption method)
-            let out = self.generate_query_impl(public_seed_idx, dim_log2, packing, index_row);
+            let out = self.generate_query_impl(public_seed_idx, dim_log2, packing, index_row, embedding_width, weights);
             // at this point, we have fully encrypted the vector with all 0s and 1 at index using RLWE.
             // say the length of that vector is l_2, and the length of the RLWE poly is d_2. then we have m_2 = l_2/d_2 RLWE CTs
             assert_eq!(out.len(), (1<<dim_log2));
