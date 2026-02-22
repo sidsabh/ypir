@@ -223,6 +223,7 @@ extern "C" {
         A2t: *const u64,
         smaller_db: *const u16,
         smaller_db_rows: usize,
+        max_batch_size: usize,
     ) -> *mut std::ffi::c_void;
 
     fn ypir_online_init_ntt(
@@ -427,6 +428,7 @@ impl OnlineComputeContext {
         A2t: &[u64],
         smaller_db: &[u16],
         smaller_db_rows: usize,
+        max_batch_size: usize,
     ) -> Result<Self, String> {
         let ctx = unsafe {
             ypir_online_init(
@@ -436,6 +438,7 @@ impl OnlineComputeContext {
                 A2t.as_ptr(),
                 smaller_db.as_ptr(),
                 smaller_db_rows,
+                max_batch_size,
             )
         };
 
@@ -549,10 +552,56 @@ impl Drop for OnlineComputeContext {
     }
 }
 
-// Add these to your existing cuda/mod.rs
-
 // ==================== SimplePIR Online FFI ====================
-#[cfg(feature = "cuda")]
+
+// CUTLASS variant: ypir_sp_online_init takes an extra max_batch_size parameter
+#[cfg(all(feature = "cuda", feature = "cutlass"))]
+extern "C" {
+    fn ypir_sp_online_init(
+        db: *const u16,
+        db_rows: usize,
+        db_rows_padded: usize,
+        db_cols: usize,
+        t_exp_left: usize,
+        rlwe_q_prime_1: u64,
+        rlwe_q_prime_2: u64,
+        poly_len: u32,
+        crt_count: u32,
+        moduli: *const u64,
+        barrett_cr: *const u64,
+        forward_table: *const u64,
+        forward_prime_table: *const u64,
+        inverse_table: *const u64,
+        inverse_prime_table: *const u64,
+        mod0_inv_mod1: u64,
+        mod1_inv_mod0: u64,
+        barrett_cr_0_modulus: u64,
+        barrett_cr_1_modulus: u64,
+        max_batch_size: usize,
+    ) -> *mut std::ffi::c_void;
+
+    fn ypir_sp_online_init_packing(
+        context: *mut std::ffi::c_void,
+        y_constants: *const u64, y_constants_size: usize,
+        precomp_res: *const u64, precomp_res_size: usize,
+        precomp_vals: *const u64, precomp_vals_size: usize,
+        precomp_tables: *const u64, precomp_tables_size: usize,
+    );
+
+    fn ypir_sp_online_compute_batch(
+        context: *mut std::ffi::c_void,
+        queries: *const u64,
+        pack_pub_params_row_1s: *const u64,
+        response_out: *mut u8,
+        response_bytes_per_batch: usize,
+        batch_size: usize,
+    );
+
+    fn ypir_sp_online_free(context: *mut std::ffi::c_void);
+}
+
+// Original variant: no max_batch_size parameter (uses compile-time MAX_SP_BATCH_SIZE=16)
+#[cfg(all(feature = "cuda", not(feature = "cutlass")))]
 extern "C" {
     fn ypir_sp_online_init(
         db: *const u16,
@@ -596,6 +645,11 @@ extern "C" {
     fn ypir_sp_online_free(context: *mut std::ffi::c_void);
 }
 
+/// Default max batch size for CUTLASS variant (matches original MAX_SP_BATCH_SIZE).
+/// Caller can override via `with_max_batch_size()` if GPU memory permits.
+#[cfg(feature = "cutlass")]
+const DEFAULT_MAX_BATCH_SIZE: usize = 16;
+
 /// SimplePIR Online GPU Context
 #[cfg(feature = "cuda")]
 pub struct SPOnlineContext {
@@ -613,8 +667,79 @@ unsafe impl Sync for SPOnlineContext {}
 
 #[cfg(feature = "cuda")]
 impl SPOnlineContext {
-    /// Create SimplePIR online GPU context
+    /// Create SimplePIR online GPU context (default max_batch_size)
     pub fn new(
+        db: &[u16],
+        db_rows: usize,
+        db_rows_padded: usize,
+        db_cols: usize,
+        t_exp_left: usize,
+        rlwe_q_prime_1: u64,
+        rlwe_q_prime_2: u64,
+        params: &spiral_rs::params::Params,
+    ) -> Result<Self, String> {
+        #[cfg(feature = "cutlass")]
+        { Self::with_max_batch_size(db, db_rows, db_rows_padded, db_cols, t_exp_left, rlwe_q_prime_1, rlwe_q_prime_2, params, DEFAULT_MAX_BATCH_SIZE) }
+        #[cfg(not(feature = "cutlass"))]
+        { Self::init_inner(db, db_rows, db_rows_padded, db_cols, t_exp_left, rlwe_q_prime_1, rlwe_q_prime_2, params) }
+    }
+
+    /// Create SimplePIR online GPU context with explicit max batch size.
+    /// Only meaningful with the `cutlass` feature; without it, the
+    /// compile-time constant MAX_SP_BATCH_SIZE=16 is used.
+    #[cfg(feature = "cutlass")]
+    pub fn with_max_batch_size(
+        db: &[u16],
+        db_rows: usize,
+        db_rows_padded: usize,
+        db_cols: usize,
+        t_exp_left: usize,
+        rlwe_q_prime_1: u64,
+        rlwe_q_prime_2: u64,
+        params: &spiral_rs::params::Params,
+        max_batch_size: usize,
+    ) -> Result<Self, String> {
+        let poly_len = params.poly_len;
+        let crt_count = params.crt_count;
+        let num_rlwe_outputs = db_cols / poly_len;
+
+        let (forward_table, forward_prime_table, inverse_table, inverse_prime_table) =
+            Self::flatten_ntt_tables(params);
+
+        let ctx = unsafe {
+            ypir_sp_online_init(
+                db.as_ptr(),
+                db_rows,
+                db_rows_padded,
+                db_cols,
+                t_exp_left,
+                rlwe_q_prime_1,
+                rlwe_q_prime_2,
+                poly_len as u32,
+                crt_count as u32,
+                params.moduli.as_ptr(),
+                params.barrett_cr_1.as_ptr(),
+                forward_table.as_ptr(),
+                forward_prime_table.as_ptr(),
+                inverse_table.as_ptr(),
+                inverse_prime_table.as_ptr(),
+                params.mod0_inv_mod1,
+                params.mod1_inv_mod0,
+                params.barrett_cr_0_modulus,
+                params.barrett_cr_1_modulus,
+                max_batch_size,
+            )
+        };
+
+        if ctx.is_null() {
+            return Err("Failed to initialize SimplePIR online GPU context (CUTLASS)".to_string());
+        }
+
+        Ok(Self { ctx, poly_len, db_cols, num_rlwe_outputs, rlwe_q_prime_1, rlwe_q_prime_2 })
+    }
+
+    #[cfg(not(feature = "cutlass"))]
+    fn init_inner(
         db: &[u16],
         db_rows: usize,
         db_rows_padded: usize,
@@ -627,20 +752,10 @@ impl SPOnlineContext {
         let poly_len = params.poly_len;
         let crt_count = params.crt_count;
         let num_rlwe_outputs = db_cols / poly_len;
-        
-        // Flatten NTT tables
-        let mut forward_table = Vec::with_capacity(crt_count * poly_len);
-        let mut forward_prime_table = Vec::with_capacity(crt_count * poly_len);
-        let mut inverse_table = Vec::with_capacity(crt_count * poly_len);
-        let mut inverse_prime_table = Vec::with_capacity(crt_count * poly_len);
-        
-        for i in 0..crt_count {
-            forward_table.extend_from_slice(&params.ntt_tables[i][0]);
-            forward_prime_table.extend_from_slice(&params.ntt_tables[i][1]);
-            inverse_table.extend_from_slice(&params.ntt_tables[i][2]);
-            inverse_prime_table.extend_from_slice(&params.ntt_tables[i][3]);
-        }
-        
+
+        let (forward_table, forward_prime_table, inverse_table, inverse_prime_table) =
+            Self::flatten_ntt_tables(params);
+
         let ctx = unsafe {
             ypir_sp_online_init(
                 db.as_ptr(),
@@ -664,19 +779,28 @@ impl SPOnlineContext {
                 params.barrett_cr_1_modulus,
             )
         };
-        
+
         if ctx.is_null() {
             return Err("Failed to initialize SimplePIR online GPU context".to_string());
         }
-        
-        Ok(Self { 
-            ctx, 
-            poly_len, 
-            db_cols, 
-            num_rlwe_outputs,
-            rlwe_q_prime_1,
-            rlwe_q_prime_2,
-        })
+
+        Ok(Self { ctx, poly_len, db_cols, num_rlwe_outputs, rlwe_q_prime_1, rlwe_q_prime_2 })
+    }
+
+    fn flatten_ntt_tables(params: &spiral_rs::params::Params) -> (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>) {
+        let poly_len = params.poly_len;
+        let crt_count = params.crt_count;
+        let mut forward_table = Vec::with_capacity(crt_count * poly_len);
+        let mut forward_prime_table = Vec::with_capacity(crt_count * poly_len);
+        let mut inverse_table = Vec::with_capacity(crt_count * poly_len);
+        let mut inverse_prime_table = Vec::with_capacity(crt_count * poly_len);
+        for i in 0..crt_count {
+            forward_table.extend_from_slice(&params.ntt_tables[i][0]);
+            forward_prime_table.extend_from_slice(&params.ntt_tables[i][1]);
+            inverse_table.extend_from_slice(&params.ntt_tables[i][2]);
+            inverse_prime_table.extend_from_slice(&params.ntt_tables[i][3]);
+        }
+        (forward_table, forward_prime_table, inverse_table, inverse_prime_table)
     }
     
     /// Upload packing data from offline precomputation

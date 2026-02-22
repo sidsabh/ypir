@@ -50,7 +50,7 @@ pub fn run_ypir_batched(
     // Q: why is clients as a generic instead of a parameter? 
     // A: CPU YPIR runs the DB-Q1 product using AVX. the supported number of clients: 1, 2, 4, or 8
     #[cfg(feature = "cuda")]
-    let measurement = dispatch_const!(num_clients, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16], |N| {
+    let measurement = dispatch_const!(num_clients, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 32, 64, 128], |N| {
         run_ypir_on_params::<N>(params, is_simplepir, trials)
     });
 
@@ -518,6 +518,7 @@ pub fn run_ypir_on_params<const K: usize>(
 
             online_upload_bytes = query_size + pub_params_size;
             debug!("Query size: {} bytes", online_upload_bytes);
+            debug!("Client {} query generated", _batch);
 
             queries.push((
                 y_client,

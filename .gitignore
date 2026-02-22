@@ -1,6 +1,6 @@
 /target
 **/*.so
-*.md
 .venv
-*.txt
 *.bin
+**/build
+InsPIRe

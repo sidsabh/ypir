@@ -1,33 +1,49 @@
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 #include "ntt.cuh"
 
-// Force rebuild
-// Packed matrix multiplication kernel adapted from SimplePIR
-// Achieves 177 GB/s on GTX 1080
+#include "cutlass/cutlass.h"
+#include "cutlass/gemm/device/gemm.h"
+#include <cublas_v2.h>
 
-#ifndef TILE_COLS
-#define TILE_COLS 128 // columns processed per tile
-#endif
+#define CUBLAS_CHECK(call) do { \
+    cublasStatus_t status_ = (call); \
+    if (status_ != CUBLAS_STATUS_SUCCESS) { \
+        fprintf(stderr, "cuBLAS error at %s:%d: %d\n", __FILE__, __LINE__, (int)status_); \
+    } \
+} while(0)
 
-#ifndef BLOCK_SIZE
-#define BLOCK_SIZE 1024  // threads per block
-#endif
-
-static constexpr int BASIS = 8;
 static constexpr int COMPRESSION = 4;
-static constexpr uint32_t MASK = (1u << BASIS) - 1u;
 
 typedef uint32_t Elem;
 
-#define MAX_BATCH_SIZE 16 // most number of queries at a time
+// CUTLASS GEMM: uint8 DB × uint32 query → uint32 output (mod 2^32 accumulation)
+using CutlassGemm = cutlass::gemm::device::Gemm<
+    uint8_t,                                // ElementA (DB, unpacked)
+    cutlass::layout::RowMajor,              // LayoutA
+    uint32_t,                               // ElementB (Query)
+    cutlass::layout::ColumnMajor,           // LayoutB
+    uint32_t,                               // ElementC (Output)
+    cutlass::layout::ColumnMajor,           // LayoutC
+    uint32_t,                               // ElementAccumulator
+    cutlass::arch::OpClassSimt,             // OperatorClass
+    cutlass::arch::Sm50,                    // ArchTag
+    cutlass::gemm::GemmShape<64, 64, 8>,    // ThreadblockShape
+    cutlass::gemm::GemmShape<32, 32, 8>,    // WarpShape
+    cutlass::gemm::GemmShape<1, 1, 1>,      // InstructionShape
+    cutlass::epilogue::thread::LinearCombination<uint32_t, 1, uint32_t, uint32_t>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>,
+    2                                        // Stages
+>;
 
 // GPU context for online computation
 struct OnlineContext {
-    Elem* d_db = nullptr;          // Device database (primary DB)
+    uint8_t* d_db = nullptr;       // Device database (uint8 elements, row-major)
     Elem* d_query = nullptr;       // Device query buffer
     Elem* d_result = nullptr;      // Device result buffer (Step 1 output / a1)
+    size_t max_batch_size = 0;     // Maximum supported batch size
 
     // Phase 2 & 3 data
     uint16_t* d_smaller_db = nullptr; // Expanded smaller DB
@@ -67,203 +83,104 @@ struct OnlineContext {
     uint64_t* d_precomp_vals = nullptr;
     uint64_t* d_precomp_tables = nullptr;
     uint64_t* d_fake_pack_pub_params = nullptr;
+
+    // Per-stream parallel execution resources
+    size_t num_streams = 0;
+    cudaStream_t* streams = nullptr;
+    uint16_t** d_modified_rows = nullptr;  // per-stream overlay (blowup rows only)
+    uint64_t** d_hint_batch = nullptr;
+    uint64_t** d_hint_acc_batch = nullptr;
+    uint64_t** d_response_batch = nullptr;
+    uint64_t** d_pack_pub_params_full_batch = nullptr;
+    uint64_t** d_packed_excess_batch = nullptr;
+    uint64_t** d_pack_excess_scratch_batch = nullptr;
+    uint64_t** d_pack_lwe_scratch_batch = nullptr;
+
+    // Pre-allocated batch buffers (avoid per-call cudaMalloc)
+    uint64_t* d_query_q2_all = nullptr;
+    uint64_t* d_pub_params_row_1s_all = nullptr;
+    uint8_t* d_all_responses = nullptr;
+    size_t response_bytes_per_item = 0;
+    size_t pub_params_row_1s_elems = 0;
+
+    // GEMM workspace (pre-allocated, CUTLASS SIMT fallback only)
+    void* d_gemm_workspace = nullptr;
+
+    // Tensor core resources (SM >= 72)
+    bool has_tensor_cores = false;
+    cublasHandle_t cublas_handle = nullptr;
+    uint8_t* d_query_bytes[4] = {nullptr, nullptr, nullptr, nullptr};
+
+    // Async transfer resources
+    cudaStream_t transfer_stream = nullptr;
+    Elem* h_query_pinned = nullptr;
+    uint64_t* h_query_q2_pinned = nullptr;
+    uint64_t* h_pub_params_pinned = nullptr;
 };
 
-struct B4 { Elem b0, b1, b2, b3; };
 
-template<int K, int B>
-__global__ void matMulVecPackedWarpSpanTileK_B(
-    Elem* __restrict__ out,
-    const Elem* __restrict__ a,
-    const Elem* __restrict__ b,
-    size_t aRows, size_t aCols,
-    size_t startRow, size_t numRows
-) {
-    const int lane   = threadIdx.x & 31;
-    const int warpId = threadIdx.x >> 5;
-    const int warpsPerBlock = blockDim.x >> 5;
-
-    const size_t compressedCols = aCols / COMPRESSION;
-
-    const size_t warpPackBaseLocal =
-        (size_t)blockIdx.x * (size_t)(warpsPerBlock * K) + (size_t)warpId * (size_t)K;
-    if (warpPackBaseLocal >= numRows) return;
-
-    extern __shared__ B4 s_btile[]; // size = B * TILE_COLS
-
-    unsigned long long acc[K][B];
-    #pragma unroll
-    for (int r=0; r<K; r++) {
-        #pragma unroll
-        for (int bb=0; bb<B; bb++) acc[r][bb] = 0ull;
-    }
-
-    for (size_t tileBase = 0; tileBase < compressedCols; tileBase += TILE_COLS) {
-        const size_t tileCols = min((size_t)TILE_COLS, compressedCols - tileBase);
-
-        // load b tile into shared
-        for (size_t idx = threadIdx.x; idx < (size_t)B * tileCols; idx += blockDim.x) {
-            const int bb = (int)(idx / tileCols);
-            const size_t c = idx - (size_t)bb * tileCols;
-            const size_t j = tileBase + c;
-
-            const size_t base = (size_t)bb * aCols + j * COMPRESSION;
-
-            B4 v;
-            v.b0 = __ldg(&b[base + 0]);
-            v.b1 = __ldg(&b[base + 1]);
-            v.b2 = __ldg(&b[base + 2]);
-            v.b3 = __ldg(&b[base + 3]);
-
-            s_btile[bb * TILE_COLS + c] = v;
-        }
-        __syncthreads();
-
-        #pragma unroll
-        for (int r=0; r<K; r++) {
-            const size_t rowLocal = warpPackBaseLocal + (size_t)r;
-            if (rowLocal >= numRows) break;
-
-            const size_t row = startRow + rowLocal;
-            const size_t rowBaseA = (row * compressedCols) + tileBase;
-
-            for (size_t c = (size_t)lane; c < tileCols; c += 32) {
-                const Elem db = __ldg(&a[rowBaseA + c]);
-                const Elem v0 =  db               & MASK;
-                const Elem v1 = (db >> BASIS)     & MASK;
-                const Elem v2 = (db >> (2*BASIS)) & MASK;
-                const Elem v3 = (db >> (3*BASIS)) & MASK;
-
-                #pragma unroll
-                for (int bb=0; bb<B; bb++) {
-                    const B4 bv = s_btile[bb * TILE_COLS + c];
-                    acc[r][bb] += (unsigned long long)v0 * (unsigned long long)bv.b0;
-                    acc[r][bb] += (unsigned long long)v1 * (unsigned long long)bv.b1;
-                    acc[r][bb] += (unsigned long long)v2 * (unsigned long long)bv.b2;
-                    acc[r][bb] += (unsigned long long)v3 * (unsigned long long)bv.b3;
-                }
-            }
-        }
-
-        __syncthreads();
-    }
-
-    // reduce and store
-    #pragma unroll
-    for (int r=0; r<K; r++) {
-        const size_t rowLocal = warpPackBaseLocal + (size_t)r;
-        if (rowLocal >= numRows) break;
-
-        #pragma unroll
-        for (int bb=0; bb<B; bb++) {
-            unsigned long long v = acc[r][bb];
-            #pragma unroll
-            for (int off=16; off>0; off>>=1)
-                v += __shfl_down_sync(0xffffffff, v, off);
-
-            if (lane == 0) {
-                out[startRow + rowLocal + (size_t)numRows * (size_t)bb] = (Elem)v;
-            }
-        }
+// Decompose uint32 query values into 4 uint8 byte slices for tensor core GEMM
+__global__ void decompose_query_bytes_kernel(
+    uint8_t* __restrict__ q0, uint8_t* __restrict__ q1,
+    uint8_t* __restrict__ q2, uint8_t* __restrict__ q3,
+    const uint32_t* __restrict__ query, size_t count)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count) {
+        uint32_t v = query[idx];
+        q0[idx] = (uint8_t)(v & 0xFF);
+        q1[idx] = (uint8_t)((v >> 8) & 0xFF);
+        q2[idx] = (uint8_t)((v >> 16) & 0xFF);
+        q3[idx] = (uint8_t)((v >> 24) & 0xFF);
     }
 }
 
-
-// ---- 1) X-macro list: all batch sizes we want to support ----
-#define BATCH_LIST_1_TO_16(X) \
-    X(1)  X(2)  X(3)  X(4)  X(5)  X(6)  X(7)  X(8)  \
-    X(9)  X(10) X(11) X(12) X(13) X(14) X(15) X(16)
-
-// ---- 2) shared-mem helper (matches kernel's shared layout: B * TILE_COLS * sizeof(B4)) ----
-static inline size_t shmem_for_batch(int B) {
-    return (size_t)B * (size_t)TILE_COLS * sizeof(B4);
-}
-
-// ---- 3) case generator ----
-#define LAUNCH_CASE(B) \
-    case (B): \
-        matMulVecPackedWarpSpanTileK_B<K, (B)><<<blocks, threads, shmem_for_batch(B), stream>>>( \
-            out, a, b, aRows, aCols, startRow, numRows); \
-        break;
-
-// ---- 4) dispatch wrapper (supports batch_size 1..16) ----
-template<int K>
-static inline void launch_step1(
-    Elem* out,
-    const Elem* a,
-    const Elem* b,
-    size_t aRows,
-    size_t aCols,
-    int batch_size,
-    size_t startRow,
-    size_t numRows,
-    int blocks,
-    int threads,
-    cudaStream_t stream = 0
-) {
-    switch (batch_size) {
-        BATCH_LIST_1_TO_16(LAUNCH_CASE)
-        default:
-            // Optional: clamp or fallback
-            // fprintf(stderr, "Unsupported batch_size=%d (expected 1..16)\n", batch_size);
-            break;
-    }
-}
-
-#undef LAUNCH_CASE
-
-// Kernel to rescale intermediate results and update smaller DB
+// Kernel to rescale intermediate results into per-batch overlay buffer
 __global__ void rescale_and_expand_kernel(
     const Elem* __restrict__ intermediate,
-    uint16_t* __restrict__ smaller_db,
+    uint16_t* __restrict__ modified_rows,  // output: blowup_factor_ceil × db_cols
     size_t db_cols,
     uint64_t lwe_modulus,
     uint64_t lwe_q_prime,
     int pt_bits,
-    size_t special_offs,
-    size_t blowup_factor_ceil,
-    size_t out_rows
-) 
+    size_t blowup_factor_ceil
+)
 {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= db_cols) return;
 
     // Rescale
     uint64_t val = (uint64_t)intermediate[idx];
-    
+
     double d_val = (double)val;
     double d_mod = (double)lwe_modulus;
     double d_qp = (double)lwe_q_prime;
-    
+
     uint64_t rescaled = (uint64_t)((d_val * d_qp) / d_mod + 0.5);
-    
+
     for (size_t m = 0; m < blowup_factor_ceil; m++) {
-        size_t out_idx = (special_offs + m) * db_cols + idx;
-        
+        size_t out_idx = m * db_cols + idx;
+
         uint16_t val_part = (rescaled >> (m * pt_bits)) & ((1 << pt_bits) - 1);
-        smaller_db[out_idx] = val_part;
+        modified_rows[out_idx] = val_part;
     }
 }
 
 // Secondary hint kernel matching multiply_with_db_ring
-// One block per "column" (actually a row in range [special_offs, special_offs + blowup_factor_ceil))
+// One block per modified row (m = 0..blowup_factor_ceil-1)
 __global__ void compute_secondary_hint_kernel(
     uint64_t* __restrict__ hint_out,
-    const uint16_t* __restrict__ smaller_db,
+    const uint16_t* __restrict__ modified_rows,  // overlay: blowup × db_cols
     const uint64_t* __restrict__ query_ntt,
     uint64_t* __restrict__ sum_global,  // Global memory accumulator
     NTTParams params,
-    size_t db_cols,
     size_t db_rows_poly,
-    size_t special_offs,
     size_t blowup_factor_ceil
-) 
+)
 {
-    // Each block processes one "column" (row in [special_offs, special_offs + blowup_factor_ceil))
     size_t m = blockIdx.x;
     if (m >= blowup_factor_ceil) return;
 
-    size_t col = special_offs + m; // The "column" index we're processing
     size_t tid = threadIdx.x;
 
     uint32_t poly_len = params.poly_len;
@@ -290,12 +207,11 @@ __global__ void compute_secondary_hint_kernel(
 
     // For each row (polynomial chunk)
     for (size_t row = 0; row < db_rows_poly; row++) {
-        // Load DB element as polynomial into workspace and replicate across CRT
-        // DB layout: db[col * db_rows + row * poly_len + z]
-        // where db_rows = db_rows_poly * poly_len
+        // Load DB element from overlay buffer
+        // Overlay layout: modified_rows[m * db_cols + row * poly_len + z]
         for (size_t z = tid; z < poly_len; z += blockDim.x) {
-            size_t db_idx = col * (db_rows_poly * poly_len) + row * poly_len + z;
-            workspace[z] = (uint64_t)smaller_db[db_idx];
+            size_t db_idx = m * (db_rows_poly * poly_len) + row * poly_len + z;
+            workspace[z] = (uint64_t)modified_rows[db_idx];
         }
         __syncthreads();
 
@@ -379,6 +295,9 @@ __global__ void compute_response_kernel(
     const uint64_t* __restrict__ query_packed, // [db_cols]
     size_t db_cols,
     size_t out_rows,
+    const uint16_t* __restrict__ modified_rows, // overlay: blowup rows
+    size_t overlay_start,
+    size_t overlay_count,
     NTTParams params
 ) {
     const uint32_t row = blockIdx.x;
@@ -393,7 +312,13 @@ __global__ void compute_response_kernel(
     uint64_t sum_lo = 0;
     uint64_t sum_hi = 0;
 
-    const uint16_t* db_row = smaller_db + (size_t)row * db_cols;
+    // For overlay rows, read from the per-batch modified_rows buffer
+    const uint16_t* db_row;
+    if (row >= overlay_start && row < overlay_start + overlay_count) {
+        db_row = modified_rows + (size_t)(row - overlay_start) * db_cols;
+    } else {
+        db_row = smaller_db + (size_t)row * db_cols;
+    }
 
     // Unroll-friendly: db_cols is ~65536, stride=256 => 256 iters
     for (size_t col = lane; col < db_cols; col += blockDim.x) {
@@ -532,7 +457,7 @@ __global__ void build_pub_params_full(
     }
 }
 
-__global__ void pack_excess(
+__global__ void __launch_bounds__(1024, 1) pack_excess(
     uint64_t* d_packed_out,
     const uint64_t* d_hint,
     const uint64_t* d_pub_params_full,     // IN: log2_poly_len * pub_param_size_u64
@@ -763,7 +688,7 @@ uint32_t ceil_log2_u64(uint64_t x) {
 #endif
 }
 
-__global__ void pack_lwes_and_mod_switch(
+__global__ void __launch_bounds__(1024, 1) pack_lwes_and_mod_switch(
     uint8_t* d_response_out,             // output: final response bytes
     const uint64_t* d_packed_excess,     // from pack_excess kernel: 2 * crt_count * poly_len
     const uint64_t* d_response,          // b_values from step 4: poly_len u64s
@@ -1052,7 +977,8 @@ extern "C" {
 // Initialize online computation context
 void* ypir_online_init(const Elem* db, size_t db_rows, size_t db_cols,
                        const uint64_t* pseudorandom_query1,
-                       const uint16_t* smaller_db, size_t smaller_db_rows)
+                       const uint16_t* smaller_db, size_t smaller_db_rows,
+                       size_t max_batch_size)
 {
     OnlineContext* ctx = new OnlineContext();
 
@@ -1060,17 +986,19 @@ void* ypir_online_init(const Elem* db, size_t db_rows, size_t db_cols,
     ctx->db_cols = db_cols;
     ctx->smaller_db_rows = smaller_db_rows;
     ctx->smaller_db_cols = db_rows;
+    ctx->max_batch_size = max_batch_size;
 
-    // Allocate device memory for Phase 1
-    const size_t db_bytes = db_rows * db_cols * (sizeof(Elem)/COMPRESSION);
-    const size_t query_bytes = db_cols* MAX_BATCH_SIZE * sizeof(Elem);
-    const size_t result_bytes = db_rows * MAX_BATCH_SIZE * sizeof(Elem);
+    // DB is packed uint32 on host: db_rows × (db_cols/4) uint32 = db_rows × db_cols bytes
+    // In memory this is identical to db_rows × db_cols uint8 (little-endian)
+    const size_t db_bytes = db_rows * db_cols * sizeof(uint8_t);
+    const size_t query_bytes = db_cols * max_batch_size * sizeof(Elem);
+    const size_t result_bytes = db_rows * max_batch_size * sizeof(Elem);
 
     CUDA_ASSERT(cudaMalloc(&ctx->d_db, db_bytes));
     CUDA_ASSERT(cudaMalloc(&ctx->d_query, query_bytes));
     CUDA_ASSERT(cudaMalloc(&ctx->d_result, result_bytes));
 
-    // Upload database
+    // Upload database (reinterpret packed uint32 as uint8)
     CUDA_ASSERT(cudaMemcpy(ctx->d_db, db, db_bytes, cudaMemcpyHostToDevice));
 
     // Upload pseudorandom query (*2 because CRT )
@@ -1081,7 +1009,63 @@ void* ypir_online_init(const Elem* db, size_t db_rows, size_t db_cols,
     const size_t smaller_db_bytes = smaller_db_rows * ctx->smaller_db_cols * sizeof(uint16_t);
     CUDA_ALLOC_AND_COPY(ctx->d_smaller_db, smaller_db, smaller_db_bytes);
 
+    // Host-side pointer arrays (GPU allocs deferred to init_ntt/init_packing)
+    ctx->d_modified_rows = new uint16_t*[max_batch_size]();
+    ctx->d_hint_batch = new uint64_t*[max_batch_size]();
+    ctx->d_hint_acc_batch = new uint64_t*[max_batch_size]();
+    ctx->d_response_batch = new uint64_t*[max_batch_size]();
+    ctx->d_pack_pub_params_full_batch = new uint64_t*[max_batch_size]();
+    ctx->d_packed_excess_batch = new uint64_t*[max_batch_size]();
+    ctx->d_pack_excess_scratch_batch = new uint64_t*[max_batch_size]();
+    ctx->d_pack_lwe_scratch_batch = new uint64_t*[max_batch_size]();
+
     CUDA_ASSERT(cudaDeviceSetCacheConfig(cudaFuncCachePreferL1));
+
+    // Detect tensor cores (SM >= 72: Turing, Ampere, Hopper, ...)
+    {
+        int device;
+        CUDA_ASSERT(cudaGetDevice(&device));
+        int major, minor;
+        CUDA_ASSERT(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+        CUDA_ASSERT(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
+        int sm = major * 10 + minor;
+        ctx->has_tensor_cores = (sm >= 72);
+
+        if (ctx->has_tensor_cores) {
+            CUBLAS_CHECK(cublasCreate(&ctx->cublas_handle));
+            size_t byte_query_size = db_cols * max_batch_size * sizeof(uint8_t);
+            for (int i = 0; i < 4; i++) {
+                CUDA_ASSERT(cudaMalloc(&ctx->d_query_bytes[i], byte_query_size));
+            }
+            printf("GPU SM %d.%d: tensor cores enabled for Step 1 (4x cuBLAS int8 GEMM)\n", major, minor);
+        } else {
+            printf("GPU SM %d.%d: using CUTLASS SIMT for Step 1\n", major, minor);
+        }
+    }
+
+    // Pre-allocate GEMM workspace for CUTLASS SIMT (fallback for non-tensor-core GPUs)
+    if (!ctx->has_tensor_cores) {
+        cutlass::gemm::GemmCoord problem_size(db_rows, max_batch_size, db_cols);
+        uint32_t alpha = 1, beta = 0;
+        CutlassGemm::Arguments args{
+            problem_size,
+            {ctx->d_db, (int)db_cols},
+            {ctx->d_query, (int)db_cols},
+            {ctx->d_result, (int)db_rows},
+            {ctx->d_result, (int)db_rows},
+            {alpha, beta}, 1
+        };
+        size_t ws = CutlassGemm::get_workspace_size(args);
+        if (ws > 0) {
+            CUDA_ASSERT(cudaMalloc(&ctx->d_gemm_workspace, ws));
+        }
+    }
+
+    // Transfer stream for async data uploads
+    CUDA_ASSERT(cudaStreamCreate(&ctx->transfer_stream));
+
+    // Pinned host memory for query upload
+    CUDA_ASSERT(cudaMallocHost(&ctx->h_query_pinned, db_cols * max_batch_size * sizeof(Elem)));
 
     return (void*)ctx;
 }
@@ -1157,6 +1141,64 @@ void ypir_online_init_ntt(
     size_t response_size = ctx->smaller_db_rows * sizeof(uint64_t);
     CUDA_ASSERT(cudaMalloc(&ctx->d_response, response_size));
 
+    // Determine num_streams based on available GPU memory
+    size_t modified_rows_bytes = blowup_factor_ceil * ctx->smaller_db_cols * sizeof(uint16_t);
+    size_t log2pl = ctx->ntt_params.log2_poly_len;
+    size_t pub_params_full_bytes = log2pl * 2 * t_exp_left * convd_len * sizeof(uint64_t);
+    size_t packed_excess_bytes = 2 * convd_len * sizeof(uint64_t);
+    size_t pack_excess_scratch_bytes = ((2*convd_len) + (2*poly_len) + (2*poly_len) +
+        (t_exp_left*poly_len) + (t_exp_left*convd_len) + (2*convd_len) + convd_len) * sizeof(uint64_t);
+    size_t working_set_size = (1 << (log2pl - 1));
+    size_t pack_lwe_scratch_bytes = ((working_set_size*poly_len) + 4*poly_len +
+        (2*convd_len) + (2*poly_len) + convd_len) * sizeof(uint64_t);
+    size_t per_stream_bytes = modified_rows_bytes + hint_size + sum_size + response_size +
+        pub_params_full_bytes + packed_excess_bytes + pack_excess_scratch_bytes + pack_lwe_scratch_bytes;
+
+    size_t free_mem, total_mem;
+    CUDA_ASSERT(cudaMemGetInfo(&free_mem, &total_mem));
+    size_t reserved = 128 * 1024 * 1024;  // reserve 128 MB for other allocs
+    size_t available = (free_mem > reserved) ? (free_mem - reserved) : 0;
+
+    size_t num_streams = available / per_stream_bytes;
+    if (num_streams < 1) num_streams = 1;
+    if (num_streams > ctx->max_batch_size) num_streams = ctx->max_batch_size;
+    ctx->num_streams = num_streams;
+
+    printf("GPU: %.1f MB free, per-stream %.2f MB, using %zu parallel streams\n",
+        free_mem / 1e6, per_stream_bytes / 1e6, num_streams);
+
+    // Create CUDA streams
+    ctx->streams = new cudaStream_t[num_streams];
+    for (size_t i = 0; i < num_streams; i++) {
+        CUDA_ASSERT(cudaStreamCreate(&ctx->streams[i]));
+    }
+
+    // Per-stream allocations
+    for (size_t i = 0; i < num_streams; i++) {
+        CUDA_ASSERT(cudaMalloc(&ctx->d_modified_rows[i], modified_rows_bytes));
+        CUDA_ASSERT(cudaMalloc(&ctx->d_hint_batch[i], hint_size));
+        CUDA_ASSERT(cudaMalloc(&ctx->d_hint_acc_batch[i], sum_size));
+        CUDA_ASSERT(cudaMalloc(&ctx->d_response_batch[i], response_size));
+    }
+
+    // Pre-allocate batch upload/download buffers
+    ctx->pub_params_row_1s_elems = poly_len * ctx->ntt_params.log2_poly_len * t_exp_left;
+    CUDA_ASSERT(cudaMalloc(&ctx->d_query_q2_all,
+        ctx->max_batch_size * ctx->smaller_db_cols * sizeof(uint64_t)));
+    CUDA_ASSERT(cudaMalloc(&ctx->d_pub_params_row_1s_all,
+        ctx->max_batch_size * ctx->pub_params_row_1s_elems * sizeof(uint64_t)));
+
+    size_t q_1_bits_init = ceil_log2_u64(rlwe_q_prime_2);
+    size_t q_2_bits_init = ceil_log2_u64(rlwe_q_prime_1);
+    ctx->response_bytes_per_item = ((q_1_bits_init + q_2_bits_init) * poly_len + 7) / 8;
+    CUDA_ASSERT(cudaMalloc(&ctx->d_all_responses,
+        ctx->max_batch_size * ctx->response_bytes_per_item));
+
+    // Pinned host memory for async batch transfers
+    CUDA_ASSERT(cudaMallocHost(&ctx->h_query_q2_pinned,
+        ctx->max_batch_size * ctx->smaller_db_cols * sizeof(uint64_t)));
+    CUDA_ASSERT(cudaMallocHost(&ctx->h_pub_params_pinned,
+        ctx->max_batch_size * ctx->pub_params_row_1s_elems * sizeof(uint64_t)));
 }
 
 void ypir_init_packing_data(
@@ -1209,6 +1251,39 @@ void ypir_init_packing_data(
     );
     CUDA_ASSERT(cudaGetLastError());
 
+    // Pre-allocate per-batch scratch buffers
+    size_t pack_excess_scratch_sz_u64 =
+        (2 * convd_len) +                 // cur_r
+        (2 * poly_len) +                  // ct_raw
+        (2 * poly_len) +                  // ct_auto
+        (t_exp_left * poly_len) +         // ginv_ct
+        (t_exp_left * convd_len) +        // ginv_ct_ntt
+        (2 * convd_len) +                 // tau_of_r
+        convd_len;                        // temp_ntt
+
+    size_t working_set_size = (1 << (log2_poly_len - 1));
+    size_t pack_lwe_scratch_sz =
+        (working_set_size * poly_len) +   // working_set
+        poly_len +                        // y_times_ct_odd
+        poly_len +                        // neg_y_times_ct_odd
+        poly_len +                        // ct_sum_1
+        poly_len +                        // w_times_ginv_ct
+        (2 * convd_len) +                 // result_ntt
+        (2 * poly_len) +                  // temp_raw
+        convd_len;                        // temp_ntt
+
+    size_t packed_excess_sz = 2 * convd_len;
+
+    for (size_t i = 0; i < ctx->num_streams; i++) {
+        CUDA_ASSERT(cudaMalloc(&ctx->d_pack_pub_params_full_batch[i],
+                    log2_poly_len * pub_param_size_u64 * sizeof(uint64_t)));
+        CUDA_ASSERT(cudaMalloc(&ctx->d_packed_excess_batch[i],
+                    packed_excess_sz * sizeof(uint64_t)));
+        CUDA_ASSERT(cudaMalloc(&ctx->d_pack_excess_scratch_batch[i],
+                    pack_excess_scratch_sz_u64 * sizeof(uint64_t)));
+        CUDA_ASSERT(cudaMalloc(&ctx->d_pack_lwe_scratch_batch[i],
+                    pack_lwe_scratch_sz * sizeof(uint64_t)));
+    }
 }
 
 // Full batch execution: Step 1 -> Loop(Step 2 -> Step 3 -> Step 4)
@@ -1222,267 +1297,231 @@ void ypir_online_compute_full_batch(
 ) 
 {
     OnlineContext* ctx = (OnlineContext*)context;
-    float ms1=0, ms2=0, ms3=0, ms4=0, ms5a=0, ms5b=0;
     GpuTimer t;
 
-    // Step 1: SimplePIR 
-
-    // Upload query
     size_t query_bytes = ctx->db_cols * batch_size * sizeof(Elem);
-    CUDA_ASSERT(cudaMemcpy(ctx->d_query, query, query_bytes, cudaMemcpyHostToDevice));
+    size_t q2_bytes = batch_size * ctx->smaller_db_cols * sizeof(uint64_t);
+    size_t pub_params_bytes = batch_size * ctx->pub_params_row_1s_elems * sizeof(uint64_t);
 
-    // Launch Step 1 kernel
-    const int K = 4;
-    const int threads = BLOCK_SIZE;
-    const int warps_per_block = threads / 32;
-    const int blocks_step1 = (ctx->db_rows + warps_per_block * K - 1) / (warps_per_block * K);
-    const size_t shared_mem_step1 = batch_size * COMPRESSION * TILE_COLS * sizeof(Elem);
+    // Stage query to pinned memory and async upload on default stream
+    memcpy(ctx->h_query_pinned, query, query_bytes);
+    CUDA_ASSERT(cudaMemcpyAsync(ctx->d_query, ctx->h_query_pinned, query_bytes,
+        cudaMemcpyHostToDevice, 0));
 
+    // Step 1: Matrix multiply DB × query → result
     t.tic();
-    // compute blocks_step1 same as before
-    launch_step1<K>(
-        ctx->d_result,
-        ctx->d_db,
-        ctx->d_query,
-        ctx->db_rows,
-        ctx->db_cols,
-        (int)batch_size,
-        0,
-        ctx->db_rows,
-        blocks_step1,
-        threads
-    );
-    CUDA_ASSERT(cudaGetLastError());
-
-    CUDA_ASSERT(cudaGetLastError());
-    ms1 = t.toc_ms();
-
-
-    // Prepare for Loop
-    size_t convd_len = ctx->ntt_params.crt_count * ctx->ntt_params.poly_len;
-    size_t hint_size = ctx->ntt_params.poly_len * ctx->blowup_factor_ceil * sizeof(uint64_t);
-    size_t query_q2_size = ctx->smaller_db_cols * sizeof(uint64_t); // per batch item
-    size_t response_size = ctx->smaller_db_rows * sizeof(uint64_t);
-    size_t pack_pub_params_row_1s_elems = ctx->ntt_params.poly_len * ctx->ntt_params.log2_poly_len * ctx->t_exp_left;
-
-
-    // Allocate device buffers for full batch output to avoid host sync inside loop
-    uint64_t* d_query_q2_batch;
-    CUDA_ALLOC_AND_COPY(d_query_q2_batch, query_q2_batch, batch_size * query_q2_size);
-    uint64_t* d_pack_pub_params_row_1s_batch;
-    CUDA_ALLOC_AND_COPY(d_pack_pub_params_row_1s_batch, pack_pub_params_row_1s_batch, 
-                    batch_size * pack_pub_params_row_1s_elems * sizeof(uint64_t));
-
-    size_t q_1_bits = ceil_log2_u64(ctx->rlwe_q_prime_2);
-    size_t q_2_bits = ceil_log2_u64(ctx->rlwe_q_prime_1);
-    size_t response_bytes_per_batch = ((q_1_bits + q_2_bits) * ctx->ntt_params.poly_len + 7) / 8;
-    
-    uint8_t* d_all_responses;
-    CUDA_ASSERT(cudaMalloc(&d_all_responses, batch_size * response_bytes_per_batch));
-
-
-    // Loop over batch :
-    // TODO THIS SHOULD BE MULTITHREADED
-    for (size_t i = 0; i < batch_size; i++) {
-    
-        // Step 2: Update smaller DB
-        Elem* d_intermediate = ctx->d_result + i * ctx->smaller_db_cols;
-        
-        int threads_step2 = 1024;
-        int blocks_step2 = (ctx->smaller_db_cols + threads_step2 - 1) / threads_step2;
-
-        t.tic();
-        rescale_and_expand_kernel<<<blocks_step2, threads_step2>>>(
-            d_intermediate,
-            ctx->d_smaller_db,
-            ctx->smaller_db_cols,
-            ctx->lwe_modulus,
-            ctx->lwe_q_prime,
-            (int)ctx->pt_bits,
-            ctx->special_offs,
-            ctx->blowup_factor_ceil,
-            ctx->smaller_db_rows
-        );
-        CUDA_ASSERT(cudaGetLastError());
-        ms2 += t.toc_ms();
-
-        // Step 3: Compute Secondary Hint
-        // Input: ctx->d_smaller_db, ctx->d_query_ntt
-        // Output: ctx->d_hint
-        
-        size_t shared_mem_step3 = convd_len * sizeof(uint64_t);
-        int threads_step3 = 1024;
-        t.tic();
-        compute_secondary_hint_kernel<<<ctx->blowup_factor_ceil, threads_step3, shared_mem_step3>>>(
-            ctx->d_hint,
-            ctx->d_smaller_db,
-            ctx->d_query_ntt,
-            ctx->d_hint_acc,
-            ctx->ntt_params,
-            ctx->db_cols,
-            ctx->smaller_db_cols / ctx->ntt_params.poly_len,
-            ctx->special_offs,
-            ctx->blowup_factor_ceil
-        );
-        CUDA_ASSERT(cudaGetLastError());
-        ms3 += t.toc_ms();
-
-
-        // ctx->d_hint stores the value A2*decompose(T, pt_bits)
-
-        // Step 4: Compute Response
-        // Input: ctx->d_smaller_db, d_query_q2_batch + i * ...
-        // Output: ctx->d_response
-        
-        uint64_t* d_q2_current = d_query_q2_batch + i * ctx->smaller_db_cols;
-        
-        t.tic();
-        int threads_step4 = 256;
-        dim3 grid(ctx->smaller_db_rows);   // one block per row
-        compute_response_kernel<<<grid, threads_step4>>>(
-            ctx->d_response,
-            ctx->d_smaller_db,
-            d_q2_current,
-            ctx->smaller_db_cols,
-            ctx->smaller_db_rows,
-            ctx->ntt_params
-        );
-        CUDA_ASSERT(cudaGetLastError());
-        ms4 += t.toc_ms();
-
-        
-           // ==================== Step 5: Packing ====================
-        
-        // 5a. Pack excess (automorphism keys portion)
-        // Step 5a output
-        uint64_t* d_packed_excess;
-        size_t d_packed_excess_sz = 2 * ctx->ntt_params.crt_count * ctx->ntt_params.poly_len * sizeof(uint64_t);
-        CUDA_ASSERT(cudaMalloc(&d_packed_excess, d_packed_excess_sz));
-
-        // scratch (smaller now: no d_pub_params_full, no rotation_ntt)
-        size_t convd_len = ctx->ntt_params.crt_count * ctx->ntt_params.poly_len;
-        size_t poly_len  = ctx->ntt_params.poly_len;
-
-        size_t pack_excess_scratch_sz_u64 =
-            (2 * convd_len) +                 // cur_r
-            (2 * poly_len) +                  // ct_raw
-            (2 * poly_len) +                  // ct_auto
-            (ctx->t_exp_left * poly_len) +    // ginv_ct
-            (ctx->t_exp_left * convd_len) +   // ginv_ct_ntt
-            (2 * convd_len) +                 // tau_of_r
-            convd_len;                        // temp_ntt
-
-        uint64_t* d_pack_excess_scratch;
-        CUDA_ASSERT(cudaMalloc(&d_pack_excess_scratch, pack_excess_scratch_sz_u64 * sizeof(uint64_t)));
-
-        int threads_pack = 1024;
-
-        // 0) Expand pub params row1s into full pub params (per key_idx block)
-        build_pub_params_full<<<ctx->ntt_params.log2_poly_len, threads_pack>>>(
-            ctx->d_pack_pub_params_full,
-            ctx->d_fake_pack_pub_params,                       // already on GPU
-            d_pack_pub_params_row_1s_batch + i * pack_pub_params_row_1s_elems, // condensed row1s for this item
-            ctx->t_exp_left,
-            ctx->ntt_params
-        );
+    if (ctx->has_tensor_cores) {
+        // Decompose uint32 query into 4 uint8 byte slices
+        size_t total_elems = ctx->db_cols * batch_size;
+        int dec_threads = 256;
+        int dec_blocks = (total_elems + dec_threads - 1) / dec_threads;
+        decompose_query_bytes_kernel<<<dec_blocks, dec_threads>>>(
+            ctx->d_query_bytes[0], ctx->d_query_bytes[1],
+            ctx->d_query_bytes[2], ctx->d_query_bytes[3],
+            ctx->d_query, total_elems);
         CUDA_ASSERT(cudaGetLastError());
 
-        // 1) pack_excess v2 (uses prebuilt pub params + prebuilt rotation table)
-        t.tic();
-        pack_excess<<<1, threads_pack>>>(
-            d_packed_excess,
-            ctx->d_hint,
-            ctx->d_pack_pub_params_full,
-            ctx->d_rotation_ntt_table,
-            d_pack_excess_scratch,
-            ctx->special_offs,
-            ctx->blowup_factor_ceil,
-            ctx->t_exp_left,
-            ctx->ntt_params
-        );
-        CUDA_ASSERT(cudaGetLastError());
-        ms5a += t.toc_ms();
+        // 4 cuBLAS uint8 GEMMs with alpha/beta folding (tensor cores)
+        // D = sum_{g=0..3} (256^g) * DB_u8 * q_byte_g
+        int32_t alphas[4] = {1, 256, 65536, 16777216};
+        int32_t betas[4] = {0, 1, 1, 1};
+        int M = (int)ctx->db_rows;
+        int N = (int)batch_size;
+        int K = (int)ctx->db_cols;
 
-        CUDA_ASSERT(cudaFree(d_pack_excess_scratch));
-
-        
-        // 5b. Pack LWEs and mod switch
-        size_t q_1_bits = ceil_log2_u64(ctx->rlwe_q_prime_2);
-        size_t q_2_bits = ceil_log2_u64(ctx->rlwe_q_prime_1);
-        size_t total_sz_bits = (q_1_bits + q_2_bits) * poly_len;
-        size_t total_sz_bytes = (total_sz_bits + 7) / 8;
-        
-        // Scratch for pack_lwes_and_mod_switch
-        size_t working_set_size = (1 << (ctx->ntt_params.log2_poly_len - 1));
-        size_t pack_lwe_scratch_sz = 
-            (working_set_size * poly_len) +  // working_set
-            poly_len +                        // y_times_ct_odd
-            poly_len +                        // neg_y_times_ct_odd
-            poly_len +                        // ct_sum_1
-            poly_len +                        // w_times_ginv_ct
-            (2 * convd_len) +                 // result_ntt
-            (2 * poly_len) +                  // temp_raw
-            convd_len;                        // temp_ntt
-        
-        uint64_t* d_pack_lwe_scratch;
-        CUDA_ASSERT(cudaMalloc(&d_pack_lwe_scratch, pack_lwe_scratch_sz * sizeof(uint64_t)));
-        
-        // Output for this batch item
-        uint8_t* d_response_i = d_all_responses + i * total_sz_bytes;
-
-        t.tic();
-        pack_lwes_and_mod_switch<<<1, threads_pack>>>(
-            d_response_i,
-            d_packed_excess,
-            ctx->d_response,  // b_values from step 4
-            ctx->d_y_constants,
-            ctx->d_precomp_res,
-            ctx->d_precomp_vals,
-            ctx->d_precomp_tables,
-            d_pack_pub_params_row_1s_batch + i * pack_pub_params_row_1s_elems,
-            d_pack_lwe_scratch,
-            ctx->t_exp_left,
-            ctx->rlwe_q_prime_1,
-            ctx->rlwe_q_prime_2,
-            ctx->ntt_params
-        );
-        ms5b += t.toc_ms();
-        CUDA_ASSERT(cudaGetLastError());
-        
-        CUDA_ASSERT(cudaFree(d_pack_lwe_scratch));
-        CUDA_ASSERT(cudaFree(d_packed_excess));
+        for (int g = 0; g < 4; g++) {
+            CUBLAS_CHECK(cublasGemmEx(ctx->cublas_handle,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                M, N, K,
+                &alphas[g],
+                ctx->d_db,            CUDA_R_8U, K,
+                ctx->d_query_bytes[g], CUDA_R_8U, K,
+                &betas[g],
+                ctx->d_result,        CUDA_R_32I, M,
+                CUBLAS_COMPUTE_32I,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        }
+    } else {
+        // CUTLASS SIMT GEMM (fallback for SM < 72)
+        cutlass::gemm::GemmCoord problem_size(ctx->db_rows, batch_size, ctx->db_cols);
+        uint32_t alpha = 1, beta = 0;
+        CutlassGemm::Arguments args{
+            problem_size,
+            {ctx->d_db, (int)ctx->db_cols},
+            {ctx->d_query, (int)ctx->db_cols},
+            {ctx->d_result, (int)ctx->db_rows},
+            {ctx->d_result, (int)ctx->db_rows},
+            {alpha, beta}, 1
+        };
+        CutlassGemm gemm_op;
+        cutlass::Status status = gemm_op.initialize(args, ctx->d_gemm_workspace);
+        if (status != cutlass::Status::kSuccess) {
+            fprintf(stderr, "CUTLASS init failed: %s\n", cutlassGetStatusString(status));
+        }
+        status = gemm_op();
+        if (status != cutlass::Status::kSuccess) {
+            fprintf(stderr, "CUTLASS GEMM failed: %s\n", cutlassGetStatusString(status));
+        }
     }
-    
-    // Download responses
-    size_t total_sz_bytes = ((q_1_bits + q_2_bits) * ctx->ntt_params.poly_len + 7) / 8;
+    CUDA_ASSERT(cudaGetLastError());
 
-    printf("Step1 %.3f ms, Step2 %.3f ms, Step3 %.3f ms, Step4 %.3f ms, Step5a %.3f ms, Step5b %.3f ms\n",
-        ms1, ms2, ms3, ms4, ms5a, ms5b);
-    
-    CUDA_ASSERT(cudaMemcpy(responses, d_all_responses, batch_size * total_sz_bytes, cudaMemcpyDeviceToHost));
-    
-    // Cleanup
-    CUDA_ASSERT(cudaFree(d_all_responses));
-    CUDA_ASSERT(cudaFree(d_query_q2_batch));
-    CUDA_ASSERT(cudaFree(d_pack_pub_params_row_1s_batch));
+    // Async upload q2 and pub_params on transfer stream (overlaps with GEMM)
+    memcpy(ctx->h_query_q2_pinned, query_q2_batch, q2_bytes);
+    memcpy(ctx->h_pub_params_pinned, pack_pub_params_row_1s_batch, pub_params_bytes);
+    CUDA_ASSERT(cudaMemcpyAsync(ctx->d_query_q2_all, ctx->h_query_q2_pinned, q2_bytes,
+        cudaMemcpyHostToDevice, ctx->transfer_stream));
+    CUDA_ASSERT(cudaMemcpyAsync(ctx->d_pub_params_row_1s_all, ctx->h_pub_params_pinned, pub_params_bytes,
+        cudaMemcpyHostToDevice, ctx->transfer_stream));
+
+    // Wait for GEMM + transfers
+    CUDA_ASSERT(cudaDeviceSynchronize());
+    float ms1 = t.toc_ms();
+
+    // Prepare for parallel loop
+    size_t convd_len = ctx->ntt_params.crt_count * ctx->ntt_params.poly_len;
+    size_t poly_len = ctx->ntt_params.poly_len;
+
+    // Time the parallel portion
+    t.tic();
+
+    // Process batch in chunks of num_streams
+    for (size_t chunk_start = 0; chunk_start < batch_size; chunk_start += ctx->num_streams) {
+        size_t chunk_end = chunk_start + ctx->num_streams;
+        if (chunk_end > batch_size) chunk_end = batch_size;
+
+        // Launch Steps 2-5 for each batch item on its own CUDA stream
+        for (size_t i = chunk_start; i < chunk_end; i++) {
+            size_t s = i - chunk_start;  // stream/buffer index
+            cudaStream_t stream = ctx->streams[s];
+
+            // Step 2: Rescale into per-stream overlay buffer
+            Elem* d_intermediate = ctx->d_result + i * ctx->smaller_db_cols;
+
+            int threads_step2 = 1024;
+            int blocks_step2 = (ctx->smaller_db_cols + threads_step2 - 1) / threads_step2;
+
+            rescale_and_expand_kernel<<<blocks_step2, threads_step2, 0, stream>>>(
+                d_intermediate,
+                ctx->d_modified_rows[s],
+                ctx->smaller_db_cols,
+                ctx->lwe_modulus,
+                ctx->lwe_q_prime,
+                (int)ctx->pt_bits,
+                ctx->blowup_factor_ceil
+            );
+            CUDA_ASSERT(cudaGetLastError());
+
+            // Step 3: Compute Secondary Hint (reads overlay only)
+            size_t shared_mem_step3 = convd_len * sizeof(uint64_t);
+            int threads_step3 = 1024;
+            compute_secondary_hint_kernel<<<ctx->blowup_factor_ceil, threads_step3, shared_mem_step3, stream>>>(
+                ctx->d_hint_batch[s],
+                ctx->d_modified_rows[s],
+                ctx->d_query_ntt,
+                ctx->d_hint_acc_batch[s],
+                ctx->ntt_params,
+                ctx->smaller_db_cols / ctx->ntt_params.poly_len,
+                ctx->blowup_factor_ceil
+            );
+            CUDA_ASSERT(cudaGetLastError());
+
+            // Step 4: Compute Response (shared d_smaller_db + overlay for modified rows)
+            uint64_t* d_q2_current = ctx->d_query_q2_all + i * ctx->smaller_db_cols;
+
+            int threads_step4 = 256;
+            dim3 grid(ctx->smaller_db_rows);
+            compute_response_kernel<<<grid, threads_step4, 0, stream>>>(
+                ctx->d_response_batch[s],
+                ctx->d_smaller_db,
+                d_q2_current,
+                ctx->smaller_db_cols,
+                ctx->smaller_db_rows,
+                ctx->d_modified_rows[s],
+                ctx->special_offs,
+                ctx->blowup_factor_ceil,
+                ctx->ntt_params
+            );
+            CUDA_ASSERT(cudaGetLastError());
+
+            // Step 5a: Build pub params and pack excess
+            int threads_pack = 1024;
+
+            build_pub_params_full<<<ctx->ntt_params.log2_poly_len, threads_pack, 0, stream>>>(
+                ctx->d_pack_pub_params_full_batch[s],
+                ctx->d_fake_pack_pub_params,
+                ctx->d_pub_params_row_1s_all + i * ctx->pub_params_row_1s_elems,
+                ctx->t_exp_left,
+                ctx->ntt_params
+            );
+            CUDA_ASSERT(cudaGetLastError());
+
+            pack_excess<<<1, threads_pack, 0, stream>>>(
+                ctx->d_packed_excess_batch[s],
+                ctx->d_hint_batch[s],
+                ctx->d_pack_pub_params_full_batch[s],
+                ctx->d_rotation_ntt_table,
+                ctx->d_pack_excess_scratch_batch[s],
+                ctx->special_offs,
+                ctx->blowup_factor_ceil,
+                ctx->t_exp_left,
+                ctx->ntt_params
+            );
+            CUDA_ASSERT(cudaGetLastError());
+
+            // Step 5b: Pack LWEs and mod switch
+            uint8_t* d_response_i = ctx->d_all_responses + i * ctx->response_bytes_per_item;
+
+            pack_lwes_and_mod_switch<<<1, threads_pack, 0, stream>>>(
+                d_response_i,
+                ctx->d_packed_excess_batch[s],
+                ctx->d_response_batch[s],
+                ctx->d_y_constants,
+                ctx->d_precomp_res,
+                ctx->d_precomp_vals,
+                ctx->d_precomp_tables,
+                ctx->d_pub_params_row_1s_all + i * ctx->pub_params_row_1s_elems,
+                ctx->d_pack_lwe_scratch_batch[s],
+                ctx->t_exp_left,
+                ctx->rlwe_q_prime_1,
+                ctx->rlwe_q_prime_2,
+                ctx->ntt_params
+            );
+            CUDA_ASSERT(cudaGetLastError());
+        }
+
+        // Synchronize all streams in this chunk
+        for (size_t i = chunk_start; i < chunk_end; i++) {
+            size_t s = i - chunk_start;
+            CUDA_ASSERT(cudaStreamSynchronize(ctx->streams[s]));
+        }
+    }
+
+    float ms_parallel = t.toc_ms();
+
+    printf("Step1 %.3f ms, Steps2-5 (parallel, %zu streams) %.3f ms\n",
+        ms1, ctx->num_streams, ms_parallel);
+
+    // Download responses
+    CUDA_ASSERT(cudaMemcpy(responses, ctx->d_all_responses,
+        batch_size * ctx->response_bytes_per_item, cudaMemcpyDeviceToHost));
 }
 
 // Free online computation context
 void ypir_online_free(void* context)
 {
     OnlineContext* ctx = (OnlineContext*)context;
-    
+
     CUDA_ASSERT(cudaFree(ctx->d_db));
     CUDA_ASSERT(cudaFree(ctx->d_query));
     CUDA_ASSERT(cudaFree(ctx->d_result));
-    
+
     CUDA_ASSERT(cudaFree(ctx->d_smaller_db));
     CUDA_ASSERT(cudaFree(ctx->d_query_ntt));
     CUDA_ASSERT(cudaFree(ctx->d_hint_acc));
     CUDA_ASSERT(cudaFree(ctx->d_hint));
     CUDA_ASSERT(cudaFree(ctx->d_query_q2));
     CUDA_ASSERT(cudaFree(ctx->d_response));
-    
+
     CUDA_ASSERT(cudaFree(ctx->ntt_params.moduli));
     CUDA_ASSERT(cudaFree(ctx->ntt_params.barrett_cr));
     CUDA_ASSERT(cudaFree(ctx->ntt_params.forward_table));
@@ -1496,6 +1535,51 @@ void ypir_online_free(void* context)
     CUDA_ASSERT(cudaFree(ctx->d_precomp_vals));
     CUDA_ASSERT(cudaFree(ctx->d_precomp_tables));
     CUDA_ASSERT(cudaFree(ctx->d_fake_pack_pub_params));
+    CUDA_ASSERT(cudaFree(ctx->d_pack_pub_params_full));
+    CUDA_ASSERT(cudaFree(ctx->d_rotation_ntt_table));
+
+    // Free per-stream resources
+    for (size_t i = 0; i < ctx->num_streams; i++) {
+        CUDA_ASSERT(cudaFree(ctx->d_modified_rows[i]));
+        CUDA_ASSERT(cudaFree(ctx->d_hint_batch[i]));
+        CUDA_ASSERT(cudaFree(ctx->d_hint_acc_batch[i]));
+        CUDA_ASSERT(cudaFree(ctx->d_response_batch[i]));
+        CUDA_ASSERT(cudaFree(ctx->d_pack_pub_params_full_batch[i]));
+        CUDA_ASSERT(cudaFree(ctx->d_packed_excess_batch[i]));
+        CUDA_ASSERT(cudaFree(ctx->d_pack_excess_scratch_batch[i]));
+        CUDA_ASSERT(cudaFree(ctx->d_pack_lwe_scratch_batch[i]));
+        CUDA_ASSERT(cudaStreamDestroy(ctx->streams[i]));
+    }
+    delete[] ctx->d_modified_rows;
+    delete[] ctx->d_hint_batch;
+    delete[] ctx->d_hint_acc_batch;
+    delete[] ctx->d_response_batch;
+    delete[] ctx->d_pack_pub_params_full_batch;
+    delete[] ctx->d_packed_excess_batch;
+    delete[] ctx->d_pack_excess_scratch_batch;
+    delete[] ctx->d_pack_lwe_scratch_batch;
+    delete[] ctx->streams;
+
+    // Free pre-allocated batch buffers
+    CUDA_ASSERT(cudaFree(ctx->d_query_q2_all));
+    CUDA_ASSERT(cudaFree(ctx->d_pub_params_row_1s_all));
+    CUDA_ASSERT(cudaFree(ctx->d_all_responses));
+    if (ctx->d_gemm_workspace) CUDA_ASSERT(cudaFree(ctx->d_gemm_workspace));
+
+    // Free tensor core resources
+    if (ctx->has_tensor_cores) {
+        CUBLAS_CHECK(cublasDestroy(ctx->cublas_handle));
+        for (int i = 0; i < 4; i++) {
+            CUDA_ASSERT(cudaFree(ctx->d_query_bytes[i]));
+        }
+    }
+
+    CUDA_ASSERT(cudaStreamDestroy(ctx->transfer_stream));
+
+    // Free pinned host memory
+    CUDA_ASSERT(cudaFreeHost(ctx->h_query_pinned));
+    CUDA_ASSERT(cudaFreeHost(ctx->h_query_q2_pinned));
+    CUDA_ASSERT(cudaFreeHost(ctx->h_pub_params_pinned));
 
     delete ctx;
 }

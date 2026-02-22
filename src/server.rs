@@ -227,24 +227,26 @@ where
         // SID: this is where we load the database from the passed in iterator (random bits u8::sample())
         // the database is in column major format
         // SIDQ: why are the column dims db_dim_x + poly_len ? just because we need l1, l2 to be multiples of ring dim for NTT
-        for i in 0..db_rows {
-            for j in 0..db_cols {
-                let idx = if inp_transposed {
-                    i * db_cols + j
-                } else {
-                    j * db_rows_padded + i
-                };
 
-                unsafe {
-                    *db_buf_ptr.add(idx) = db.next().unwrap();
-                    // *db_buf_ptr.add(idx) = if i < db_rows {
-                    //     db.next().unwrap()
-                    // } else {
-                    //     T::default()
-                    // };
-                }
-            }
-        }
+        // UNCOMMENT - JUST FOR SKIPPING FILLING
+        // for i in 0..db_rows {
+        //     for j in 0..db_cols {
+        //         let idx = if inp_transposed {
+        //             i * db_cols + j
+        //         } else {
+        //             j * db_rows_padded + i
+        //         };
+
+        //         unsafe {
+        //             *db_buf_ptr.add(idx) = db.next().unwrap();
+        //             // *db_buf_ptr.add(idx) = if i < db_rows {
+        //             //     db.next().unwrap()
+        //             // } else {
+        //             //     T::default()
+        //             // };
+        //         }
+        //     }
+        // }
 
         // Parameters for the second round (the "DoublePIR" round)
         let smaller_params = if is_simplepir {
@@ -870,6 +872,7 @@ where
             );
             precomp.push(tup);
         }
+        debug!("size of cached_ntt: {}", precomp.len() * precomp[0].1.len() * precomp[0].1[0].data.len() * 8 );
         debug!("Precomp in {} us", now.elapsed().as_micros());
 
         #[cfg(not(feature = "cuda"))]
@@ -952,9 +955,9 @@ where
                 pseudorandom_query_1: vec![],
                 y_constants,
                 smaller_server: None,
-                prepacked_lwe,
-                fake_pack_pub_params,
-                precomp,
+                prepacked_lwe: vec![],
+                fake_pack_pub_params: vec![],
+                precomp: vec![],
                 cuda_context: None,
                 sp_cuda_context
             }
@@ -1291,6 +1294,7 @@ where
                     &flat_query,
                     smaller_db,
                     smaller_db_rows,
+                    128,                       // max_batch_size
                 ) {
                     Ok(ctx) => {
                         let upload_time = upload_start.elapsed();

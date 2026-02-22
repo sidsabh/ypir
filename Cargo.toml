@@ -6,6 +6,7 @@ default-run = "run"
 
 [features]
 cuda = []
+cutlass = ["cuda"]  # CUTLASS-based SimplePIR online kernel (replaces hand-written matmul)
 toeplitz = []
 toeplitz-crt = ["toeplitz"]  # Enables toeplitz Rust code + CRT CUDA kernel
 default = ["cuda"]
