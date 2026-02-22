@@ -44,7 +44,7 @@ struct SPOnlineContext {
     size_t db_cols;
     size_t num_rlwe_outputs;  // db_cols / poly_len
     size_t t_exp_left;
-    
+
     // Modulus switch parameters
     uint64_t rlwe_q_prime_1;
     uint64_t rlwe_q_prime_2;
