@@ -907,6 +907,7 @@ where
                     params.get_q_prime_1(),
                     params.get_q_prime_2(),
                     params,
+                    256, // max_batch_size
                 ) {
                     Ok(ctx) => {
                         // Flatten packing data
@@ -1153,7 +1154,7 @@ where
                     params.get_q_prime_1(),
                     params.get_q_prime_2(),
                     params,
-                    128, // max_batch_size
+                    256, // max_batch_size
                 ) {
                     Ok(ctx) => {
                         // Flatten packing data (same as SP path)
@@ -1544,7 +1545,7 @@ where
                     &flat_query,
                     smaller_db,
                     smaller_db_rows,
-                    128,                       // max_batch_size
+                    256,                       // max_batch_size
                 ) {
                     Ok(ctx) => {
                         let upload_time = upload_start.elapsed();

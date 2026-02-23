@@ -1143,50 +1143,7 @@ void ypir_online_init_ntt(
     size_t response_size = ctx->smaller_db_rows * sizeof(uint64_t);
     CUDA_ASSERT(cudaMalloc(&ctx->d_response, response_size));
 
-    // Determine num_streams based on available GPU memory
-    size_t modified_rows_bytes = blowup_factor_ceil * ctx->smaller_db_cols * sizeof(uint16_t);
-    size_t log2pl = ctx->ntt_params.log2_poly_len;
-    size_t pub_params_full_bytes = log2pl * 2 * t_exp_left * convd_len * sizeof(uint64_t);
-    size_t packed_excess_bytes = 2 * convd_len * sizeof(uint64_t);
-    size_t pack_excess_scratch_bytes = ((2*convd_len) + (2*poly_len) + (2*poly_len) +
-        (t_exp_left*poly_len) + (t_exp_left*convd_len) + (2*convd_len) + convd_len) * sizeof(uint64_t);
-    size_t working_set_size = (1 << (log2pl - 1));
-    size_t pack_lwe_scratch_bytes = ((working_set_size*poly_len) + 4*poly_len +
-        (2*convd_len) + (2*poly_len) + convd_len) * sizeof(uint64_t);
-    size_t per_stream_bytes = modified_rows_bytes + hint_size + sum_size + response_size +
-        pub_params_full_bytes + packed_excess_bytes + pack_excess_scratch_bytes + pack_lwe_scratch_bytes;
-
-    size_t free_mem, total_mem;
-    CUDA_ASSERT(cudaMemGetInfo(&free_mem, &total_mem));
-    size_t reserved = 128 * 1024 * 1024;  // reserve 128 MB for other allocs
-    size_t available = (free_mem > reserved) ? (free_mem - reserved) : 0;
-
-    size_t num_streams = available / per_stream_bytes;
-    if (num_streams < 1) {
-        // throw error
-        fprintf(stderr, "Error: Not enough GPU memory for even 1 stream. Required per stream: %.2f MB, available: %.2f MB\n",
-            per_stream_bytes / 1e6, available / 1e6);
-        exit(1);
-    }
-    if (num_streams > ctx->max_batch_size) num_streams = ctx->max_batch_size;
-    ctx->num_streams = num_streams;
-
-    printf("GPU: %.1f MB free, per-stream %.2f MB, using %zu parallel streams\n",
-        free_mem / 1e6, per_stream_bytes / 1e6, num_streams);
-
-    // Create CUDA streams
-    ctx->streams = new cudaStream_t[num_streams];
-    for (size_t i = 0; i < num_streams; i++) {
-        CUDA_ASSERT(cudaStreamCreate(&ctx->streams[i]));
-    }
-
-    // Per-stream allocations
-    for (size_t i = 0; i < num_streams; i++) {
-        CUDA_ASSERT(cudaMalloc(&ctx->d_modified_rows[i], modified_rows_bytes));
-        CUDA_ASSERT(cudaMalloc(&ctx->d_hint_batch[i], hint_size));
-        CUDA_ASSERT(cudaMalloc(&ctx->d_hint_acc_batch[i], sum_size));
-        CUDA_ASSERT(cudaMalloc(&ctx->d_response_batch[i], response_size));
-    }
+    // Streaming will be allocated in init_packing, after all fixed data is uploaded
 
     // Pre-allocate batch upload/download buffers
     ctx->pub_params_row_1s_elems = poly_len * ctx->ntt_params.log2_poly_len * t_exp_left;
@@ -1227,28 +1184,23 @@ void ypir_init_packing_data(
     CUDA_ALLOC_AND_COPY(ctx->d_precomp_tables, precomp_tables, precomp_tables_size);
     CUDA_ALLOC_AND_COPY(ctx->d_fake_pack_pub_params, fake_pack_pub_params, fake_pack_pub_params_size);
 
-
     // sizes
-    size_t poly_len      = ctx->ntt_params.poly_len;          // 2048
-    size_t crt_count     = ctx->ntt_params.crt_count;         // 2
-    size_t convd_len     = crt_count * poly_len;              // 4096
-    size_t log2_poly_len = ctx->ntt_params.log2_poly_len;     // 11
-    size_t t_exp_left    = ctx->t_exp_left;                   // 3
-    size_t blowup        = ctx->blowup_factor_ceil;           // 2
+    size_t poly_len      = ctx->ntt_params.poly_len;
+    size_t crt_count     = ctx->ntt_params.crt_count;
+    size_t convd_len     = crt_count * poly_len;
+    size_t log2_poly_len = ctx->ntt_params.log2_poly_len;
+    size_t t_exp_left    = ctx->t_exp_left;
+    size_t blowup        = ctx->blowup_factor_ceil;
 
-    size_t pub_param_size_u64 = 2 * t_exp_left * convd_len;   // per key_idx
+    size_t pub_param_size_u64 = 2 * t_exp_left * convd_len;
 
-    // 1) full pub params (expanded row1) for the current request/batch-item
-    // if pub_params_row_1s is per-query, allocate per-request. If it's constant, allocate once.
+    // Single-instance allocations
     CUDA_ASSERT(cudaMalloc(&ctx->d_pack_pub_params_full,
                         log2_poly_len * pub_param_size_u64 * sizeof(uint64_t)));
 
-    // 2) rotation NTT table (depends only on (special_offs, blowup, params))
-    // allocate once (or reallocate when special_offs/blowup changes)
     CUDA_ASSERT(cudaMalloc(&ctx->d_rotation_ntt_table,
                         blowup * convd_len * sizeof(uint64_t)));
 
-    // build it once
     int threads_pack = 256;
     precompute_rotation_ntt_table<<<blowup, threads_pack>>>(
         ctx->d_rotation_ntt_table,
@@ -1258,39 +1210,77 @@ void ypir_init_packing_data(
     );
     CUDA_ASSERT(cudaGetLastError());
 
-    // Pre-allocate per-batch scratch buffers
-    size_t pack_excess_scratch_sz_u64 =
-        (2 * convd_len) +                 // cur_r
-        (2 * poly_len) +                  // ct_raw
-        (2 * poly_len) +                  // ct_auto
-        (t_exp_left * poly_len) +         // ginv_ct
-        (t_exp_left * convd_len) +        // ginv_ct_ntt
-        (2 * convd_len) +                 // tau_of_r
-        convd_len;                        // temp_ntt
+    // ── Determine num_streams based on remaining GPU memory ──
+    // (done here, AFTER all fixed allocations including packing data)
 
+    size_t modified_rows_bytes = blowup * ctx->smaller_db_cols * sizeof(uint16_t);
+    size_t hint_size = poly_len * blowup * sizeof(uint64_t);
+    size_t sum_size = blowup * convd_len * sizeof(uint64_t);
+    size_t response_size = ctx->smaller_db_rows * sizeof(uint64_t);
+    size_t pub_params_full_bytes = log2_poly_len * pub_param_size_u64 * sizeof(uint64_t);
+    size_t packed_excess_bytes = 2 * convd_len * sizeof(uint64_t);
+    size_t pack_excess_scratch_bytes = ((2*convd_len) + (2*poly_len) + (2*poly_len) +
+        (t_exp_left*poly_len) + (t_exp_left*convd_len) + (2*convd_len) + convd_len) * sizeof(uint64_t);
     size_t working_set_size = (1 << (log2_poly_len - 1));
-    size_t pack_lwe_scratch_sz =
-        (working_set_size * poly_len) +   // working_set
-        poly_len +                        // y_times_ct_odd
-        poly_len +                        // neg_y_times_ct_odd
-        poly_len +                        // ct_sum_1
-        poly_len +                        // w_times_ginv_ct
-        (2 * convd_len) +                 // result_ntt
-        (2 * poly_len) +                  // temp_raw
-        convd_len;                        // temp_ntt
+    size_t pack_lwe_scratch_bytes = ((working_set_size*poly_len) + 4*poly_len +
+        (2*convd_len) + (2*poly_len) + convd_len) * sizeof(uint64_t);
+    size_t per_stream_bytes = modified_rows_bytes + hint_size + sum_size + response_size +
+        pub_params_full_bytes + packed_excess_bytes + pack_excess_scratch_bytes + pack_lwe_scratch_bytes;
 
+    size_t free_mem, total_mem;
+    CUDA_ASSERT(cudaMemGetInfo(&free_mem, &total_mem));
+    size_t usable = (free_mem * 9) / 10;  // use 90%, leave room for CUDA overhead
+
+    size_t num_streams = usable / per_stream_bytes;
+    if (num_streams < 1) {
+        fprintf(stderr, "ERROR: Not enough GPU memory for even 1 stream. "
+                "Required per stream: %.2f MB, free: %.2f MB\n",
+                per_stream_bytes / 1e6, free_mem / 1e6);
+        abort();
+    }
+    if (num_streams > ctx->max_batch_size) num_streams = ctx->max_batch_size;
+    ctx->num_streams = num_streams;
+
+    printf("GPU: %.1f MB free, per-stream %.2f MB, using %zu parallel streams\n",
+        free_mem / 1e6, per_stream_bytes / 1e6, num_streams);
+
+    // Create CUDA streams
+    ctx->streams = new cudaStream_t[num_streams];
+    for (size_t i = 0; i < num_streams; i++) {
+        CUDA_ASSERT(cudaStreamCreate(&ctx->streams[i]));
+    }
+
+    // Per-stream allocations: one bulk cudaMalloc per stream, carved up with pointers
+    size_t pack_excess_scratch_sz_u64 =
+        (2 * convd_len) + (2 * poly_len) + (2 * poly_len) +
+        (t_exp_left * poly_len) + (t_exp_left * convd_len) +
+        (2 * convd_len) + convd_len;
+    size_t pack_lwe_scratch_sz =
+        (working_set_size * poly_len) + poly_len + poly_len + poly_len + poly_len +
+        (2 * convd_len) + (2 * poly_len) + convd_len;
     size_t packed_excess_sz = 2 * convd_len;
 
-    for (size_t i = 0; i < ctx->num_streams; i++) {
-        CUDA_ASSERT(cudaMalloc(&ctx->d_pack_pub_params_full_batch[i],
-                    log2_poly_len * pub_param_size_u64 * sizeof(uint64_t)));
-        CUDA_ASSERT(cudaMalloc(&ctx->d_packed_excess_batch[i],
-                    packed_excess_sz * sizeof(uint64_t)));
-        CUDA_ASSERT(cudaMalloc(&ctx->d_pack_excess_scratch_batch[i],
-                    pack_excess_scratch_sz_u64 * sizeof(uint64_t)));
-        CUDA_ASSERT(cudaMalloc(&ctx->d_pack_lwe_scratch_batch[i],
-                    pack_lwe_scratch_sz * sizeof(uint64_t)));
+    for (size_t i = 0; i < num_streams; i++) {
+        // Single allocation for this stream
+        char* bulk = nullptr;
+        CUDA_ASSERT(cudaMalloc(&bulk, per_stream_bytes));
+        char* p = bulk;
+
+        ctx->d_modified_rows[i] = (uint16_t*)p;  p += modified_rows_bytes;
+        ctx->d_hint_batch[i]    = (uint64_t*)p;   p += hint_size;
+        ctx->d_hint_acc_batch[i] = (uint64_t*)p;  p += sum_size;
+        ctx->d_response_batch[i] = (uint64_t*)p;  p += response_size;
+        ctx->d_pack_pub_params_full_batch[i] = (uint64_t*)p;
+            p += log2_poly_len * pub_param_size_u64 * sizeof(uint64_t);
+        ctx->d_packed_excess_batch[i] = (uint64_t*)p;
+            p += packed_excess_sz * sizeof(uint64_t);
+        ctx->d_pack_excess_scratch_batch[i] = (uint64_t*)p;
+            p += pack_excess_scratch_sz_u64 * sizeof(uint64_t);
+        ctx->d_pack_lwe_scratch_batch[i] = (uint64_t*)p;
+            p += pack_lwe_scratch_sz * sizeof(uint64_t);
     }
+
+    CUDA_ASSERT(cudaDeviceSynchronize());
 }
 
 // Full batch execution: Step 1 -> Loop(Step 2 -> Step 3 -> Step 4)
@@ -1546,16 +1536,9 @@ void ypir_online_free(void* context)
     CUDA_ASSERT(cudaFree(ctx->d_pack_pub_params_full));
     CUDA_ASSERT(cudaFree(ctx->d_rotation_ntt_table));
 
-    // Free per-stream resources
+    // Free per-stream resources (each stream is one bulk allocation starting at d_modified_rows)
     for (size_t i = 0; i < ctx->num_streams; i++) {
-        CUDA_ASSERT(cudaFree(ctx->d_modified_rows[i]));
-        CUDA_ASSERT(cudaFree(ctx->d_hint_batch[i]));
-        CUDA_ASSERT(cudaFree(ctx->d_hint_acc_batch[i]));
-        CUDA_ASSERT(cudaFree(ctx->d_response_batch[i]));
-        CUDA_ASSERT(cudaFree(ctx->d_pack_pub_params_full_batch[i]));
-        CUDA_ASSERT(cudaFree(ctx->d_packed_excess_batch[i]));
-        CUDA_ASSERT(cudaFree(ctx->d_pack_excess_scratch_batch[i]));
-        CUDA_ASSERT(cudaFree(ctx->d_pack_lwe_scratch_batch[i]));
+        CUDA_ASSERT(cudaFree(ctx->d_modified_rows[i]));  // frees entire bulk block
         CUDA_ASSERT(cudaStreamDestroy(ctx->streams[i]));
     }
     delete[] ctx->d_modified_rows;
