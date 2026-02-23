@@ -18,7 +18,8 @@ fn main() {
     if cuda_enabled {
         if Path::new("/usr/local/cuda/bin/nvcc").exists() ||
            Path::new("/opt/cuda/bin/nvcc").exists() ||
-           Path::new("/usr/bin/nvcc").exists() {
+           Path::new("/usr/bin/nvcc").exists() || 
+           Path::new("/opt/apps/cuda/12.2/bin/nvcc").exists() {
             compile_cuda();
         } else {
             panic!("CUDA feature enabled but nvcc not found. Please install CUDA toolkit or disable the cuda feature.");
@@ -106,6 +107,10 @@ fn compile_cuda() {
     // Set up linking
     println!("cargo:rustc-link-search=native={}", out_dir);
     println!("cargo:rustc-link-lib=ypir_cuda");
+
+    let cuda_home = std::env::var("CUDA_HOME")
+        .unwrap_or("/opt/apps/cuda/12.2".to_string());
+    println!("cargo:rustc-link-search=native={}/lib64", cuda_home);
 
     // Runtime path so tests/debugger can load it
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", out_dir);

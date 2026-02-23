@@ -829,27 +829,32 @@ where
         let num_rlwe_outputs = db_cols / params.poly_len;
         
         // Begin offline precomputation
-        let now = Instant::now();
-        
+        let simplepir_prep_time_ms: u128;
+
         #[cfg(feature = "cuda")]
         let hint_0: Vec<u64> = {
             let init_start = Instant::now();
             let gpu_ctx = self.init_hint_0_simplepir_gpu_context();
             let init_time = init_start.elapsed();
-            
+
             let compute_start = Instant::now();
             let gpu_result = self.compute_hint_0_simplepir_gpu(&gpu_ctx);
             let compute_time = compute_start.elapsed();
 
             debug!("SimplePIR GPU init: {:?}, compute: {:?}", init_time, compute_time);
+            simplepir_prep_time_ms = compute_time.as_millis();
             gpu_result
         };
-        
+
         #[cfg(not(feature = "cuda"))]
-        let hint_0: Vec<u64> = self.answer_hint_ring(SEED_0, db_cols);
-        
+        let hint_0: Vec<u64> = {
+            let now = Instant::now();
+            let result = self.answer_hint_ring(SEED_0, db_cols);
+            simplepir_prep_time_ms = now.elapsed().as_millis();
+            result
+        };
+
         // hint_0 is poly_len x db_cols
-        let simplepir_prep_time_ms = now.elapsed().as_millis();
         if let Some(measurement) = measurement {
             measurement.offline.simplepir_prep_time_ms = simplepir_prep_time_ms as usize;
         }
@@ -1062,11 +1067,12 @@ where
         let db_cols = params.instances * params.poly_len;
         let num_rlwe_outputs = db_cols / params.poly_len;
 
-        let now = Instant::now();
+        let simplepir_prep_time_ms: u128;
 
         // GPU path: hint_0 is computed on GPU (already CRT-packed)
         #[cfg(feature = "cuda")]
         let hint_0_packed: Vec<u64> = {
+            let init_start = Instant::now();
             let db_rows = 1 << (params.db_dim_1 + params.poly_len_log2);
             let db_rows_padded = self.db_rows_padded();
             let a = generate_pseudorandom_matrix_word(SEED_0, params.poly_len, db_rows);
@@ -1081,22 +1087,31 @@ where
                 params.moduli[0],
                 params.moduli[1],
             ).expect("Failed to initialize Word offline GPU context");
-            gpu_ctx.compute_hint_0().expect("Word GPU hint_0 failed")
+            let init_time = init_start.elapsed();
+
+            let compute_start = Instant::now();
+            let result = gpu_ctx.compute_hint_0().expect("Word GPU hint_0 failed");
+            let compute_time = compute_start.elapsed();
+
+            debug!("Word offline GPU init: {:?}, compute: {:?}", init_time, compute_time);
+            simplepir_prep_time_ms = compute_time.as_millis();
+            result
         };
 
         // CPU path: compute hint_0 then CRT-pack
         #[cfg(not(feature = "cuda"))]
         let hint_0_packed: Vec<u64> = {
+            let now = Instant::now();
             let hint_0 = self.compute_hint_0_word();
-            hint_0.iter().map(|&x| {
+            let result = hint_0.iter().map(|&x| {
                 let crt0 = x % params.moduli[0];
                 let crt1 = x % params.moduli[1];
                 crt0 | (crt1 << 32)
-            }).collect()
+            }).collect();
+            simplepir_prep_time_ms = now.elapsed().as_millis();
+            result
         };
 
-        let simplepir_prep_time_ms = now.elapsed().as_millis();
-        debug!("Word hint_0 computed in {} ms", simplepir_prep_time_ms);
         if let Some(measurement) = measurement {
             measurement.offline.simplepir_prep_time_ms = simplepir_prep_time_ms as usize;
         }
