@@ -160,6 +160,8 @@ pub struct OfflinePrecomputedValues<'a> {
     pub cuda_context: Option<std::sync::Arc<crate::cuda::OnlineComputeContext>>,
     #[cfg(feature = "cuda")]
     pub sp_cuda_context: Option<std::sync::Arc<crate::cuda::SPOnlineContext>>,
+    #[cfg(feature = "cuda")]
+    pub word_cuda_context: Option<std::sync::Arc<crate::cuda::WordOnlineContext>>,
 }
 
 #[derive(Clone)]
@@ -187,7 +189,7 @@ impl DbRowsPadded for Params {
 
 impl<'a, T> YServer<'a, T>
 where
-    T: Sized + Copy + ToU64 + Default,
+    T: Sized + Copy + ToU64 + Default + Sync,
     *const T: ToM512,
 {
     pub fn new<'b, I>(
@@ -959,7 +961,255 @@ where
                 fake_pack_pub_params: vec![],
                 precomp: vec![],
                 cuda_context: None,
-                sp_cuda_context
+                sp_cuda_context,
+                word_cuda_context: None,
+            }
+        }
+    }
+
+    /// Modswitch a single value from Z_{2^64} to Z_Q with rounding.
+    fn modswitch_word_to_q(x: u64, q: u64) -> u64 {
+        ((x as u128 * q as u128 + (1u128 << 63)) >> 64) as u64
+    }
+
+    /// Compute hint_0 using plain word-based matmul in Z_{2^64}, then modswitch to Z_Q.
+    /// A is poly_len × db_rows, DB is column-major db_cols × db_rows_padded.
+    /// Output: poly_len × db_cols values in Z_Q, stored row-major.
+    pub fn compute_hint_0_word(&self) -> Vec<u64> {
+        let poly_len = self.params.poly_len;
+        let db_rows = 1 << (self.params.db_dim_1 + self.params.poly_len_log2);
+        let db_rows_padded = self.db_rows_padded();
+        let db_cols = self.db_cols();
+        let q = self.params.modulus;
+
+        debug!(
+            "compute_hint_0_word: poly_len={}, db_rows={}, db_cols={}, total_muls={}",
+            poly_len, db_rows, db_cols, poly_len as u64 * db_rows as u64 * db_cols as u64
+        );
+
+        let now = Instant::now();
+        let a = generate_pseudorandom_matrix_word(SEED_0, poly_len, db_rows);
+        debug!("  A matrix generated in {} ms", now.elapsed().as_millis());
+
+        let now = Instant::now();
+        let mut hint_0 = vec![0u64; poly_len * db_cols];
+        let db = self.db();
+
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let chunk_size = (db_cols + num_threads - 1) / num_threads;
+
+        // Parallelize over columns: each thread computes a contiguous range of columns.
+        // Use col-major scratch buffer so each thread writes to its own contiguous chunk.
+        let mut hint_0_col_major = vec![0u64; db_cols * poly_len];
+
+        std::thread::scope(|s| {
+            let chunks: Vec<&mut [u64]> = hint_0_col_major.chunks_mut(chunk_size * poly_len).collect();
+            let mut handles = Vec::new();
+            for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
+                let col_start = chunk_idx * chunk_size;
+                let col_end = (col_start + chunk_size).min(db_cols);
+                let a_ref = &a;
+                let db_ref = db;
+                handles.push(s.spawn(move || {
+                    for col in col_start..col_end {
+                        let local_col = col - col_start;
+                        for i in 0..poly_len {
+                            let mut acc: u64 = 0;
+                            for j in 0..db_rows {
+                                acc = acc.wrapping_add(
+                                    a_ref[i * db_rows + j]
+                                        .wrapping_mul(db_ref[col * db_rows_padded + j].to_u64()),
+                                );
+                            }
+                            chunk[local_col * poly_len + i] =
+                                Self::modswitch_word_to_q(acc, q);
+                        }
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
+
+        // Transpose col-major (db_cols × poly_len) to row-major (poly_len × db_cols)
+        for col in 0..db_cols {
+            for i in 0..poly_len {
+                hint_0[i * db_cols + col] = hint_0_col_major[col * poly_len + i];
+            }
+        }
+
+        debug!(
+            "  Matmul ({} threads) + modswitch in {} ms",
+            num_threads,
+            now.elapsed().as_millis()
+        );
+
+        hint_0
+    }
+
+    /// Offline precomputation for word-based SimplePIR.
+    /// Same structure as perform_offline_precomputation_simplepir but uses plain word matmul.
+    pub fn perform_offline_precomputation_simplepir_word(
+        &self,
+        measurement: Option<&mut Measurement>,
+    ) -> OfflinePrecomputedValues {
+        let params = self.params;
+        assert!(self.ypir_params.is_simplepir);
+        let db_cols = params.instances * params.poly_len;
+        let num_rlwe_outputs = db_cols / params.poly_len;
+
+        let now = Instant::now();
+
+        // GPU path: hint_0 is computed on GPU (already CRT-packed)
+        #[cfg(feature = "cuda")]
+        let hint_0_packed: Vec<u64> = {
+            let db_rows = 1 << (params.db_dim_1 + params.poly_len_log2);
+            let db_rows_padded = self.db_rows_padded();
+            let a = generate_pseudorandom_matrix_word(SEED_0, params.poly_len, db_rows);
+            let gpu_ctx = crate::cuda::WordOfflineContext::new(
+                self.db_u16(),
+                &a,
+                db_rows as u32,
+                db_rows_padded as u32,
+                db_cols as u32,
+                params.poly_len as u32,
+                params.modulus,
+                params.moduli[0],
+                params.moduli[1],
+            ).expect("Failed to initialize Word offline GPU context");
+            gpu_ctx.compute_hint_0().expect("Word GPU hint_0 failed")
+        };
+
+        // CPU path: compute hint_0 then CRT-pack
+        #[cfg(not(feature = "cuda"))]
+        let hint_0_packed: Vec<u64> = {
+            let hint_0 = self.compute_hint_0_word();
+            hint_0.iter().map(|&x| {
+                let crt0 = x % params.moduli[0];
+                let crt1 = x % params.moduli[1];
+                crt0 | (crt1 << 32)
+            }).collect()
+        };
+
+        let simplepir_prep_time_ms = now.elapsed().as_millis();
+        debug!("Word hint_0 computed in {} ms", simplepir_prep_time_ms);
+        if let Some(measurement) = measurement {
+            measurement.offline.simplepir_prep_time_ms = simplepir_prep_time_ms as usize;
+        }
+
+        let now = Instant::now();
+        let y_constants = generate_y_constants(&params);
+
+        let combined = [&hint_0_packed[..], &vec![0u64; db_cols]].concat();
+        assert_eq!(combined.len(), db_cols * (params.poly_len + 1));
+        let prepacked_lwe = prep_pack_many_lwes(&params, &combined, num_rlwe_outputs);
+
+        let fake_pack_pub_params = generate_fake_pack_pub_params(&params);
+
+        let mut precomp: Precomp = Vec::new();
+        for i in 0..prepacked_lwe.len() {
+            let tup = precompute_pack(
+                params,
+                params.poly_len_log2,
+                &prepacked_lwe[i],
+                &fake_pack_pub_params,
+                &y_constants,
+            );
+            precomp.push(tup);
+        }
+        debug!("Precomp in {} us", now.elapsed().as_micros());
+
+        #[cfg(not(feature = "cuda"))]
+        {
+            OfflinePrecomputedValues {
+                hint_0: hint_0_packed,
+                hint_1: vec![],
+                pseudorandom_query_1: vec![],
+                y_constants,
+                smaller_server: None,
+                prepacked_lwe,
+                fake_pack_pub_params,
+                precomp,
+            }
+        }
+
+        #[cfg(feature = "cuda")]
+        {
+            let db_rows = 1 << (params.db_dim_1 + params.poly_len_log2);
+            let db_rows_padded = self.db_rows_padded();
+
+            // Initialize Word CUDA online context
+            let word_cuda_context = {
+                debug!("Initializing Word CUDA online context...");
+                match crate::cuda::WordOnlineContext::new(
+                    self.db_u16(),
+                    db_rows,
+                    db_rows_padded,
+                    db_cols,
+                    params.t_exp_left,
+                    params.get_q_prime_1(),
+                    params.get_q_prime_2(),
+                    params,
+                    128, // max_batch_size
+                ) {
+                    Ok(ctx) => {
+                        // Flatten packing data (same as SP path)
+                        let mut y_constants_flat = Vec::new();
+                        for m in &y_constants.0 { y_constants_flat.extend_from_slice(m.as_slice()); }
+                        for m in &y_constants.1 { y_constants_flat.extend_from_slice(m.as_slice()); }
+
+                        let mut precomp_res_flat = Vec::new();
+                        let mut precomp_vals_flat = Vec::new();
+                        let mut precomp_tables_flat = Vec::new();
+
+                        for (res, vals, tables) in &precomp {
+                            precomp_res_flat.extend_from_slice(res.as_slice());
+                            for v in vals {
+                                let condensed = condense_matrix(params, v);
+                                for row in 0..v.rows {
+                                    let poly = condensed.get_poly(row, 0);
+                                    precomp_vals_flat.extend_from_slice(&poly[..params.poly_len]);
+                                }
+                            }
+                            for t in tables {
+                                for &val in t {
+                                    precomp_tables_flat.push(val as u64);
+                                }
+                            }
+                        }
+
+                        ctx.init_packing(
+                            &y_constants_flat,
+                            &precomp_res_flat,
+                            &precomp_vals_flat,
+                            &precomp_tables_flat,
+                        );
+
+                        debug!("Word CUDA online context initialized");
+                        Some(std::sync::Arc::new(ctx))
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to create Word CUDA context: {}", e);
+                        None
+                    }
+                }
+            };
+
+            OfflinePrecomputedValues {
+                hint_0: hint_0_packed,
+                hint_1: vec![],
+                pseudorandom_query_1: vec![],
+                y_constants,
+                smaller_server: None,
+                prepacked_lwe: vec![],
+                fake_pack_pub_params: vec![],
+                precomp: vec![],
+                cuda_context: None,
+                sp_cuda_context: None,
+                word_cuda_context,
             }
         }
     }
@@ -1415,7 +1665,8 @@ where
                 fake_pack_pub_params,
                 precomp,
                 cuda_context,
-                sp_cuda_context: None
+                sp_cuda_context: None,
+                word_cuda_context: None,
             }
         }
     }
@@ -1543,6 +1794,148 @@ where
             m.online.first_pass_time_ms = online_time_ms as usize;
         }
         
+        result
+    }
+
+    /// Online computation for word-based SimplePIR (CPU path).
+    /// Takes raw u64 queries (NOT CRT-packed), does plain matmul in Z_{2^64},
+    /// modswitches to Z_Q, CRT-packs, and feeds into existing packing.
+    #[cfg(not(feature = "cuda"))]
+    pub fn perform_online_computation_simplepir_word(
+        &self,
+        word_queries: &[&[u64]],
+        offline_vals: &OfflinePrecomputedValues<'a>,
+        pack_pub_params_row_1s: &[&[PolyMatrixNTT<'a>]],
+        mut measurement: Option<&mut Measurement>,
+    ) -> Vec<Vec<Vec<u8>>> {
+        assert!(self.ypir_params.is_simplepir);
+
+        let params = self.params;
+        let q = params.modulus;
+        let y_constants = &offline_vals.y_constants;
+        let prepacked_lwe = &offline_vals.prepacked_lwe;
+        let precomp = &offline_vals.precomp;
+
+        let rlwe_q_prime_1 = params.get_q_prime_1();
+        let rlwe_q_prime_2 = params.get_q_prime_2();
+
+        let db_rows = 1 << (params.db_dim_1 + params.poly_len_log2);
+        let db_rows_padded = self.db_rows_padded();
+        let db_cols = params.instances * params.poly_len;
+        let num_rlwe_outputs = db_cols / params.poly_len;
+
+        let batch_size = word_queries.len();
+        assert_eq!(word_queries[0].len(), db_rows);
+
+        let first_pass = Instant::now();
+        debug!("Performing word matmul ({} queries)...", batch_size);
+
+        let db = self.db();
+
+        // Compute intermediate per batch item: matmul in Z_{2^64}, modswitch to Z_Q, CRT-pack
+        let mut all_intermediates = vec![vec![0u64; db_cols]; batch_size];
+        for (batch, query) in word_queries.iter().enumerate() {
+            let intermediate = &mut all_intermediates[batch];
+            for col in 0..db_cols {
+                let mut acc: u64 = 0;
+                for row in 0..db_rows {
+                    acc = acc.wrapping_add(
+                        query[row].wrapping_mul(db[col * db_rows_padded + row].to_u64()),
+                    );
+                }
+                let val_q = Self::modswitch_word_to_q(acc, q);
+                let crt0 = val_q % params.moduli[0];
+                let crt1 = val_q % params.moduli[1];
+                intermediate[col] = crt0 | (crt1 << 32);
+            }
+        }
+
+        debug!("Done w word matmul...");
+        let first_pass_time_ms = first_pass.elapsed().as_millis();
+        if let Some(ref mut m) = measurement {
+            m.online.first_pass_time_ms = first_pass_time_ms as usize;
+        }
+
+        let ring_packing = Instant::now();
+        let mut all_responses = Vec::with_capacity(batch_size);
+        for (batch, intermediate) in all_intermediates.iter().enumerate() {
+            let packed = pack_many_lwes(
+                &params,
+                &prepacked_lwe,
+                &precomp,
+                intermediate,
+                num_rlwe_outputs,
+                &pack_pub_params_row_1s[batch],
+                &y_constants,
+            );
+            debug!("Packed batch {}...", batch);
+
+            let mut packed_mod_switched = Vec::with_capacity(packed.len());
+            for ct in packed.iter() {
+                let res = ct.raw();
+                let res_switched = res.switch(rlwe_q_prime_1, rlwe_q_prime_2);
+                packed_mod_switched.push(res_switched);
+            }
+            all_responses.push(packed_mod_switched);
+        }
+        if let Some(m) = measurement {
+            m.online.ring_packing_time_ms = ring_packing.elapsed().as_millis() as usize;
+        }
+
+        all_responses
+    }
+
+    /// Online computation for word-based SimplePIR (GPU path).
+    /// GEMM + modswitch + CRT-pack + packing all on GPU.
+    #[cfg(feature = "cuda")]
+    pub fn perform_online_computation_simplepir_word(
+        &self,
+        word_queries: &[&[u64]],
+        offline_vals: &OfflinePrecomputedValues<'a>,
+        pack_pub_params_row_1s: &[&[PolyMatrixNTT<'a>]],
+        mut measurement: Option<&mut Measurement>,
+    ) -> Vec<Vec<Vec<u8>>> {
+        assert!(self.ypir_params.is_simplepir);
+        let params = self.params;
+        let batch_size = word_queries.len();
+
+        let online_start = Instant::now();
+
+        let ctx = offline_vals.word_cuda_context.as_ref()
+            .expect("Word CUDA context not initialized");
+
+        // Flatten queries: batch_size * db_rows
+        let db_rows = 1 << (params.db_dim_1 + params.poly_len_log2);
+        let mut queries_flat: Vec<u64> = Vec::with_capacity(batch_size * db_rows);
+        for query in word_queries {
+            queries_flat.extend_from_slice(query);
+        }
+
+        // Flatten pack_pub_params_row_1s: batch_size * ell * t_exp_left * poly_len
+        let mut pub_params_flat: Vec<u64> = Vec::new();
+        for keys in pack_pub_params_row_1s {
+            for key in keys.iter() {
+                let slc = key.as_slice();
+                for col in 0..params.t_exp_left {
+                    let start = col * 2 * params.poly_len;
+                    pub_params_flat.extend_from_slice(&slc[start..start + params.poly_len]);
+                }
+            }
+        }
+
+        let q_1_bits = (params.get_q_prime_2() as f64).log2().ceil() as usize;
+        let q_2_bits = (params.get_q_prime_1() as f64).log2().ceil() as usize;
+        let response_bytes_per_output = ((q_1_bits + q_2_bits) * params.poly_len + 7) / 8;
+
+        let result = ctx.compute_batch(&queries_flat, &pub_params_flat, response_bytes_per_output, batch_size);
+
+        let online_time_ms = online_start.elapsed().as_millis();
+        debug!("Word GPU online time: {} ms", online_time_ms);
+
+        if let Some(ref mut m) = measurement {
+            m.online.first_pass_time_ms = online_time_ms as usize;
+        }
+
         result
     }
 

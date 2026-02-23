@@ -238,7 +238,7 @@ uint32_t ceil_log2_u64(uint64_t x) {
 
 // Grid: (num_rlwe_outputs, batch_size) blocks
 // Each block handles one (output, batch) pair
-__global__ void sp_pack_lwes_and_mod_switch_batch(
+__global__ void __launch_bounds__(1024, 1) sp_pack_lwes_and_mod_switch_batch(
     uint8_t* d_response_out,             // output: batch_size * num_outputs * response_bytes_per_output
     const uint64_t* d_intermediate,      // b_values from step 1: batch_size * db_cols u64s
     const uint64_t* d_y_constants,       // [y_0..y_{ell-1}, neg_y_0..neg_y_{ell-1}], each crt_count*poly_len

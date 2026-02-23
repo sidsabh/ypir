@@ -580,11 +580,6 @@ pub fn pack_using_precomp_vals<'a>(
 
     // recall: PolyMatrixRaw is never CRT, always composed
     let mut out_raw = res.raw();
-    debug!("Rust row1 before b_values [0..4]: {} {} {} {}", 
-       out_raw.data[params.poly_len], 
-       out_raw.data[params.poly_len+1],
-       out_raw.data[params.poly_len+2],
-       out_raw.data[params.poly_len+3]);
 
 
     // all the packing magic is just about the random portion and how it re-encodes with the automorphism keys (affects both a and b)

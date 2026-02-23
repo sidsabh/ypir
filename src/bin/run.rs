@@ -1,4 +1,4 @@
-use ypir::scheme::run_ypir_batched;
+use ypir::scheme::{run_ypir_batched, run_ypir_batched_word};
 
 use clap::Parser;
 
@@ -16,10 +16,12 @@ struct Args {
     /// Number of trials (optional, default 5)
     /// to run the YPIR scheme and average performance measurements over (a warmup trial is excluded)
     trials: Option<usize>,
-    /// Verbose mode (optional)
-    /// if set, run as SimplePIR
+    /// Run as SimplePIR
     #[clap(long, short, action)]
     is_simplepir: bool,
+    /// Run word-based SimplePIR (plain LWE over Z_{2^64})
+    #[clap(long, action)]
+    word: bool,
     /// Output report file (optional)
     /// where results will be written in JSON.
     out_report_json: Option<String>,
@@ -39,6 +41,7 @@ fn main() {
         out_report_json,
         verbose,
         is_simplepir,
+        word,
     } = args;
 
     if verbose {
@@ -55,7 +58,7 @@ fn main() {
     let num_clients = num_clients.unwrap_or(1);
     let trials = trials.unwrap_or(5);
 
-    if item_size_bits > 8 && !is_simplepir {
+    if item_size_bits > 8 && !is_simplepir && !word {
         panic!("Items can be at must be at most 8 bits.");
     }
 
@@ -64,17 +67,29 @@ fn main() {
         assert_eq!(num_clients, 1, "SimplePIR variant only supports 1 client.");
     }
 
+
+    let mode_str = if word {
+        "w/ Word SimplePIR"
+    } else if is_simplepir {
+        "w/ SimplePIR"
+    } else {
+        "w/ DoublePIR"
+    };
+
     println!(
         "Running YPIR ({}) on a database of {} bits, and performing cross-client batching over {} clients. \n\
         The server performance measurement will be averaged over {} trials.",
-        if is_simplepir { "w/ SimplePIR" } else { "w/ DoublePIR" },
+        mode_str,
         num_items * item_size_bits,
         num_clients,
         trials
     );
 
-    let measurement =
-        run_ypir_batched(num_items, item_size_bits, num_clients, is_simplepir, trials);
+    let measurement = if word {
+        run_ypir_batched_word(num_items, item_size_bits, num_clients, trials)
+    } else {
+        run_ypir_batched(num_items, item_size_bits, num_clients, is_simplepir, trials)
+    };
     println!(
         "Measurement completed. See the README for details on what the following fields mean."
     );

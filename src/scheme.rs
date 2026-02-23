@@ -41,22 +41,42 @@ pub fn run_ypir_batched(
     is_simplepir: bool,
     trials: usize,
 ) -> Measurement {
-    let params = if is_simplepir {
+    run_ypir_batched_impl(num_items, item_size_bits, num_clients, is_simplepir, false, trials)
+}
+
+pub fn run_ypir_batched_word(
+    num_items: usize,
+    item_size_bits: usize,
+    num_clients: usize,
+    trials: usize,
+) -> Measurement {
+    run_ypir_batched_impl(num_items, item_size_bits, num_clients, true, true, trials)
+}
+
+fn run_ypir_batched_impl(
+    num_items: usize,
+    item_size_bits: usize,
+    num_clients: usize,
+    is_simplepir: bool,
+    word: bool,
+    trials: usize,
+) -> Measurement {
+    let params = if is_simplepir || word {
         params_for_scenario_simplepir(num_items, item_size_bits)
     } else {
         assert!(item_size_bits <= 8, "Standard YPIR supports item sizes of 1-8 bits.");
         params_for_scenario(num_items, item_size_bits)
     };
-    // Q: why is clients as a generic instead of a parameter? 
+    // Q: why is clients as a generic instead of a parameter?
     // A: CPU YPIR runs the DB-Q1 product using AVX. the supported number of clients: 1, 2, 4, or 8
     #[cfg(feature = "cuda")]
     let measurement = dispatch_const!(num_clients, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 32, 64, 128], |N| {
-        run_ypir_on_params::<N>(params, is_simplepir, trials)
+        run_ypir_on_params::<N>(params, is_simplepir, word, trials)
     });
 
     #[cfg(not(feature = "cuda"))]
     let measurement = dispatch_const!(num_clients, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], |N| {
-        run_ypir_on_params::<N>(params, is_simplepir, trials)
+        run_ypir_on_params::<N>(params, is_simplepir, word, trials)
     });
 
     debug!("{:#?}", measurement);
@@ -90,9 +110,9 @@ impl Sample for u16 {
     }
 }
 
-pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize) -> Measurement {
+pub fn run_simple_ypir_on_params<const K: usize>(params: Params, word: bool, trials: usize) -> Measurement {
     #[cfg(not(feature="cuda"))]
-    assert_eq!(K, 1); // for now
+    if !word { assert_eq!(K, 1); } // ring-based CPU path only supports K=1
 
     let is_simplepir = true;
     let db_rows = 1 << (params.db_dim_1 + params.poly_len_log2);
@@ -133,12 +153,14 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize) 
     let mut measurements = vec![Measurement::default(); trials + 1];
 
     let start_offline_comp = Instant::now();
-    let offline_values =
-        y_server.perform_offline_precomputation_simplepir(Some(&mut measurements[0]));
+    let offline_values = if word {
+        y_server.perform_offline_precomputation_simplepir_word(Some(&mut measurements[0]))
+    } else {
+        y_server.perform_offline_precomputation_simplepir(Some(&mut measurements[0]))
+    };
     let offline_server_time_ms = start_offline_comp.elapsed().as_millis();
 
     let packed_query_row_sz = params.db_rows_padded();
-    // let mut all_queries_packed = AlignedMemory64::new(K * packed_query_row_sz);
 
     for trial in 0..trials + 1 {
         debug!("trial: {}", trial);
@@ -149,7 +171,11 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize) 
         // QUERY GENERATION PHASE
         // ================================================================
         let mut online_upload_bytes = 0;
-        let mut queries = Vec::new();
+        // Each query: (y_client, target_idx, ring_query OR word_query, pack_pub_params_row_1s)
+        // We store the ring query as Option<AlignedMemory64> and word query as Option<Vec<u64>>
+        let mut query_meta: Vec<(YClient, usize, Vec<spiral_rs::poly::PolyMatrixNTT>)> = Vec::new();
+        let mut ring_queries: Vec<AlignedMemory64> = Vec::new();
+        let mut word_queries_storage: Vec<Vec<u64>> = Vec::new();
 
         let mut clients = (0..K).map(|_| Client::init(&params)).collect::<Vec<_>>();
 
@@ -173,7 +199,6 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize) 
                 &mut ChaCha20Rng::from_entropy(),
                 &mut ChaCha20Rng::from_seed(STATIC_SEED_2),
             );
-            // let pub_params_size = get_vec_pm_size_bytes(&pack_pub_params) / 2;
             let mut pack_pub_params_row_1s = pack_pub_params.to_vec();
             for i in 0..pack_pub_params.len() {
                 pack_pub_params_row_1s[i] =
@@ -184,35 +209,30 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize) 
             debug!("pub params size: {} bytes", pub_params_size);
 
             let y_client = YClient::new(client, &params);
-            let query_row = y_client.generate_query(SEED_0, params.db_dim_1, true, target_row, None, None);
-            let query_row_last_row: &[u64] = &query_row;
-            assert_eq!(query_row_last_row.len(), db_rows);
-            let packed_query_row = pack_query(&params, query_row_last_row);
 
-            let query_size = ((packed_query_row.len() as f64 * params.modulus_log2 as f64) / 8.0)
-                .ceil() as usize;
+            if word {
+                let wq = y_client.generate_query_word(SEED_0, params.db_dim_1, target_row);
+                assert_eq!(wq.len(), db_rows);
+                let query_size = wq.len() * 8;
+                online_upload_bytes = query_size + pub_params_size;
+                word_queries_storage.push(wq);
+            } else {
+                let query_row = y_client.generate_query(SEED_0, params.db_dim_1, true, target_row, None, None);
+                let query_row_last_row: &[u64] = &query_row;
+                assert_eq!(query_row_last_row.len(), db_rows);
+                let packed_query_row = pack_query(&params, query_row_last_row);
+                let query_size = ((packed_query_row.len() as f64 * params.modulus_log2 as f64) / 8.0)
+                    .ceil() as usize;
+                online_upload_bytes = query_size + pub_params_size;
+                ring_queries.push(packed_query_row);
+            }
 
             measurement.online.client_query_gen_time_ms = start.elapsed().as_millis() as usize;
             debug!("Generated query in {} us", start.elapsed().as_micros());
-
-            online_upload_bytes = query_size + pub_params_size;
             debug!("Query size: {} bytes", online_upload_bytes);
+            debug!("Client {} query generated", _batch);
 
-            queries.push((
-                y_client,
-                target_idx,
-                packed_query_row,
-                pack_pub_params_row_1s,
-            ));
-        }
-
-        let mut all_queries_packed = AlignedMemory64::new(K * packed_query_row_sz);
-        for (i, chunk_mut) in all_queries_packed
-            .as_mut_slice()
-            .chunks_mut(packed_query_row_sz)
-            .enumerate()
-        {
-            (&mut chunk_mut[..db_rows]).copy_from_slice(queries[i].2.as_slice());
+            query_meta.push((y_client, target_idx, pack_pub_params_row_1s));
         }
 
         let offline_values = offline_values.clone();
@@ -221,26 +241,44 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize) 
         // ONLINE PHASE
         // ================================================================
 
-        let query_slices: Vec<&[u64]> = all_queries_packed
-            .as_slice()
-            .chunks(packed_query_row_sz)
-            .collect();
-
         let start_online_comp = Instant::now();
-        let p = &queries.iter().map(|x| x.3.as_slice()).collect::<Vec<_>>();
-        let responses = y_server.perform_online_computation_simplepir(
-            &query_slices,
-            &offline_values,
-            p,
-            Some(&mut measurement),
-        );
+        let p = &query_meta.iter().map(|x| x.2.as_slice()).collect::<Vec<_>>();
+
+        let responses = if word {
+            let query_slices: Vec<&[u64]> = word_queries_storage.iter().map(|q| q.as_slice()).collect();
+            y_server.perform_online_computation_simplepir_word(
+                &query_slices,
+                &offline_values,
+                p,
+                Some(&mut measurement),
+            )
+        } else {
+            let mut all_queries_packed = AlignedMemory64::new(K * packed_query_row_sz);
+            for (i, chunk_mut) in all_queries_packed
+                .as_mut_slice()
+                .chunks_mut(packed_query_row_sz)
+                .enumerate()
+            {
+                (&mut chunk_mut[..db_rows]).copy_from_slice(ring_queries[i].as_slice());
+            }
+            let query_slices: Vec<&[u64]> = all_queries_packed
+                .as_slice()
+                .chunks(packed_query_row_sz)
+                .collect();
+            y_server.perform_online_computation_simplepir(
+                &query_slices,
+                &offline_values,
+                p,
+                Some(&mut measurement),
+            )
+        };
 
         let online_server_time_ms = start_online_comp.elapsed().as_millis();
         let online_download_bytes = get_size_bytes(&responses);
 
         // check correctness
-        for (response_switched, (y_client, target_idx, _, _)) in
-            responses.iter().zip(queries.iter())
+        for (response_switched, (y_client, target_idx, _)) in
+            responses.iter().zip(query_meta.iter())
         {
             let (target_row, _target_col) = (target_idx / db_cols, target_idx % db_cols);
             let corr_result = y_server
@@ -248,12 +286,6 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize) 
                 .iter()
                 .map(|x| x.to_u64())
                 .collect::<Vec<_>>();
-
-            // let scheme_params = YPIRSchemeParams::from_params(&params, &lwe_params);
-            // let log2_corr_err = scheme_params.delta().log2();
-            // let log2_expected_outer_noise = scheme_params.expected_outer_noise().log2();
-            // debug!("log2_correctness_err: {}", log2_corr_err);
-            // debug!("log2_expected_outer_noise: {}", log2_expected_outer_noise);
 
             let start_decode = Instant::now();
 
@@ -318,10 +350,11 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize) 
 pub fn run_ypir_on_params<const K: usize>(
     params: Params,
     is_simplepir: bool,
+    word: bool,
     trials: usize,
 ) -> Measurement {
-    if is_simplepir {
-        return run_simple_ypir_on_params::<K>(params, trials);
+    if is_simplepir || word {
+        return run_simple_ypir_on_params::<K>(params, word, trials);
     }
     let lwe_params = LWEParams::default();
 
@@ -718,6 +751,11 @@ mod test {
     #[test]
     fn test_ypir_simplepir_basic() {
         run_ypir_batched(1 << 10, 65536 * 8, 1, true, 1);
+    }
+
+    #[test]
+    fn test_ypir_sp_word_basic() {
+        run_ypir_batched_word(1 << 10, 65536 * 8, 1, 1);
     }
 
     #[test]

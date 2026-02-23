@@ -1162,7 +1162,12 @@ void ypir_online_init_ntt(
     size_t available = (free_mem > reserved) ? (free_mem - reserved) : 0;
 
     size_t num_streams = available / per_stream_bytes;
-    if (num_streams < 1) num_streams = 1;
+    if (num_streams < 1) {
+        // throw error
+        fprintf(stderr, "Error: Not enough GPU memory for even 1 stream. Required per stream: %.2f MB, available: %.2f MB\n",
+            per_stream_bytes / 1e6, available / 1e6);
+        exit(1);
+    }
     if (num_streams > ctx->max_batch_size) num_streams = ctx->max_batch_size;
     ctx->num_streams = num_streams;
 

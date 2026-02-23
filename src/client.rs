@@ -169,6 +169,21 @@ pub fn generate_matrix_ring(
     out
 }
 
+/// Generate a poly_len × db_rows matrix of random u64 values via ChaCha20.
+/// Stored row-major: A[i * db_rows + j] for row i, col j.
+pub fn generate_pseudorandom_matrix_word(
+    seed: u8,
+    poly_len: usize,
+    db_rows: usize,
+) -> Vec<u64> {
+    let mut rng_pub = ChaCha20Rng::from_seed(get_seed(seed));
+    let mut out = vec![0u64; poly_len * db_rows];
+    for idx in 0..poly_len * db_rows {
+        out[idx] = rng_pub.sample::<u64, _>(rand::distributions::Standard);
+    }
+    out
+}
+
 impl<'p, 'c> YClient<'p, 'c> {
     pub fn new(inner: &'c mut Client<'p>, params: &'p Params) -> Self {
         Self {
@@ -411,6 +426,63 @@ impl<'p, 'c> YClient<'p, 'c> {
         }
 
         out
+    }
+
+    /// Generate a word-based (plain LWE over Z_{2^64}) query.
+    /// Returns db_rows u64 values: q[j] = sum_i(s[i] * A[i*db_rows+j]) + e[j] + indicator * scale
+    pub fn generate_query_word(
+        &self,
+        seed: u8,
+        dim_log2: usize,
+        target_row: usize,
+    ) -> Vec<u64> {
+        let db_rows = 1 << (dim_log2 + self.params.poly_len_log2);
+        let poly_len = self.params.poly_len;
+        let q = self.params.modulus;
+
+        // Regenerate A from seed (same ChaCha20 stream as server)
+        let a = generate_pseudorandom_matrix_word(seed, poly_len, db_rows);
+
+        // Recover s = sk_reg coefficients as signed i64
+        let sk_raw = self.inner.get_sk_reg();
+        let sk_data = sk_raw.as_slice();
+        let mut s = vec![0i64; poly_len];
+        for i in 0..poly_len {
+            let x = sk_data[i];
+            s[i] = if x > q / 2 { x as i64 - q as i64 } else { x as i64 };
+        }
+
+        // scale = floor(2^64 / pt_modulus)
+        let scale: u64 = (1u128 << 64).wrapping_div(self.params.pt_modulus as u128) as u64;
+
+        // Sample noise
+        let dg = DiscreteGaussian::init(self.params.noise_width);
+        let mut rng = ChaCha20Rng::from_entropy();
+
+        let mut query = vec![0u64; db_rows];
+        for j in 0..db_rows {
+            // q[j] = sum_i(s[i] * A[i*db_rows+j])
+            let mut val: u64 = 0;
+            for i in 0..poly_len {
+                val = val.wrapping_add((s[i] as u64).wrapping_mul(a[i * db_rows + j]));
+            }
+
+            // Add noise
+            let e = dg.sample(q, &mut rng);
+            // e is in Z_Q, but we need it in Z_{2^64}
+            // scale up: e_word = e * floor(2^64 / Q)
+            let e_scale = (1u128 << 64).wrapping_div(q as u128) as u64;
+            val = val.wrapping_add((e as u64).wrapping_mul(e_scale));
+
+            // Add indicator
+            if j == target_row {
+                val = val.wrapping_add(scale);
+            }
+
+            query[j] = val;
+        }
+
+        query
     }
 
     pub fn client(&self) -> &Client<'p> {
