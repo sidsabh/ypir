@@ -122,7 +122,7 @@ fn main() -> std::io::Result<()> {
     }
 
     info!("Offline precomputation...");
-    let offline_obj = y_server.perform_offline_precomputation_simplepir(None);
+    let offline_obj = y_server.perform_offline_precomputation_simplepir(None, ypir::packing::PackingType::CDKS);
     let offline_values: &'static _ = Box::leak(Box::new(offline_obj));
 
     info!("Server ready.");
@@ -198,19 +198,20 @@ fn handle_client(
         let k = batch.queries.len();
         debug!("Processing batch of {} queries from {}", k, peer);
 
-        // Reconstruct pub params for each query
-        let pub_params_all: Vec<Vec<PolyMatrixNTT>> = batch
+        // Reconstruct pub params for each query as PackingKeys
+        let mut packing_keys: Vec<ypir::packing::PackingKeys> = batch
             .queries
             .iter()
             .map(|q| {
-                q.packed_pub_params
+                let pack_pub_params_row_1s: Vec<PolyMatrixNTT> = q.packed_pub_params
                     .iter()
                     .map(|data| {
                         let mut pm = PolyMatrixNTT::zero(params, 1, params.t_exp_left);
                         pm.as_mut_slice().copy_from_slice(data);
                         pm
                     })
-                    .collect()
+                    .collect();
+                ypir::packing::PackingKeys::init_cdks_from_keys(params.clone(), pack_pub_params_row_1s)
             })
             .collect();
 
@@ -220,13 +221,10 @@ fn handle_client(
             .map(|q| q.packed_query.as_slice())
             .collect();
 
-        let pub_param_refs: Vec<&[PolyMatrixNTT]> =
-            pub_params_all.iter().map(|v| v.as_slice()).collect();
-
         let responses = server.perform_online_computation_simplepir(
             &query_slices,
             offline,
-            &pub_param_refs,
+            &mut packing_keys,
             None,
         );
 

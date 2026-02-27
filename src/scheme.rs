@@ -12,7 +12,9 @@ use spiral_rs::{client::*, params::*};
 use crate::bits::{read_bits, u64s_to_contiguous_bytes};
 use crate::modulus_switch::ModulusSwitch;
 use crate::noise_analysis::YPIRSchemeParams;
-use crate::packing::condense_matrix;
+use crate::packing::{
+    condense_matrix, PackingKeys, PackingType,
+};
 
 use super::{client::*, lwe::LWEParams, measurement::*, params::*, server::*};
 
@@ -22,6 +24,13 @@ pub const SEED_1: u8 = 1;
 
 pub const STATIC_SEED_2: [u8; 32] = [
     2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+pub const W_SEED: [u8; 32] = [
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+];
+pub const V_SEED: [u8; 32] = [
+    8, 8, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
 ];
 
 
@@ -39,54 +48,44 @@ pub fn run_ypir_batched(
     item_size_bits: usize,
     num_clients: usize,
     is_simplepir: bool,
-    trials: usize,
-) -> Measurement {
-    run_ypir_batched_impl(num_items, item_size_bits, num_clients, is_simplepir, false, trials)
-}
-
-pub fn run_ypir_batched_word(
-    num_items: usize,
-    item_size_bits: usize,
-    num_clients: usize,
-    trials: usize,
-) -> Measurement {
-    run_ypir_batched_impl(num_items, item_size_bits, num_clients, true, true, trials)
-}
-
-fn run_ypir_batched_impl(
-    num_items: usize,
-    item_size_bits: usize,
-    num_clients: usize,
-    is_simplepir: bool,
     word: bool,
     trials: usize,
+    packing: PackingType,
 ) -> Measurement {
+    #[cfg(feature = "cuda")]
+    assert!(
+        packing != PackingType::InspiRING,
+        "GPU does not support InspiRING packing. Use CDKS packing or run on CPU."
+    );
+
     let params = if is_simplepir || word {
         params_for_scenario_simplepir(num_items, item_size_bits)
     } else {
         assert!(item_size_bits <= 8, "Standard YPIR supports item sizes of 1-8 bits.");
         params_for_scenario(num_items, item_size_bits)
     };
+
+    // InspiRING batching now supported: offline precomp shared across clients,
+    // PackingKeys per-client, server loops over clients.
+
     // Q: why is clients as a generic instead of a parameter?
     // A: CPU YPIR runs the DB-Q1 product using AVX. the supported number of clients: 1, 2, 4, or 8
     #[cfg(feature = "cuda")]
     let measurement = dispatch_const!(num_clients, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 32, 64, 128, 256], |N| {
-        run_ypir_on_params::<N>(params, is_simplepir, word, trials)
+        run_ypir_on_params::<N>(params, is_simplepir, word, trials, packing)
     });
 
     #[cfg(not(feature = "cuda"))]
     let measurement = dispatch_const!(num_clients, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], |N| {
-        run_ypir_on_params::<N>(params, is_simplepir, word, trials)
+        run_ypir_on_params::<N>(params, is_simplepir, word, trials, packing)
     });
 
     debug!("{:#?}", measurement);
     let db_size_bytes = (num_items * item_size_bits + 7) / 8;
-    // hint preprocessing throughput: DB size / hint preprocessing time - GB/sec
     println!(
         "Hint Prep. Throughput {:.2} GB/sec",
         (db_size_bytes as f64) / ((measurement.offline.simplepir_prep_time_ms) as f64 / 1000.0) / (1 << 30) as f64
     );
-    // throughput: DB size / online server time- GB/sec
     println!(
         "Throughput: {:.2} GB/sec",
         (num_clients * db_size_bytes) as f64 / ((measurement.online.server_time_ms) as f64 / 1000.0) / (1 << 30) as f64
@@ -110,9 +109,7 @@ impl Sample for u16 {
     }
 }
 
-pub fn run_simple_ypir_on_params<const K: usize>(params: Params, word: bool, trials: usize) -> Measurement {
-    #[cfg(not(feature="cuda"))]
-    if !word { assert_eq!(K, 1); } // ring-based CPU path only supports K=1
+pub fn run_simple_ypir_on_params<const K: usize>(params: Params, word: bool, trials: usize, packing: PackingType) -> Measurement {
 
     let is_simplepir = true;
     let db_rows = 1 << (params.db_dim_1 + params.poly_len_log2);
@@ -125,10 +122,8 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, word: bool, tri
     let rlwe_q_prime_1 = params.get_q_prime_1();
     let rlwe_q_prime_2 = params.get_q_prime_2();
 
-    // The number of bits represented by a plaintext RLWE coefficient
-    // let pt_bits = (params.pt_modulus as f64).log2().floor() as usize;
-
     let num_rlwe_outputs = db_cols / params.poly_len;
+    let gamma = params.poly_len; // always full packing for InspiRING
 
     // --
 
@@ -141,23 +136,21 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, word: bool, tri
         "Database of {} bytes",
         y_server.db().len() * (params.pt_modulus as f64).log2().ceil() as usize / 8
     );
-    // assert_eq!(
-    //     y_server.db().len() * std::mem::size_of::<T>(),
-    //     db_rows_padded * db_cols * (params.pt_modulus as f64).log2().ceil() as usize / 8
-    // );
     assert_eq!(y_server.db().len(), db_rows_padded * db_cols);
 
     // ================================================================
-    // OFFLINE PHASE
+    // OFFLINE PHASE (InspiRING precomp now lives inside the server)
     // ================================================================
     let mut measurements = vec![Measurement::default(); trials + 1];
 
     let start_offline_comp = Instant::now();
+
     let offline_values = if word {
-        y_server.perform_offline_precomputation_simplepir_word(Some(&mut measurements[0]))
+        y_server.perform_offline_precomputation_simplepir_word(Some(&mut measurements[0]), packing)
     } else {
-        y_server.perform_offline_precomputation_simplepir(Some(&mut measurements[0]))
+        y_server.perform_offline_precomputation_simplepir(Some(&mut measurements[0]), packing)
     };
+
     let offline_server_time_ms = start_offline_comp.elapsed().as_millis();
 
     let packed_query_row_sz = params.db_rows_padded();
@@ -171,9 +164,9 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, word: bool, tri
         // QUERY GENERATION PHASE
         // ================================================================
         let mut online_upload_bytes = 0;
-        // Each query: (y_client, target_idx, ring_query OR word_query, pack_pub_params_row_1s)
-        // We store the ring query as Option<AlignedMemory64> and word query as Option<Vec<u64>>
-        let mut query_meta: Vec<(YClient, usize, Vec<spiral_rs::poly::PolyMatrixNTT>)> = Vec::new();
+
+        // Unified: both packing types produce (YClient, target_idx, PackingKeys)
+        let mut query_meta: Vec<(YClient, usize, PackingKeys)> = Vec::new();
         let mut ring_queries: Vec<AlignedMemory64> = Vec::new();
         let mut word_queries_storage: Vec<Vec<u64>> = Vec::new();
 
@@ -191,22 +184,36 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, word: bool, tri
             let start = Instant::now();
             client.generate_secret_keys();
             let sk_reg = &client.get_sk_reg();
-            let pack_pub_params = raw_generate_expansion_params(
-                &params,
-                &sk_reg,
-                params.poly_len_log2,
-                params.t_exp_left,
-                &mut ChaCha20Rng::from_entropy(),
-                &mut ChaCha20Rng::from_seed(STATIC_SEED_2),
-            );
-            let mut pack_pub_params_row_1s = pack_pub_params.to_vec();
-            for i in 0..pack_pub_params.len() {
-                pack_pub_params_row_1s[i] =
-                    pack_pub_params[i].submatrix(1, 0, 1, pack_pub_params[i].cols);
-                pack_pub_params_row_1s[i] = condense_matrix(&params, &pack_pub_params_row_1s[i]);
-            }
-            let pub_params_size = get_vec_pm_size_bytes(&pack_pub_params_row_1s);
-            debug!("pub params size: {} bytes", pub_params_size);
+
+            let (pub_params_size, pk) = match packing {
+                PackingType::InspiRING => {
+                    let pp = offline_values.packing_params.as_ref().unwrap();
+                    let packing_keys = PackingKeys::init_full(pp, sk_reg, W_SEED, V_SEED);
+                    let size = packing_keys.get_size_bytes();
+                    debug!("InspiRING packing key size: {} bytes", size);
+                    (size, packing_keys)
+                },
+                _ => {
+                    let pack_pub_params = raw_generate_expansion_params(
+                        &params,
+                        &sk_reg,
+                        params.poly_len_log2,
+                        params.t_exp_left,
+                        &mut ChaCha20Rng::from_entropy(),
+                        &mut ChaCha20Rng::from_seed(STATIC_SEED_2),
+                    );
+                    let mut pack_pub_params_row_1s = pack_pub_params.to_vec();
+                    for i in 0..pack_pub_params.len() {
+                        pack_pub_params_row_1s[i] =
+                            pack_pub_params[i].submatrix(1, 0, 1, pack_pub_params[i].cols);
+                        pack_pub_params_row_1s[i] = condense_matrix(&params, &pack_pub_params_row_1s[i]);
+                    }
+                    let size = get_vec_pm_size_bytes(&pack_pub_params_row_1s);
+                    debug!("pub params size: {} bytes", size);
+                    let packing_keys = PackingKeys::init_cdks_from_keys(params.clone(), pack_pub_params_row_1s);
+                    (size, packing_keys)
+                },
+            };
 
             let y_client = YClient::new(client, &params);
 
@@ -217,7 +224,7 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, word: bool, tri
                 online_upload_bytes = query_size + pub_params_size;
                 word_queries_storage.push(wq);
             } else {
-                let query_row = y_client.generate_query(SEED_0, params.db_dim_1, true, target_row, None, None);
+                let query_row = y_client.generate_query(SEED_0, params.db_dim_1, packing, target_row, None, None);
                 let query_row_last_row: &[u64] = &query_row;
                 assert_eq!(query_row_last_row.len(), db_rows);
                 let packed_query_row = pack_query(&params, query_row_last_row);
@@ -227,29 +234,30 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, word: bool, tri
                 ring_queries.push(packed_query_row);
             }
 
+            query_meta.push((y_client, target_idx, pk));
+
             measurement.online.client_query_gen_time_ms = start.elapsed().as_millis() as usize;
             debug!("Generated query in {} us", start.elapsed().as_micros());
             debug!("Query size: {} bytes", online_upload_bytes);
             debug!("Client {} query generated", _batch);
-
-            query_meta.push((y_client, target_idx, pack_pub_params_row_1s));
         }
 
         let offline_values = offline_values.clone();
 
         // ================================================================
-        // ONLINE PHASE
+        // ONLINE PHASE (unified: server handles both packing types)
         // ================================================================
 
         let start_online_comp = Instant::now();
-        let p = &query_meta.iter().map(|x| x.2.as_slice()).collect::<Vec<_>>();
 
-        let responses = if word {
+        let mut packing_keys: Vec<PackingKeys> = query_meta.iter().map(|(_, _, pk)| pk.clone()).collect();
+
+        let responses: Vec<Vec<Vec<u8>>> = if word {
             let query_slices: Vec<&[u64]> = word_queries_storage.iter().map(|q| q.as_slice()).collect();
             y_server.perform_online_computation_simplepir_word(
                 &query_slices,
                 &offline_values,
-                p,
+                &mut packing_keys,
                 Some(&mut measurement),
             )
         } else {
@@ -268,7 +276,7 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, word: bool, tri
             y_server.perform_online_computation_simplepir(
                 &query_slices,
                 &offline_values,
-                p,
+                &mut packing_keys,
                 Some(&mut measurement),
             )
         };
@@ -297,23 +305,34 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, word: bool, tri
             }
 
             debug!("decrypting outer cts...");
-            let outer_ct = response
+            let outer_ct: Vec<u64> = response
                 .iter()
                 .flat_map(|ct| {
-                    decrypt_ct_reg_measured(y_client.client(), &params, &ct.ntt(), params.poly_len)
-                        .as_slice()
-                        .to_vec()
+                    decrypt_ct_reg_measured(
+                        y_client.client(),
+                        &params,
+                        &ct.ntt(),
+                        params.poly_len,
+                    )
+                    .as_slice()
+                    .to_vec()
                 })
-                .collect::<Vec<_>>();
+                .collect();
             assert_eq!(outer_ct.len(), num_rlwe_outputs * params.poly_len);
-            // debug!("outer_ct: {:?}", &outer_ct[..]);
-            // let outer_ct_t_u8 = u64s_to_contiguous_bytes(&outer_ct, pt_bits);
             let final_result = outer_ct.as_slice();
             measurement.online.client_decode_time_ms = start_decode.elapsed().as_millis() as usize;
 
-            // debug!("got      {:?}", &final_result[..256]);
-            // debug!("expected {:?}", &corr_result[..256]);
-            // debug!("got {:?}, expected {:?}", &final_result[..256], &corr_result[..256]);
+            if final_result != corr_result {
+                let mismatches: Vec<usize> = final_result.iter().zip(corr_result.iter())
+                    .enumerate()
+                    .filter(|(_, (a, b))| a != b)
+                    .map(|(i, _)| i)
+                    .collect();
+                eprintln!("MISMATCH: {} / {} values differ", mismatches.len(), final_result.len());
+                for &i in mismatches.iter().take(10) {
+                    eprintln!("  [{i}] got={}, expected={}", final_result[i], corr_result[i]);
+                }
+            }
             assert_eq!(final_result, corr_result);
         }
 
@@ -352,9 +371,10 @@ pub fn run_ypir_on_params<const K: usize>(
     is_simplepir: bool,
     word: bool,
     trials: usize,
+    packing: PackingType,
 ) -> Measurement {
     if is_simplepir || word {
-        return run_simple_ypir_on_params::<K>(params, word, trials);
+        return run_simple_ypir_on_params::<K>(params, word, trials, packing);
     }
     let lwe_params = LWEParams::default();
 
@@ -455,7 +475,7 @@ pub fn run_ypir_on_params<const K: usize>(
 
     let start_offline_comp = Instant::now();
     // server precomputed state (silent preprocessing)
-    let offline_values = y_server.perform_offline_precomputation(Some(&mut measurements[0]));
+    let offline_values = y_server.perform_offline_precomputation(Some(&mut measurements[0]), packing);
     let offline_server_time_ms = start_offline_comp.elapsed().as_millis();
 
     let packed_query_row_sz = params.db_rows_padded();
@@ -475,7 +495,11 @@ pub fn run_ypir_on_params<const K: usize>(
         // QUERY GENERATION PHASE
         // ================================================================
         let mut online_upload_bytes = 0;
-        let mut queries = Vec::new();
+        // Unified: both packing types produce (YClient, target_idx, PackingKeys)
+        let mut query_meta: Vec<(YClient, usize)> = Vec::new();
+        let mut packed_query_rows: Vec<Vec<u32>> = Vec::new();
+        let mut packed_query_cols: Vec<AlignedMemory64> = Vec::new();
+        let mut packing_keys_vec: Vec<PackingKeys> = Vec::new();
 
         let mut clients = (0..K).map(|_| Client::init(&params)).collect::<Vec<_>>();
 
@@ -491,75 +515,62 @@ pub fn run_ypir_on_params<const K: usize>(
             let start = Instant::now();
             client.generate_secret_keys();
             let sk_reg = &client.get_sk_reg();
-            let pack_pub_params = raw_generate_expansion_params(
-                &params,
-                &sk_reg,
-                params.poly_len_log2,
-                params.t_exp_left,
-                &mut ChaCha20Rng::from_entropy(),
-                &mut ChaCha20Rng::from_seed(STATIC_SEED_2),
-            );
-            
 
-            assert_eq!(pack_pub_params.len(), params.poly_len_log2);
-            assert_eq!(pack_pub_params[0].cols, params.t_exp_left);
-            assert_eq!(pack_pub_params[0].rows, 2);
-
-            // generated the key switching (automorphism) keys
-
-            // now we are applying some CRT optimizations (all NTTs are consisting of two sets of coefficients for the two moduli) and dropping the random portion (YPIR 4.2)
-            let mut pack_pub_params_row_1s = pack_pub_params.to_vec();
-            for i in 0..pack_pub_params.len() {
-                pack_pub_params_row_1s[i] =
-                    pack_pub_params[i].submatrix(1, 0, 1, pack_pub_params[i].cols);
-                pack_pub_params_row_1s[i] = condense_matrix(&params, &pack_pub_params_row_1s[i]);
-            }
-            let pub_params_size = get_vec_pm_size_bytes(&pack_pub_params_row_1s);
-            debug!("pub params size: {} bytes", pub_params_size);
+            let (pub_params_size, pk) = match packing {
+                PackingType::InspiRING => {
+                    let pp = offline_values.packing_params.as_ref().unwrap();
+                    let packing_keys = PackingKeys::init_full(pp, sk_reg, W_SEED, V_SEED);
+                    let size = packing_keys.get_size_bytes();
+                    debug!("InspiRING packing key size: {} bytes", size);
+                    (size, packing_keys)
+                },
+                _ => {
+                    let pack_pub_params = raw_generate_expansion_params(
+                        &params,
+                        &sk_reg,
+                        params.poly_len_log2,
+                        params.t_exp_left,
+                        &mut ChaCha20Rng::from_entropy(),
+                        &mut ChaCha20Rng::from_seed(STATIC_SEED_2),
+                    );
+                    let mut pack_pub_params_row_1s = pack_pub_params.to_vec();
+                    for i in 0..pack_pub_params.len() {
+                        pack_pub_params_row_1s[i] =
+                            pack_pub_params[i].submatrix(1, 0, 1, pack_pub_params[i].cols);
+                        pack_pub_params_row_1s[i] = condense_matrix(&params, &pack_pub_params_row_1s[i]);
+                    }
+                    let size = get_vec_pm_size_bytes(&pack_pub_params_row_1s);
+                    debug!("pub params size: {} bytes", size);
+                    let packing_keys = PackingKeys::init_cdks_from_keys(params.clone(), pack_pub_params_row_1s);
+                    (size, packing_keys)
+                },
+            };
 
             let y_client = YClient::new(client, &params);
-            let query_row = y_client.generate_query(SEED_0, params.db_dim_1, false, target_row, None, None); // SimplePIR query on the column
-            // represents a matrix (n+1) × dim, where each column is an LWE ciphertext, stored in row major
-            // therefore, the last row is the non-random portion of the ct
+            let query_row = y_client.generate_query(SEED_0, params.db_dim_1, PackingType::NoPacking, target_row, None, None);
             let query_row_last_row: &[u64] = &query_row[lwe_params.n * db_rows..];
 
-            // then we align the allocation on a 64-byte boundary using rust allocator
-            // interestingly, AVX-512 works as a SIMD operation with 8 64-byte values, but we only have a 32-bit modulus so NOT optimal, but still solid
-            // let mut aligned_query_packed = AlignedMemory64::new(query_row_last_row.len());
-            // aligned_query_packed
-            //     .as_mut_slice()
-            //     .copy_from_slice(&query_row_last_row);
-            // let packed_query_row = aligned_query_packed;
             let packed_query_row_u32 = query_row_last_row
                 .iter()
                 .map(|x| *x as u32)
                 .collect::<Vec<_>>();
-            // this isn't really packed
 
-            // remember, we only need queries that are of size db_dim1, db_dim2, because for DoublePIR we transponse our 2nd DB
-            let query_col = y_client.generate_query(SEED_1, params.db_dim_2, true, target_col, None, None);
-            let query_col_last_row = &query_col;
-            // recall, we have a larger modulus for DoublePIR (~=2^56)
-            // we decompose the larger modulus into two moduli <2^32, then pack them into a single 64-bit word
-            let packed_query_col = pack_query(&params, query_col_last_row);
-            // the reason we use RLWE then convert them back to LWE is we want to stick to two clients: LWE client and RLWE client
+            let query_col = y_client.generate_query(SEED_1, params.db_dim_2, packing, target_col, None, None);
+            let packed_query_col = pack_query(&params, &query_col);
 
-            let query_size = query_row_last_row.len() * 4 + query_col_last_row.len() * 8;
+            let query_size = query_row_last_row.len() * 4 + query_col.len() * 8;
 
             measurement.online.client_query_gen_time_ms = start.elapsed().as_millis() as usize;
-            debug!("Generated query in {} us", start.elapsed().as_micros()); // if this was important, we would do this different (LWE matrix multiply)
+            debug!("Generated query in {} us", start.elapsed().as_micros());
 
             online_upload_bytes = query_size + pub_params_size;
             debug!("Query size: {} bytes", online_upload_bytes);
             debug!("Client {} query generated", _batch);
 
-            queries.push((
-                y_client,
-                target_idx,
-                packed_query_row_u32,
-                packed_query_col,
-                pack_pub_params_row_1s,
-            ));
+            query_meta.push((y_client, target_idx));
+            packed_query_rows.push(packed_query_row_u32);
+            packed_query_cols.push(packed_query_col);
+            packing_keys_vec.push(pk);
         }
 
         let mut all_queries_packed = vec![0u32; K * packed_query_row_sz];
@@ -568,9 +579,8 @@ pub fn run_ypir_on_params<const K: usize>(
             .chunks_mut(packed_query_row_sz)
             .enumerate()
         {
-            (&mut chunk_mut[..db_rows]).copy_from_slice(queries[i].2.as_slice());
+            (&mut chunk_mut[..db_rows]).copy_from_slice(packed_query_rows[i].as_slice());
         }
-        // all_queries_packed stores only the SimplePIR queries (u32 * db_dim_1 bytes)
 
         let mut offline_values = offline_values.clone();
 
@@ -580,26 +590,24 @@ pub fn run_ypir_on_params<const K: usize>(
 
         let start_online_comp = Instant::now();
 
+        let query_col_slices: Vec<&[u64]> = packed_query_cols.iter().map(|q| q.as_slice()).collect();
+
         let responses = y_server.perform_online_computation::<K>(
             &mut offline_values,
             &all_queries_packed,
-            &queries
-                .iter()
-                .map(|x| (x.3.as_slice(), x.4.as_slice()))
-                .collect::<Vec<_>>(),
+            &query_col_slices,
+            &mut packing_keys_vec,
             Some(&mut measurement),
         );
 
         assert_eq!(responses.len(), K);
-        assert_eq!(responses[0].len(), rho);
-        assert_eq!(responses[0][0].len(), doublepir_resp_bytes / rho);
 
         let online_server_time_ms = start_online_comp.elapsed().as_millis();
         let online_download_bytes = get_size_bytes(&responses); // TODO: this is not quite right for multiple clients
 
         // check correctness
-        for (response_switched, (y_client, target_idx, _, _, _)) in
-            responses.iter().zip(queries.iter())
+        for (response_switched, (y_client, target_idx)) in
+            responses.iter().zip(query_meta.iter())
         {
             let (target_row, target_col) = (target_idx / db_cols, target_idx % db_cols);
             let corr_result = y_server.get_elem(target_row, target_col).to_u64();
@@ -621,7 +629,6 @@ pub fn run_ypir_on_params<const K: usize>(
             // response now contains a full RLWE in q2 space
 
             debug!("decrypting outer cts...");
-            // monad referenced!
             let outer_ct = response
                 .iter()
                 .flat_map(|ct| {
@@ -630,22 +637,17 @@ pub fn run_ypir_on_params<const K: usize>(
                         .to_vec()
                 })
                 .collect::<Vec<_>>();
-            assert_eq!(outer_ct.len(), out_rows);
-            // debug!("outer_ct: {:?}", &outer_ct[..]);
-            
-            
-            // now we have the column of our DB2
-            let outer_ct_t_u8 = u64s_to_contiguous_bytes(&outer_ct, pt_bits);
 
-            // no clue why we're storing this as a PolyMatrixRaw if we're just using it as a vec
             let mut inner_ct = PolyMatrixRaw::zero(&params, 2, 1);
 
-            let mut bit_offs = 0;
             let lwe_q_prime = lwe_params.get_q_prime_2();
             let special_offs =
                 ((lwe_params.n * lwe_q_prime_bits) as f64 / pt_bits as f64).ceil() as usize;
+            let gamma = params.poly_len;
 
-            // first n values were packed tightly
+            // first n values were packed tightly in the mask CTs
+            let outer_ct_t_u8 = u64s_to_contiguous_bytes(&outer_ct, pt_bits);
+            let mut bit_offs = 0;
             for z in 0..lwe_params.n {
                 let val = read_bits(&outer_ct_t_u8, bit_offs, lwe_q_prime_bits);
                 bit_offs += lwe_q_prime_bits;
@@ -658,13 +660,25 @@ pub fn run_ypir_on_params<const K: usize>(
                 inner_ct.data[z] = rescale(val, lwe_q_prime, lwe_params.modulus);
             }
 
-            // the non-random was stored at an offset
-            bit_offs = special_offs * pt_bits; 
-            let val = read_bits(&outer_ct_t_u8, bit_offs, lwe_q_prime_bits);
-            // let mut val = 0;
-            // for i in 0..blowup_factor.ceil() as usize {
-            //     val |= outer_ct[special_offs + i] << (i * pt_bits);
-            // }
+            // b_val extraction depends on packing type
+            let val = match packing {
+                PackingType::InspiRING => {
+                    // NoPacking body: excess CTs are raw after the mask CTs
+                    // b_val is reconstructed from coefficient 0 of each decrypted excess CT
+                    let num_rlwes_for_mask = (special_offs as f64 / gamma as f64).ceil() as usize;
+                    let mut val = 0u64;
+                    for i in 0..blowup_factor.ceil() as usize {
+                        val |= (outer_ct[num_rlwes_for_mask * gamma + i * gamma] % params.pt_modulus)
+                            << (i * pt_bits);
+                    }
+                    val
+                },
+                _ => {
+                    // CDKS: b_val packed at special_offs within the packed CTs
+                    bit_offs = special_offs * pt_bits;
+                    read_bits(&outer_ct_t_u8, bit_offs, lwe_q_prime_bits)
+                },
+            };
             assert!(
                 val < lwe_q_prime,
                 "val: {}, lwe_q_prime: {}",
@@ -724,6 +738,8 @@ pub fn run_ypir_on_params<const K: usize>(
     final_measurement
 }
 
+
+
 fn mean(xs: &[usize]) -> f64 {
     xs.iter().map(|x| *x as f64).sum::<f64>() / xs.len() as f64
 }
@@ -741,95 +757,126 @@ fn std_dev(xs: &[usize]) -> f64 {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::packing::PackingType;
     use test_log::test;
 
     #[test]
     fn test_ypir_basic() {
-        run_ypir_batched(1 << 30, 1, 1, false, 1);
+        run_ypir_batched(1 << 30, 1, 1, false, false, 1, PackingType::CDKS);
     }
 
     #[test]
     fn test_ypir_simplepir_basic() {
-        run_ypir_batched(1 << 10, 65536 * 8, 1, true, 1);
+        run_ypir_batched(1 << 15, 2048 * 15, 1, true, false, 1, PackingType::CDKS);
     }
 
     #[test]
     fn test_ypir_sp_word_basic() {
-        run_ypir_batched_word(1 << 10, 65536 * 8, 1, 1);
+        run_ypir_batched(1 << 10, 65536 * 8, 1, true, true, 1, PackingType::CDKS);
     }
 
     #[test]
     fn test_ypir_simplepir_rectangle() {
-        run_ypir_batched(1 << 16, 16384 * 8, 1, true, 1);
+        run_ypir_batched(1 << 16, 16384 * 8, 1, true, false, 1, PackingType::CDKS);
     }
 
     #[test]
     fn test_ypir_simplepir_rectangle_8gb() {
-        run_ypir_batched(1 << 17, 65536 * 8, 1, true, 1);
+        run_ypir_batched(1 << 17, 65536 * 8, 1, true, false, 1, PackingType::CDKS);
     }
 
     #[test]
     fn test_ypir_many_clients() {
-        run_ypir_batched(1 << 30, 1, 2, false, 1);
+        run_ypir_batched(1 << 30, 1, 2, false, false, 1, PackingType::CDKS);
     }
 
     #[test]
     fn test_ypir_many_clients_and_trials() {
-        run_ypir_batched(1 << 30, 1, 2, false, 5);
+        run_ypir_batched(1 << 30, 1, 2, false, false, 5, PackingType::CDKS);
     }
 
     #[test]
     #[ignore]
     fn test_ypir_small() {
-        run_ypir_batched(1 << 20, 8, 1, false, 5);
+        run_ypir_batched(1 << 20, 8, 1, false, false, 5, PackingType::CDKS);
     }
 
     #[test]
     #[ignore]
     fn test_ypir_1gb() {
-        run_ypir_batched(1 << 33, 1, 2, false, 1);
+        run_ypir_batched(1 << 33, 1, 2, false, false, 1, PackingType::CDKS);
     }
 
     #[test]
     #[ignore]
     // add a test for Toeplitz matrix (8 GB GPU RAM limit)
     fn test_ypir_toeplitz() {
-        run_ypir_batched(1 << 32, 1, 1, false, 5);
+        run_ypir_batched(1 << 32, 1, 1, false, false, 5, PackingType::CDKS);
     }
 
     #[test]
     #[ignore]
     fn test_ypir_2gb() {
-        run_ypir_batched(1 << 34, 1, 1, false, 5);
+        run_ypir_batched(1 << 34, 1, 1, false, false, 5, PackingType::CDKS);
     }
 
     #[test]
     #[ignore]
     fn test_ypir_4gb() {
-        run_ypir_batched(1 << 35, 1, 1, false, 5);
+        run_ypir_batched(1 << 35, 1, 1, false, false, 5, PackingType::CDKS);
     }
 
     #[test]
     #[ignore]
     fn test_ypir_8gb() {
-        run_ypir_batched(1 << 36, 1, 1, false, 5);
+        run_ypir_batched(1 << 36, 1, 1, false, false, 5, PackingType::CDKS);
     }
 
     #[test]
     #[ignore]
     fn test_ypir_16gb() {
-        run_ypir_batched(1 << 37, 1, 1, false, 5);
+        run_ypir_batched(1 << 37, 1, 1, false, false, 5, PackingType::CDKS);
     }
 
     #[test]
     #[ignore]
     fn test_ypir_32gb() {
-        run_ypir_batched(1 << 38, 1, 1, false, 5);
+        run_ypir_batched(1 << 38, 1, 1, false, false, 5, PackingType::CDKS);
     }
 
     #[test]
     #[ignore]
     fn test_batched_4_ypir() {
-        run_ypir_batched(1 << 30, 1, 4, false, 5);
+        run_ypir_batched(1 << 30, 1, 4, false, false, 5, PackingType::CDKS);
+    }
+
+    #[test]
+    fn test_ypir_sp_word_inspiring() {
+        run_ypir_batched(1 << 10, 65536 * 8, 1, true, true, 1, PackingType::InspiRING);
+    }
+
+    #[test]
+    fn test_ypir_simplepir_inspiring() {
+        run_ypir_batched(1 << 10, 65536 * 8, 1, true, false, 1, PackingType::InspiRING);
+    }
+
+    #[test]
+    fn test_ypir_sp_word_inspiring_batched() {
+        run_ypir_batched(1 << 10, 65536 * 8, 2, true, true, 1, PackingType::InspiRING);
+    }
+
+    #[test]
+    fn test_ypir_simplepir_batched() {
+        run_ypir_batched(1 << 10, 65536 * 8, 2, true, false, 1, PackingType::CDKS);
+    }
+
+    #[test]
+    fn test_ypir_doublepir_inspiring() {
+        run_ypir_batched(1 << 30, 1, 1, false, false, 1, PackingType::InspiRING);
+    }
+
+    #[test]
+    fn test_ypir_doublepir_inspiring_batched() {
+        run_ypir_batched(1 << 30, 1, 2, false, false, 1, PackingType::InspiRING);
     }
 }

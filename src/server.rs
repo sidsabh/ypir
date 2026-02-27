@@ -7,7 +7,7 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
 use spiral_rs::aligned_memory::AlignedMemory64;
-use spiral_rs::{arith::*, client::*, params::*, poly::*};
+use spiral_rs::{arith::*, client::*, number_theory::invert_uint_mod, params::*, poly::*};
 
 use crate::convolution::naive_multiply_matrices;
 use crate::measurement::Measurement;
@@ -156,6 +156,11 @@ pub struct OfflinePrecomputedValues<'a> {
     pub prepacked_lwe: Vec<Vec<PolyMatrixNTT<'a>>>,
     pub fake_pack_pub_params: Vec<PolyMatrixNTT<'a>>,
     pub precomp: Precomp<'a>,
+    // InspiRING packing fields
+    pub packing_type: PackingType,
+    pub packing_params: Option<PackParams<'a>>,
+    pub precomp_inspir_vec: Option<Vec<PrecompInsPIR<'a>>>,
+    pub offline_packing_keys: Option<OfflinePackingKeys<'a>>,
     #[cfg(feature = "cuda")]
     pub cuda_context: Option<std::sync::Arc<crate::cuda::OnlineComputeContext>>,
     #[cfg(feature = "cuda")]
@@ -231,24 +236,24 @@ where
         // SIDQ: why are the column dims db_dim_x + poly_len ? just because we need l1, l2 to be multiples of ring dim for NTT
 
         // UNCOMMENT - JUST FOR SKIPPING FILLING
-        // for i in 0..db_rows {
-        //     for j in 0..db_cols {
-        //         let idx = if inp_transposed {
-        //             i * db_cols + j
-        //         } else {
-        //             j * db_rows_padded + i
-        //         };
+        for i in 0..db_rows {
+            for j in 0..db_cols {
+                let idx = if inp_transposed {
+                    i * db_cols + j
+                } else {
+                    j * db_rows_padded + i
+                };
 
-        //         unsafe {
-        //             *db_buf_ptr.add(idx) = db.next().unwrap();
-        //             // *db_buf_ptr.add(idx) = if i < db_rows {
-        //             //     db.next().unwrap()
-        //             // } else {
-        //             //     T::default()
-        //             // };
-        //         }
-        //     }
-        // }
+                unsafe {
+                    *db_buf_ptr.add(idx) = db.next().unwrap();
+                    // *db_buf_ptr.add(idx) = if i < db_rows {
+                    //     db.next().unwrap()
+                    // } else {
+                    //     T::default()
+                    // };
+                }
+            }
+        }
 
         // Parameters for the second round (the "DoublePIR" round)
         let smaller_params = if is_simplepir {
@@ -449,7 +454,7 @@ where
 
         // recall - for the query over DB2 (DoublePIR), we used this same call
         // it generates RLWE encryption of a column, which is equivalent to an LWE encryption under the negacyclic matrix
-        let query = y_client.generate_query_impl(public_seed_idx, self.params.db_dim_1, true, 0, None, None);
+        let query = y_client.generate_query_impl(public_seed_idx, self.params.db_dim_1, PackingType::CDKS, 0, None, None);
 
         // this is basically just grabbing the random portion (A2)
         // correct, but not efficient
@@ -778,6 +783,36 @@ where
         self.multiply_batched_with_db_packed::<K>(aligned_queries_packed, 1)
     }
 
+    /// Word-based matrix-vector product for a single query.
+    /// Returns the intermediate result (db_cols entries) after matmul in Z_{2^64},
+    /// mod-switched to Z_Q, and CRT-packed into u64s.
+    pub fn answer_query_word(&self, query: &[u64]) -> Vec<u64> {
+        let params = self.params;
+        let q = params.modulus;
+        let db_rows = 1 << (params.db_dim_1 + params.poly_len_log2);
+        let db_rows_padded = self.db_rows_padded();
+        let db_cols = self.db_cols();
+        let db = self.db();
+
+        assert_eq!(query.len(), db_rows);
+
+        let mut intermediate = vec![0u64; db_cols];
+        for col in 0..db_cols {
+            let mut acc: u64 = 0;
+            for row in 0..db_rows {
+                acc = acc.wrapping_add(
+                    query[row].wrapping_mul(db[col * db_rows_padded + row].to_u64()),
+                );
+            }
+            let val_q = Self::modswitch_word_to_q(acc, q);
+            let crt0 = val_q % params.moduli[0];
+            let crt1 = val_q % params.moduli[1];
+            intermediate[col] = crt0 | (crt1 << 32);
+        }
+
+        intermediate
+    }
+
     #[cfg(feature = "cuda")]
     pub fn init_hint_0_simplepir_gpu_context(&self) -> crate::cuda::SPOfflineContext {
         let db_rows = 1 << (self.params.db_dim_1 + self.params.poly_len_log2);
@@ -821,6 +856,7 @@ where
     pub fn perform_offline_precomputation_simplepir(
         &self,
         measurement: Option<&mut Measurement>,
+        packing: PackingType,
     ) -> OfflinePrecomputedValues {
         // Set up some parameters
         let params = self.params;
@@ -882,6 +918,41 @@ where
         debug!("size of cached_ntt: {}", precomp.len() * precomp[0].1.len() * precomp[0].1[0].data.len() * 8 );
         debug!("Precomp in {} us", now.elapsed().as_micros());
 
+        // InspiRING offline precomputation
+        let gamma = params.poly_len; // always full packing for InspiRING
+        let (packing_params, precomp_inspir_vec) = if packing == PackingType::InspiRING {
+            let packing_params = PackParams::new(&params, gamma);
+            let offline_packing_keys = OfflinePackingKeys::init_full(&packing_params, crate::scheme::W_SEED, crate::scheme::V_SEED);
+
+            let now_precomp = Instant::now();
+            let mut precomp_vec = Vec::with_capacity(num_rlwe_outputs);
+            for i in 0..num_rlwe_outputs {
+                let mut a_ct_tilde = Vec::new();
+                for j in 0..gamma {
+                    if j < prepacked_lwe[i].len() {
+                        a_ct_tilde.push(prepacked_lwe[i][j].submatrix(0, 0, 1, 1));
+                    }
+                }
+
+                let w_all = offline_packing_keys.w_all.as_ref().unwrap();
+                let w_bar_all = offline_packing_keys.w_bar_all.as_ref().unwrap();
+                let v_mask = offline_packing_keys.v_mask.as_ref().unwrap();
+
+                let precomp_i = crate::packing::full_packing_with_preprocessing_offline_without_rotations(
+                    &packing_params,
+                    w_all,
+                    w_bar_all,
+                    v_mask,
+                    &a_ct_tilde,
+                );
+                precomp_vec.push(precomp_i);
+            }
+            debug!("InspiRING precomp in {} us", now_precomp.elapsed().as_micros());
+            (Some(packing_params), Some(precomp_vec))
+        } else {
+            (None, None)
+        };
+
         #[cfg(not(feature = "cuda"))]
         {
             OfflinePrecomputedValues {
@@ -893,9 +964,13 @@ where
                 prepacked_lwe,
                 fake_pack_pub_params,
                 precomp,
+                packing_type: packing,
+                packing_params,
+                precomp_inspir_vec,
+                offline_packing_keys: None,
             }
         }
-        
+
         #[cfg(feature = "cuda")]
         {
             // Initialize CUDA online context
@@ -933,8 +1008,12 @@ where
                                     precomp_vals_flat.extend_from_slice(&poly[..params.poly_len]);
                                 }
                             }
-                            for t in tables {
-                                for &val in t {
+                            // Extract CDKS tables in the order CUDA expects:
+                            // table[0] → t=(1<<ell)+1, table[1] → t=(1<<(ell-1))+1, ..., table[ell-1] → t=3
+                            for cur_ell in (1..=params.poly_len_log2).rev() {
+                                let t = (1 << cur_ell) + 1;
+                                let full_table_idx = (t - 1) / 2;
+                                for &val in &tables[full_table_idx] {
                                     precomp_tables_flat.push(val as u64);
                                 }
                             }
@@ -966,6 +1045,10 @@ where
                 prepacked_lwe: vec![],
                 fake_pack_pub_params: vec![],
                 precomp: vec![],
+                packing_type: packing,
+                packing_params,
+                precomp_inspir_vec,
+                offline_packing_keys: None,
                 cuda_context: None,
                 sp_cuda_context,
                 word_cuda_context: None,
@@ -1061,6 +1144,7 @@ where
     pub fn perform_offline_precomputation_simplepir_word(
         &self,
         measurement: Option<&mut Measurement>,
+        packing: PackingType,
     ) -> OfflinePrecomputedValues {
         let params = self.params;
         assert!(self.ypir_params.is_simplepir);
@@ -1102,14 +1186,17 @@ where
         #[cfg(not(feature = "cuda"))]
         let hint_0_packed: Vec<u64> = {
             let now = Instant::now();
-            let hint_0 = self.compute_hint_0_word();
-            let result = hint_0.iter().map(|&x| {
-                let crt0 = x % params.moduli[0];
-                let crt1 = x % params.moduli[1];
-                crt0 | (crt1 << 32)
-            }).collect();
+            let mut hint_0 = self.compute_hint_0_word();
+            // CDKS packing multiplies a-part by N; pre-multiply by inv_N to cancel.
+            // InspiRING normalization happens via mod_inv_poly during offline precomp, so skip.
+            if packing != PackingType::InspiRING {
+                let inv_n = invert_uint_mod(params.poly_len as u64, params.modulus).unwrap();
+                for val in hint_0.iter_mut() {
+                    *val = multiply_uint_mod(*val, inv_n, params.modulus);
+                }
+            }
             simplepir_prep_time_ms = now.elapsed().as_millis();
-            result
+            hint_0
         };
 
         if let Some(measurement) = measurement {
@@ -1138,6 +1225,41 @@ where
         }
         debug!("Precomp in {} us", now.elapsed().as_micros());
 
+        // InspiRING offline precomputation
+        let gamma = params.poly_len;
+        let (inspir_packing_params, inspir_precomp_vec) = if packing == PackingType::InspiRING {
+            let packing_params = PackParams::new(&params, gamma);
+            let offline_packing_keys = OfflinePackingKeys::init_full(&packing_params, crate::scheme::W_SEED, crate::scheme::V_SEED);
+
+            let now_precomp = Instant::now();
+            let mut precomp_vec = Vec::with_capacity(num_rlwe_outputs);
+            for i in 0..num_rlwe_outputs {
+                let mut a_ct_tilde = Vec::new();
+                for j in 0..gamma {
+                    if j < prepacked_lwe[i].len() {
+                        a_ct_tilde.push(prepacked_lwe[i][j].submatrix(0, 0, 1, 1));
+                    }
+                }
+
+                let w_all = offline_packing_keys.w_all.as_ref().unwrap();
+                let w_bar_all = offline_packing_keys.w_bar_all.as_ref().unwrap();
+                let v_mask = offline_packing_keys.v_mask.as_ref().unwrap();
+
+                let precomp_i = crate::packing::full_packing_with_preprocessing_offline_without_rotations(
+                    &packing_params,
+                    w_all,
+                    w_bar_all,
+                    v_mask,
+                    &a_ct_tilde,
+                );
+                precomp_vec.push(precomp_i);
+            }
+            debug!("InspiRING precomp in {} us", now_precomp.elapsed().as_micros());
+            (Some(packing_params), Some(precomp_vec))
+        } else {
+            (None, None)
+        };
+
         #[cfg(not(feature = "cuda"))]
         {
             OfflinePrecomputedValues {
@@ -1149,6 +1271,10 @@ where
                 prepacked_lwe,
                 fake_pack_pub_params,
                 precomp,
+                packing_type: packing,
+                packing_params: inspir_packing_params,
+                precomp_inspir_vec: inspir_precomp_vec,
+                offline_packing_keys: None,
             }
         }
 
@@ -1190,8 +1316,12 @@ where
                                     precomp_vals_flat.extend_from_slice(&poly[..params.poly_len]);
                                 }
                             }
-                            for t in tables {
-                                for &val in t {
+                            // Extract CDKS tables in the order CUDA expects:
+                            // table[0] → t=(1<<ell)+1, table[1] → t=(1<<(ell-1))+1, ..., table[ell-1] → t=3
+                            for cur_ell in (1..=params.poly_len_log2).rev() {
+                                let t = (1 << cur_ell) + 1;
+                                let full_table_idx = (t - 1) / 2;
+                                for &val in &tables[full_table_idx] {
                                     precomp_tables_flat.push(val as u64);
                                 }
                             }
@@ -1223,6 +1353,10 @@ where
                 prepacked_lwe: vec![],
                 fake_pack_pub_params: vec![],
                 precomp: vec![],
+                packing_type: packing,
+                packing_params: inspir_packing_params,
+                precomp_inspir_vec: inspir_precomp_vec,
+                offline_packing_keys: None,
                 cuda_context: None,
                 sp_cuda_context: None,
                 word_cuda_context,
@@ -1233,6 +1367,7 @@ where
     pub fn perform_offline_precomputation(
         &self,
         measurement: Option<&mut Measurement>,
+        packing: PackingType,
     ) -> OfflinePrecomputedValues {
         // Set up some parameters
 
@@ -1452,42 +1587,68 @@ where
         // A2 in NTT form (we already generated this in the creation of hint_1)
         let pseudorandom_query_1 = smaller_server.generate_pseudorandom_query(SEED_1);
 
-        // generates the possible rotations needed for the CDKS FFT tree algorithm
-        let y_constants = generate_y_constants(&params);
-
         // now we just add the last row to store the DoublePIR response
         let combined = [&hint_1[..], &vec![0u64; out_rows]].concat(); // stored in row major
         assert_eq!(combined.len(), out_rows * (params.poly_len + 1)); // full DoublePIR response, 0s everywhere besides H2
 
-        // all this does is get the rho many CDKS RLWE squares, drops the b (0), negacylic perms them, then puts them in NTT form. it is a full CT, but the non-random portion is empty
-        // TODO: QUESTION: why did we create the hint in NTT form, convert to RAW, then negacyclic then NTT again?
-        // couldn't we avoid these NTTs and do negacyclic in the NTT domain?
+        // get the rho many RLWE squares, negacyclic perms them, NTT form
         let prepacked_lwe = prep_pack_many_lwes(&params, &combined, rho);
         assert_eq!(prepacked_lwe.len(), rho);
         assert_eq!(prepacked_lwe[0].len(), params.poly_len);
 
+        let gamma = params.poly_len;
         let now = Instant::now();
-        // generates automorphism keys, doesn't actually encrypt sk, so only random portion is valid
-        let fake_pack_pub_params = generate_fake_pack_pub_params(&params);
-
+        let mut y_constants = (Vec::new(), Vec::new());
+        let mut fake_pack_pub_params = Vec::new();
         let mut precomp: Precomp = Vec::new();
-        for i in 0..prepacked_lwe.len() {
-            // for each CDKS square, we compute the final RLWE random portion
-            // Algo2 from CDKS, only on the random portion
-            // input: d2 many polynomials, log(d2) many automorphism keys, Y constants in NTT for multiplication-based rotations (the value of 1X^(d2/(2^l)) for l in [1..log(d2)])
-            // output.0 is the 1 RLWE for the random portion
-            // output.1 is the cached NTT for g−1𝑧(𝜏 (𝑐0)) at each level
-            // output.2 is the cached lookup tables for the NTT automorphism (reduces to a permutation). tau->{(i, remap_i)}
-            let tup: (PolyMatrixNTT<'_>, Vec<PolyMatrixNTT<'_>>, Vec<Vec<usize>>) = precompute_pack(
-                params,
-                params.poly_len_log2,
-                &prepacked_lwe[i],
-                &fake_pack_pub_params,
-                &y_constants,
-            );
-            precomp.push(tup);
+        let mut packing_params_opt: Option<PackParams> = None;
+        let mut precomp_inspir_vec_opt: Option<Vec<PrecompInsPIR>> = None;
+        let mut offline_packing_keys_opt: Option<OfflinePackingKeys> = None;
+
+        match packing {
+            PackingType::InspiRING => {
+                let packing_params = PackParams::new(&params, gamma);
+                let offline_packing_keys = OfflinePackingKeys::init_full(&packing_params, crate::scheme::W_SEED, crate::scheme::V_SEED);
+
+                let mut precomp_vec = Vec::with_capacity(rho);
+                for i in 0..rho {
+                    let mut a_ct_tilde = Vec::new();
+                    for j in 0..gamma {
+                        if j < prepacked_lwe[i].len() {
+                            a_ct_tilde.push(prepacked_lwe[i][j].submatrix(0, 0, 1, 1));
+                        }
+                    }
+
+                    let w_all = offline_packing_keys.w_all.as_ref().unwrap();
+                    let w_bar_all = offline_packing_keys.w_bar_all.as_ref().unwrap();
+                    let v_mask = offline_packing_keys.v_mask.as_ref().unwrap();
+
+                    let precomp_i = crate::packing::full_packing_with_preprocessing_offline_without_rotations(
+                        &packing_params, w_all, w_bar_all, v_mask, &a_ct_tilde,
+                    );
+                    precomp_vec.push(precomp_i);
+                }
+                debug!("InspiRING DoublePIR precomp in {} us", now.elapsed().as_micros());
+                packing_params_opt = Some(packing_params);
+                precomp_inspir_vec_opt = Some(precomp_vec);
+                offline_packing_keys_opt = Some(offline_packing_keys);
+            },
+            _ => {
+                y_constants = generate_y_constants(&params);
+                fake_pack_pub_params = generate_fake_pack_pub_params(&params);
+                for i in 0..prepacked_lwe.len() {
+                    let tup: (PolyMatrixNTT<'_>, Vec<PolyMatrixNTT<'_>>, Vec<Vec<usize>>) = precompute_pack(
+                        params,
+                        params.poly_len_log2,
+                        &prepacked_lwe[i],
+                        &fake_pack_pub_params,
+                        &y_constants,
+                    );
+                    precomp.push(tup);
+                }
+                debug!("CDKS Precomp in {} us", now.elapsed().as_micros());
+            },
         }
-        debug!("Precomp in {} us", now.elapsed().as_micros());
 
         #[cfg(not(feature = "cuda"))]
         {
@@ -1499,7 +1660,11 @@ where
                     smaller_server: Some(smaller_server),
                     prepacked_lwe,
                     fake_pack_pub_params,
-                    precomp
+                    precomp,
+                    packing_type: packing,
+                    packing_params: packing_params_opt,
+                    precomp_inspir_vec: precomp_inspir_vec_opt,
+                    offline_packing_keys: offline_packing_keys_opt,
             }
         }
 
@@ -1648,8 +1813,11 @@ where
                             precomp_vals_flat.extend_from_slice(&poly[..params.poly_len]);
                         }
                     }
-                    for t in tables {
-                        for &val in t {
+                    // Extract CDKS tables in the order CUDA expects
+                    for cur_ell in (1..=params.poly_len_log2).rev() {
+                        let t = (1 << cur_ell) + 1;
+                        let full_table_idx = (t - 1) / 2;
+                        for &val in &tables[full_table_idx] {
                             precomp_tables_flat.push(val as u64);
                         }
                     }
@@ -1680,6 +1848,10 @@ where
                 prepacked_lwe,
                 fake_pack_pub_params,
                 precomp,
+                packing_type: packing,
+                packing_params: None,
+                precomp_inspir_vec: None,
+                offline_packing_keys: None,
                 cuda_context,
                 sp_cuda_context: None,
                 word_cuda_context: None,
@@ -1687,78 +1859,110 @@ where
         }
     }
 
-    /// Perform SimplePIR-style YPIR
+    /// Perform SimplePIR-style YPIR (CPU path, supports batching and InspiRING/CDKS dispatch)
     #[cfg(not(feature = "cuda"))]
     pub fn perform_online_computation_simplepir(
         &self,
         first_dim_queries_packed: &[&[u64]],
         offline_vals: &OfflinePrecomputedValues<'a>,
-        pack_pub_params_row_1s: &[&[PolyMatrixNTT<'a>]],
+        packing_keys: &mut [PackingKeys<'a>],
         mut measurement: Option<&mut Measurement>,
     ) -> Vec<Vec<Vec<u8>>> {
         assert!(self.ypir_params.is_simplepir);
 
-        // Set up some parameters
-
         let params = self.params;
-
         let y_constants = &offline_vals.y_constants;
         let prepacked_lwe = &offline_vals.prepacked_lwe;
         let precomp = &offline_vals.precomp;
 
-        // RLWE reduced moduli
         let rlwe_q_prime_1 = params.get_q_prime_1();
         let rlwe_q_prime_2 = params.get_q_prime_2();
 
         let db_rows = 1 << (params.db_dim_1 + params.poly_len_log2);
         let db_cols = params.instances * params.poly_len;
+        let num_rlwe_outputs = db_cols / params.poly_len;
+        let gamma = params.poly_len;
 
+        let batch_size = first_dim_queries_packed.len();
         assert_eq!(first_dim_queries_packed[0].len(), params.db_rows_padded());
 
-        // Begin online computation
-
+        // Step 1: Matmul for all queries
         let first_pass = Instant::now();
-        debug!("Performing mul...");
-        let mut intermediate = AlignedMemory64::new(db_cols);
-        fast_batched_dot_product_avx512::<1, T>(
-            &params,
-            intermediate.as_mut_slice(),
-            first_dim_queries_packed[0],
-            db_rows,
-            self.db(),
-            db_rows,
-            db_cols,
-        );
+        debug!("Performing mul ({} queries)...", batch_size);
+        let mut all_intermediates = vec![vec![0u64; db_cols]; batch_size];
+        for (batch, query) in first_dim_queries_packed.iter().enumerate() {
+            let mut intermediate = AlignedMemory64::new(db_cols);
+            fast_batched_dot_product_avx512::<1, T>(
+                &params,
+                intermediate.as_mut_slice(),
+                query,
+                db_rows,
+                self.db(),
+                db_rows,
+                db_cols,
+            );
+            all_intermediates[batch] = intermediate.as_slice().to_vec();
+        }
         debug!("Done w mul...");
         let first_pass_time_ms = first_pass.elapsed().as_millis();
         if let Some(ref mut m) = measurement {
             m.online.first_pass_time_ms = first_pass_time_ms as usize;
         }
 
+        // Step 2: Packing dispatch per client
         let ring_packing = Instant::now();
-        let num_rlwe_outputs = db_cols / params.poly_len;
-        let packed = pack_many_lwes(
-            &params,
-            &prepacked_lwe,
-            &precomp,
-            intermediate.as_slice(),
-            num_rlwe_outputs,
-            &pack_pub_params_row_1s[0],
-            &y_constants,
-        );
-        debug!("Packed...");
+        let mut all_responses = Vec::with_capacity(batch_size);
+        for (batch, intermediate) in all_intermediates.iter().enumerate() {
+            let pk = &mut packing_keys[batch];
+
+            let packed_mod_switched = match offline_vals.packing_type {
+                PackingType::InspiRING => {
+                    let packing_params = offline_vals.packing_params.as_ref().unwrap();
+                    let precomp_inspir_vec = offline_vals.precomp_inspir_vec.as_ref().unwrap();
+
+                    let expand_start = Instant::now();
+                    pk.expand();
+                    debug!("pk.expand(): {} us", expand_start.elapsed().as_micros());
+                    let packed = pack_many_lwes_inspir_without_rotations(
+                        packing_params,
+                        precomp_inspir_vec,
+                        intermediate,
+                        pk,
+                        gamma,
+                    );
+
+                    let mut switched = Vec::with_capacity(packed.len());
+                    for p in packed.iter() {
+                        switched.push(p.switch_and_keep(rlwe_q_prime_1, rlwe_q_prime_2, gamma));
+                    }
+                    switched
+                },
+                _ => {
+                    let packed = pack_many_lwes(
+                        &params,
+                        &prepacked_lwe,
+                        &precomp,
+                        intermediate,
+                        num_rlwe_outputs,
+                        &pk.pack_pub_params_row_1s,
+                        &y_constants,
+                    );
+
+                    let mut switched = Vec::with_capacity(packed.len());
+                    for ct in packed.iter() {
+                        let res = ct.raw();
+                        switched.push(res.switch(rlwe_q_prime_1, rlwe_q_prime_2));
+                    }
+                    switched
+                },
+            };
+            all_responses.push(packed_mod_switched);
+        }
         if let Some(m) = measurement {
             m.online.ring_packing_time_ms = ring_packing.elapsed().as_millis() as usize;
         }
 
-        let mut packed_mod_switched = Vec::with_capacity(packed.len());
-        for ct in packed.iter() {
-            let res = ct.raw();
-            let res_switched = res.switch(rlwe_q_prime_1, rlwe_q_prime_2);
-            packed_mod_switched.push(res_switched);
-        }
-
-        vec![packed_mod_switched]
+        all_responses
     }
 
     #[cfg(feature = "cuda")]
@@ -1766,28 +1970,28 @@ where
         &self,
         first_dim_queries_packed: &[&[u64]],
         offline_vals: &OfflinePrecomputedValues<'a>,
-        pack_pub_params_row_1s: &[&[PolyMatrixNTT<'a>]],
+        packing_keys: &mut [PackingKeys<'a>],
         mut measurement: Option<&mut Measurement>,
     ) -> Vec<Vec<Vec<u8>>> {
-            assert!(self.ypir_params.is_simplepir);
+        assert!(self.ypir_params.is_simplepir);
         let params = self.params;
         let batch_size = first_dim_queries_packed.len();
-        
+
         let online_start = Instant::now();
-        
+
         let ctx = offline_vals.sp_cuda_context.as_ref()
             .expect("CUDA context not initialized");
-        
+
         // Flatten queries: batch_size * db_rows_padded
         let mut queries_flat: Vec<u64> = Vec::with_capacity(batch_size * self.db_rows_padded());
         for query in first_dim_queries_packed {
             queries_flat.extend_from_slice(query);
         }
-        
-        // Flatten pack_pub_params_row_1s: batch_size * ell * t_exp_left * poly_len
+
+        // Flatten CDKS pack_pub_params_row_1s
         let mut pub_params_flat: Vec<u64> = Vec::new();
-        for keys in pack_pub_params_row_1s {
-            for key in keys.iter() {
+        for pk in packing_keys.iter() {
+            for key in pk.pack_pub_params_row_1s.iter() {
                 let slc = key.as_slice();
                 for col in 0..params.t_exp_left {
                     let start = col * 2 * params.poly_len;
@@ -1799,108 +2003,21 @@ where
         let q_1_bits = (params.get_q_prime_2() as f64).log2().ceil() as usize;
         let q_2_bits = (params.get_q_prime_1() as f64).log2().ceil() as usize;
         let response_bytes_per_output = ((q_1_bits + q_2_bits) * params.poly_len + 7) / 8;
-        
+
         // Run GPU computation
         let result = ctx.compute_batch(&queries_flat, &pub_params_flat, response_bytes_per_output, batch_size);
-        
+
         let online_time_ms = online_start.elapsed().as_millis();
         debug!("SimplePIR GPU online time: {} ms", online_time_ms);
-        
+
         if let Some(ref mut m) = measurement {
             m.online.first_pass_time_ms = online_time_ms as usize;
         }
-        
+
         result
     }
 
-    /// Online computation for word-based SimplePIR (CPU path).
-    /// Takes raw u64 queries (NOT CRT-packed), does plain matmul in Z_{2^64},
-    /// modswitches to Z_Q, CRT-packs, and feeds into existing packing.
-    #[cfg(not(feature = "cuda"))]
-    pub fn perform_online_computation_simplepir_word(
-        &self,
-        word_queries: &[&[u64]],
-        offline_vals: &OfflinePrecomputedValues<'a>,
-        pack_pub_params_row_1s: &[&[PolyMatrixNTT<'a>]],
-        mut measurement: Option<&mut Measurement>,
-    ) -> Vec<Vec<Vec<u8>>> {
-        assert!(self.ypir_params.is_simplepir);
-
-        let params = self.params;
-        let q = params.modulus;
-        let y_constants = &offline_vals.y_constants;
-        let prepacked_lwe = &offline_vals.prepacked_lwe;
-        let precomp = &offline_vals.precomp;
-
-        let rlwe_q_prime_1 = params.get_q_prime_1();
-        let rlwe_q_prime_2 = params.get_q_prime_2();
-
-        let db_rows = 1 << (params.db_dim_1 + params.poly_len_log2);
-        let db_rows_padded = self.db_rows_padded();
-        let db_cols = params.instances * params.poly_len;
-        let num_rlwe_outputs = db_cols / params.poly_len;
-
-        let batch_size = word_queries.len();
-        assert_eq!(word_queries[0].len(), db_rows);
-
-        let first_pass = Instant::now();
-        debug!("Performing word matmul ({} queries)...", batch_size);
-
-        let db = self.db();
-
-        // Compute intermediate per batch item: matmul in Z_{2^64}, modswitch to Z_Q, CRT-pack
-        let mut all_intermediates = vec![vec![0u64; db_cols]; batch_size];
-        for (batch, query) in word_queries.iter().enumerate() {
-            let intermediate = &mut all_intermediates[batch];
-            for col in 0..db_cols {
-                let mut acc: u64 = 0;
-                for row in 0..db_rows {
-                    acc = acc.wrapping_add(
-                        query[row].wrapping_mul(db[col * db_rows_padded + row].to_u64()),
-                    );
-                }
-                let val_q = Self::modswitch_word_to_q(acc, q);
-                let crt0 = val_q % params.moduli[0];
-                let crt1 = val_q % params.moduli[1];
-                intermediate[col] = crt0 | (crt1 << 32);
-            }
-        }
-
-        debug!("Done w word matmul...");
-        let first_pass_time_ms = first_pass.elapsed().as_millis();
-        if let Some(ref mut m) = measurement {
-            m.online.first_pass_time_ms = first_pass_time_ms as usize;
-        }
-
-        let ring_packing = Instant::now();
-        let mut all_responses = Vec::with_capacity(batch_size);
-        for (batch, intermediate) in all_intermediates.iter().enumerate() {
-            let packed = pack_many_lwes(
-                &params,
-                &prepacked_lwe,
-                &precomp,
-                intermediate,
-                num_rlwe_outputs,
-                &pack_pub_params_row_1s[batch],
-                &y_constants,
-            );
-            debug!("Packed batch {}...", batch);
-
-            let mut packed_mod_switched = Vec::with_capacity(packed.len());
-            for ct in packed.iter() {
-                let res = ct.raw();
-                let res_switched = res.switch(rlwe_q_prime_1, rlwe_q_prime_2);
-                packed_mod_switched.push(res_switched);
-            }
-            all_responses.push(packed_mod_switched);
-        }
-        if let Some(m) = measurement {
-            m.online.ring_packing_time_ms = ring_packing.elapsed().as_millis() as usize;
-        }
-
-        all_responses
-    }
-
+    
     /// Online computation for word-based SimplePIR (GPU path).
     /// GEMM + modswitch + CRT-pack + packing all on GPU.
     #[cfg(feature = "cuda")]
@@ -1908,9 +2025,11 @@ where
         &self,
         word_queries: &[&[u64]],
         offline_vals: &OfflinePrecomputedValues<'a>,
-        pack_pub_params_row_1s: &[&[PolyMatrixNTT<'a>]],
+        packing_keys: &mut [PackingKeys<'a>],
         mut measurement: Option<&mut Measurement>,
     ) -> Vec<Vec<Vec<u8>>> {
+
+
         assert!(self.ypir_params.is_simplepir);
         let params = self.params;
         let batch_size = word_queries.len();
@@ -1927,10 +2046,10 @@ where
             queries_flat.extend_from_slice(query);
         }
 
-        // Flatten pack_pub_params_row_1s: batch_size * ell * t_exp_left * poly_len
+        // Flatten CDKS pack_pub_params_row_1s
         let mut pub_params_flat: Vec<u64> = Vec::new();
-        for keys in pack_pub_params_row_1s {
-            for key in keys.iter() {
+        for pk in packing_keys.iter() {
+            for key in pk.pack_pub_params_row_1s.iter() {
                 let slc = key.as_slice();
                 for col in 0..params.t_exp_left {
                     let start = col * 2 * params.poly_len;
@@ -1955,12 +2074,141 @@ where
         result
     }
 
+    /// Online computation for word-based SimplePIR (CPU path).
+    /// Takes raw u64 queries (NOT CRT-packed), does plain matmul in Z_{2^64},
+    /// modswitches to Z_Q, CRT-packs, and feeds into existing packing.
+    #[cfg(not(feature = "cuda"))]
+    pub fn perform_online_computation_simplepir_word(
+        &self,
+        word_queries: &[&[u64]],
+        offline_vals: &OfflinePrecomputedValues<'a>,
+        packing_keys: &mut [PackingKeys<'a>],
+        mut measurement: Option<&mut Measurement>,
+    ) -> Vec<Vec<Vec<u8>>> {
+        assert!(self.ypir_params.is_simplepir);
+
+        let params = self.params;
+        let q = params.modulus;
+        let y_constants = &offline_vals.y_constants;
+        let prepacked_lwe = &offline_vals.prepacked_lwe;
+        let precomp = &offline_vals.precomp;
+
+        let rlwe_q_prime_1 = params.get_q_prime_1();
+        let rlwe_q_prime_2 = params.get_q_prime_2();
+
+        let db_rows = 1 << (params.db_dim_1 + params.poly_len_log2);
+        let db_rows_padded = self.db_rows_padded();
+        let db_cols = params.instances * params.poly_len;
+        let num_rlwe_outputs = db_cols / params.poly_len;
+        let gamma = params.poly_len;
+
+        let batch_size = word_queries.len();
+        assert_eq!(word_queries[0].len(), db_rows);
+
+        let first_pass = Instant::now();
+        debug!("Performing word matmul ({} queries)...", batch_size);
+
+        let db = self.db();
+
+        // Compute intermediate per batch item: matmul in Z_{2^64}, modswitch to Z_Q
+        let mut all_intermediates = vec![vec![0u64; db_cols]; batch_size];
+        for (batch, query) in word_queries.iter().enumerate() {
+            let intermediate = &mut all_intermediates[batch];
+            for col in 0..db_cols {
+                let mut acc: u64 = 0;
+                for row in 0..db_rows {
+                    acc = acc.wrapping_add(
+                        query[row].wrapping_mul(db[col * db_rows_padded + row].to_u64()),
+                    );
+                }
+                intermediate[col] = Self::modswitch_word_to_q(acc, q);
+            }
+        }
+
+        // Pre-multiply all intermediate values by inv_N mod Q.
+        // CDKS packing multiplies b-values by N (lines 594-601 of packing.rs).
+        // N * inv_N = 1 mod Q, so the query noise is NOT amplified by N.
+        // This mirrors the ring path's pre-division by N in generate_query_impl.
+        // InspiRING does NOT pre-divide by N (its normalization happens via mod_inv_poly
+        // on the mask side during offline precomp), so skip this for InspiRING.
+        if offline_vals.packing_type != PackingType::InspiRING {
+            let inv_n = invert_uint_mod(params.poly_len as u64, q).unwrap();
+            for intermediate in all_intermediates.iter_mut() {
+                for val in intermediate.iter_mut() {
+                    *val = multiply_uint_mod(*val, inv_n, q);
+                }
+            }
+        }
+
+        debug!("Done w word matmul...");
+        let first_pass_time_ms = first_pass.elapsed().as_millis();
+        if let Some(ref mut m) = measurement {
+            m.online.first_pass_time_ms = first_pass_time_ms as usize;
+        }
+
+        let ring_packing = Instant::now();
+        let mut all_responses = Vec::with_capacity(batch_size);
+        for (batch, intermediate) in all_intermediates.iter().enumerate() {
+            let pk = &mut packing_keys[batch];
+
+            let packed_mod_switched = match offline_vals.packing_type {
+                PackingType::InspiRING => {
+                    let packing_params = offline_vals.packing_params.as_ref().unwrap();
+                    let precomp_inspir_vec = offline_vals.precomp_inspir_vec.as_ref().unwrap();
+
+                    let expand_start = Instant::now();
+                    pk.expand();
+                    debug!("pk.expand(): {} us", expand_start.elapsed().as_micros());
+                    let packed = pack_many_lwes_inspir_without_rotations(
+                        packing_params,
+                        precomp_inspir_vec,
+                        intermediate,
+                        pk,
+                        gamma,
+                    );
+
+                    let mut switched = Vec::with_capacity(packed.len());
+                    for p in packed.iter() {
+                        switched.push(p.switch_and_keep(rlwe_q_prime_1, rlwe_q_prime_2, gamma));
+                    }
+                    switched
+                },
+                _ => {
+                    let packed = pack_many_lwes(
+                        &params,
+                        &prepacked_lwe,
+                        &precomp,
+                        intermediate,
+                        num_rlwe_outputs,
+                        &pk.pack_pub_params_row_1s,
+                        &y_constants,
+                    );
+                    debug!("Packed batch {}...", batch);
+
+                    let mut switched = Vec::with_capacity(packed.len());
+                    for ct in packed.iter() {
+                        let res = ct.raw();
+                        switched.push(res.switch(rlwe_q_prime_1, rlwe_q_prime_2));
+                    }
+                    switched
+                },
+            };
+            all_responses.push(packed_mod_switched);
+        }
+        if let Some(m) = measurement {
+            m.online.ring_packing_time_ms = ring_packing.elapsed().as_millis() as usize;
+        }
+
+        all_responses
+    }
+
     #[cfg(not(feature = "cuda"))]
     pub fn perform_online_computation<const K: usize>(
         &self,
         offline_vals: &mut OfflinePrecomputedValues<'a>,
         first_dim_queries_packed: &[u32],
-        second_dim_queries: &[(&[u64], &[PolyMatrixNTT<'a>])],
+        second_dim_query_cols: &[&[u64]],
+        packing_keys: &mut [PackingKeys<'a>],
         mut measurement: Option<&mut Measurement>,
     ) -> Vec<Vec<Vec<u8>>> {
         // Set up some parameters
@@ -1980,35 +2228,25 @@ where
 
         // The number of bits represented by a plaintext RLWE coefficient
         let pt_bits = (params.pt_modulus as f64).log2().floor() as usize;
-        // assert_eq!(pt_bits, 16);
 
-        // The factor by which ciphertext values are bigger than plaintext values  // SID: calling this blowup_factor is misleading because it's comparing Zp to Zq' instead of Zn to Zq'
         let blowup_factor = lwe_q_prime_bits as f64 / pt_bits as f64;
         debug!("blowup_factor: {}", blowup_factor);
-        // assert!(blowup_factor.ceil() - blowup_factor >= 0.05);
 
         // The starting index of the final value (the '1' in lwe_params.n + 1)
-        // This is rounded to start on a pt_bits boundary
-        // used in DoublePIR packing step to differentiate the H2/c2*H1 from the T*A2/c2*T
         let special_offs =
             ((lwe_params.n * lwe_q_prime_bits) as f64 / pt_bits as f64).ceil() as usize;
 
         // Parameters for the second round (the "DoublePIR" round)
         let mut smaller_params = params.clone();
         smaller_params.db_dim_1 = params.db_dim_2;
-        // realistically, this is (d1+1)*K
-        // we always divide by poly_len so that we can pad to a power of 2 multiple of poly_len 
-        // so why is K the correct decomposition?
-        // well, we defintely are operating on p (2^15) as the plaintext space so we have to decompose our 2^32 vals into that
-        // before we decompose, we modulus switch down, so this is accurate
         smaller_params.db_dim_2 = ((blowup_factor * (lwe_params.n + 1) as f64)
             / params.poly_len as f64)
             .log2()
             .ceil() as usize;
 
         let out_rows = 1 << (smaller_params.db_dim_2 + params.poly_len_log2);
-        // number of blocks of RLWE that we pack
         let rho = 1 << smaller_params.db_dim_2;
+        let gamma = params.poly_len;
         assert_eq!(smaller_params.db_dim_1, params.db_dim_2);
         assert!(out_rows as f64 >= (blowup_factor * (lwe_params.n + 1) as f64));
 
@@ -2020,13 +2258,12 @@ where
         let prepacked_lwe = &offline_vals.prepacked_lwe;
         let fake_pack_pub_params = &offline_vals.fake_pack_pub_params;
         let precomp = &offline_vals.precomp;
+        let packing_type = offline_vals.packing_type;
 
         // Begin online computation
 
         let online_phase = Instant::now();
         let first_pass = Instant::now();
-        // memory bandwidth right here! but this op is 60% of the time, so we have to optimize E2E
-        // ex: (    "firstPassTimeMs": 148, "secondPassTimeMs": 31,"ringPackingTimeMs": 63,)
         let intermediate = self.lwe_multiply_batched_with_db_packed::<K>(first_dim_queries_packed);
         let simplepir_resp_bytes = intermediate.len() / K * (lwe_q_prime_bits as usize) / 8;
         debug!("simplepir_resp_bytes {} bytes", simplepir_resp_bytes);
@@ -2042,11 +2279,14 @@ where
         let mut second_pass_time_ms = 0;
         let mut ring_packing_time_ms = 0;
         let mut responses = Vec::new();
-        for (intermediate_chunk, (packed_query_col, pack_pub_params_row_1s)) in intermediate
+        for (batch, intermediate_chunk) in intermediate
             .as_slice()
             .chunks(db_cols)
-            .zip(second_dim_queries.iter())
+            .enumerate()
         {
+            let packed_query_col = second_dim_query_cols[batch];
+            let pk = &mut packing_keys[batch];
+
             let second_pass = Instant::now();
             let intermediate_cts_rescaled = intermediate_chunk
                 .iter()
@@ -2059,24 +2299,13 @@ where
             );
 
             let now = Instant::now();
-            // modify the smaller_server db to include the intermediate values
-            // let mut smaller_server_clone = smaller_server.clone();
             {
-                // remember, this is stored in 'transposed' form
-                // so it is out_cols x db_cols
                 let smaller_db_mut: &mut [u16] = smaller_server.db_mut();
                 for j in 0..db_cols {
-                    // new value to write into the db
                     let val = intermediate_cts_rescaled[j];
-
                     for m in 0..blowup_factor.ceil() as usize {
-                        // index in the transposed db
                         let out_idx = (special_offs + m) * db_cols + j;
-
-                        // part of the value to write into the db
                         let val_part = ((val >> (m * pt_bits)) & ((1 << pt_bits) - 1)) as u16;
-
-                        // assert_eq!(smaller_db_mut[out_idx], DoubleType::default());
                         smaller_db_mut[out_idx] = val_part;
                     }
                 }
@@ -2088,7 +2317,6 @@ where
                 let blowup_factor_ceil = blowup_factor.ceil() as usize;
 
                 let phase = Instant::now();
-                // analogue to the answer_hint_ring call that generated H2 originally, now we generated A2 * T
                 let secondary_hint = smaller_server.multiply_with_db_ring(
                     &pseudorandom_query_1,
                     special_offs..special_offs + blowup_factor_ceil,
@@ -2100,101 +2328,124 @@ where
                 );
                 assert_eq!(secondary_hint.len(), params.poly_len * blowup_factor_ceil);
 
-                // now we write all the 
                 for i in 0..params.poly_len {
                     for j in 0..blowup_factor_ceil {
-                        let inp_idx = i * blowup_factor_ceil + j;//agree
-                        let out_idx = i * out_rows + special_offs + j;//agree
-
-                        // assert_eq!(hint_1_combined[out_idx], 0); // we no longer clone for each query, just overwrite
+                        let inp_idx = i * blowup_factor_ceil + j;
+                        let out_idx = i * out_rows + special_offs + j;
                         hint_1_combined[out_idx] = secondary_hint[inp_idx];
                     }
                 }
             }
-        debug!("compute secondary hint in {} us", now.elapsed().as_micros());
+            debug!("compute secondary hint in {} us", now.elapsed().as_micros());
 
             assert_eq!(hint_1_combined.len(), params.poly_len * out_rows);
 
-            // computing c2* [H1.extend(T)]
             let response: AlignedMemory64 = smaller_server.answer_query(packed_query_col);
-            // the result is in Zq2 (2^56) space (CRT composed), raw form, just a constant polynomial
-            
+
             second_pass_time_ms += second_pass.elapsed().as_millis();
             let ring_packing = Instant::now();
             let now = Instant::now();
             assert_eq!(response.len(), 1 * out_rows);
 
-            // put all the new "random" RLWEs into NTT form (A2*decomp(T)) ~ 2
-            let mut excess_cts = Vec::with_capacity(blowup_factor.ceil() as usize);
-            for j in special_offs..special_offs + blowup_factor.ceil() as usize {
+            let blowup_factor_ceil = blowup_factor.ceil() as usize;
+
+            // Build excess CTs (body: query-dependent a-vectors at special_offs)
+            let mut excess_cts_raw = Vec::with_capacity(blowup_factor_ceil);
+            for j in special_offs..special_offs + blowup_factor_ceil {
                 let mut rlwe_ct = PolyMatrixRaw::zero(&params, 2, 1);
 
-                // 'a' vector
-                // put this in negacyclic order
                 let mut poly = Vec::new();
                 for k in 0..params.poly_len {
                     poly.push(hint_1_combined[k * out_rows + j]);
                 }
                 let nega = negacyclic_perm(&poly, 0, params.modulus);
-
                 rlwe_ct.get_poly_mut(0, 0).copy_from_slice(&nega);
+                // For InspiRING NoPacking body, we need the b-value in the CT
+                if packing_type == PackingType::InspiRING {
+                    rlwe_ct.get_poly_mut(1, 0)[0] = response[j];
+                }
+                // For CDKS, row 1 stays zero — b-values are handled via pack_many_lwes on the full response
 
-                excess_cts.push(rlwe_ct.ntt());
+                excess_cts_raw.push(rlwe_ct);
             }
-            debug!("in between: {} us", now.elapsed().as_micros());
+            debug!("excess cts: {} us", now.elapsed().as_micros());
 
-            // assert_eq!(pack_pub_params_row_1s[0].rows, 1);
+            // Dispatch: mask packing + body packing + modulus switching based on packing type
+            let packed_mod_switched = match packing_type {
+                PackingType::InspiRING => {
+                    let packing_params = offline_vals.packing_params.as_ref().unwrap();
+                    let precomp_inspir_vec = offline_vals.precomp_inspir_vec.as_ref().unwrap();
 
-            // this will run the full packing over the rho many squares, now we can get all the real responses
-            // but we don't have the precomputed for the A2*decomp(T) RLWEs, so we just work with their b's and add that part of the RLWE in later (other_packed)
-            let mut packed = pack_many_lwes(
-                &params,
-                &prepacked_lwe,
-                &precomp,
-                response.as_slice(),
-                rho,
-                &pack_pub_params_row_1s,
-                &y_constants,
-            );
+                    let expand_start = Instant::now();
+                    pk.expand();
+                    debug!("pk.expand(): {} us", expand_start.elapsed().as_micros());
 
-            let now = Instant::now();
-            let mut pack_pub_params = fake_pack_pub_params.clone();
-            for i in 0..pack_pub_params.len() {
-                let uncondensed = uncondense_matrix(params, &pack_pub_params_row_1s[i]);
-                pack_pub_params[i].copy_into(&uncondensed, 1, 0);
-            }
-            debug!("uncondense pub params: {} us", now.elapsed().as_micros());
-            let now = Instant::now();
-            let other_packed =
-                pack_using_single_with_offset(&params, &pack_pub_params, &excess_cts, special_offs);
-            
-            // wouldn't it be packed[-1], and then modulo special_offs % poly_len? 
-            // well it turns out with our parameter choices in YPIR, we always pack into a single RLWE!!
-            // the other_packed just rotated to that slot
-            add_into(&mut packed[0], &other_packed);
+                    // Mask packing: only the first special_offs b-values (offline-known a-vectors)
+                    let packed = pack_many_lwes_inspir_without_rotations(
+                        packing_params,
+                        precomp_inspir_vec,
+                        &response.as_slice()[..special_offs],
+                        pk,
+                        gamma,
+                    );
+                    let num_mask_cts = packed.len();
 
-            debug!(
-                "pack_using_single_with_offset: {} us",
-                now.elapsed().as_micros()
-            );
+                    // Modulus switch mask CTs with switch_and_keep (InspiRING packing)
+                    let now = Instant::now();
+                    let mut packed_mod_switched = Vec::with_capacity(num_mask_cts + excess_cts_raw.len());
+                    for ct in packed.iter() {
+                        packed_mod_switched.push(ct.switch_and_keep(rlwe_q_prime_1, rlwe_q_prime_2, gamma));
+                    }
+                    // Body: NoPacking — excess CTs use plain switch
+                    for ct in &excess_cts_raw {
+                        packed_mod_switched.push(ct.switch(rlwe_q_prime_1, rlwe_q_prime_2));
+                    }
+                    debug!("switching: {} us", now.elapsed().as_micros());
 
-            let now = Instant::now();
-            let mut packed_mod_switched = Vec::with_capacity(packed.len());
-            for (i, ct) in packed.iter().enumerate() {
-                let res = ct.raw();
+                    packed_mod_switched
+                },
+                _ => {
+                    // CDKS path: pack all response values, then add body via automorphisms
+                    let excess_cts_ntt: Vec<PolyMatrixNTT> = excess_cts_raw.iter()
+                        .map(|ct| ct.ntt())
+                        .collect();
 
-                let res_switched = res.switch(rlwe_q_prime_1, rlwe_q_prime_2);
-                packed_mod_switched.push(res_switched);
-            }
-            debug!("switching: {} us", now.elapsed().as_micros());
-            // debug!("Preprocessing pack in {} us", now.elapsed().as_micros());
-            // debug!("");
+                    let mut packed = pack_many_lwes(
+                        &params,
+                        &prepacked_lwe,
+                        &precomp,
+                        response.as_slice(),
+                        rho,
+                        &pk.pack_pub_params_row_1s,
+                        &y_constants,
+                    );
+
+                    let now = Instant::now();
+                    let mut pack_pub_params = fake_pack_pub_params.clone();
+                    for i in 0..pack_pub_params.len() {
+                        let uncondensed = uncondense_matrix(params, &pk.pack_pub_params_row_1s[i]);
+                        pack_pub_params[i].copy_into(&uncondensed, 1, 0);
+                    }
+                    debug!("uncondense pub params: {} us", now.elapsed().as_micros());
+                    let other_packed =
+                        pack_using_single_with_offset(&params, &pack_pub_params, &excess_cts_ntt, special_offs);
+
+                    add_into(&mut packed[0], &other_packed);
+                    debug!(
+                        "pack_using_single_with_offset: {} us",
+                        now.elapsed().as_micros()
+                    );
+
+                    let now = Instant::now();
+                    let packed_mod_switched = packed.into_iter()
+                        .map(|p| p.raw().switch(rlwe_q_prime_1, rlwe_q_prime_2))
+                        .collect::<Vec<_>>();
+                    debug!("switching: {} us", now.elapsed().as_micros());
+
+                    packed_mod_switched
+                },
+            };
             ring_packing_time_ms += ring_packing.elapsed().as_millis();
-
-            // packed is blowup_factor ring ct's
-            // these encode, contiguously [poly_len + 1, blowup_factor]
-            // (and some padding)
-            assert_eq!(packed.len(), rho);
 
             responses.push(packed_mod_switched);
         }
@@ -2218,7 +2469,8 @@ where
         &self,
         offline_vals: &mut OfflinePrecomputedValues<'a>,
         first_dim_queries_packed: &[u32],
-        second_dim_queries: &[(&[u64], &[PolyMatrixNTT<'a>])],
+        second_dim_query_cols: &[&[u64]],
+        packing_keys: &mut [PackingKeys<'a>],
         mut measurement: Option<&mut Measurement>,
     ) -> Vec<Vec<Vec<u8>>> {
         debug!("CUDA-accelerated online computation");
@@ -2231,13 +2483,14 @@ where
         let rlwe_q_prime_2 = params.get_q_prime_2();
 
 
-        let mut query_q2_batch = Vec::with_capacity(second_dim_queries.len() * db_cols);
-        let mut pack_pub_params_row_1s_batch: Vec<u64> = Vec::with_capacity(second_dim_queries.len() * params.poly_len_log2 * params.t_exp_left);
+        let mut query_q2_batch = Vec::with_capacity(second_dim_query_cols.len() * db_cols);
+        let mut pack_pub_params_row_1s_batch: Vec<u64> = Vec::with_capacity(second_dim_query_cols.len() * params.poly_len_log2 * params.t_exp_left);
 
-        for (packed_query_col, automorph_keys) in second_dim_queries.iter() {
+        for (i, packed_query_col) in second_dim_query_cols.iter().enumerate() {
             query_q2_batch.extend_from_slice(packed_query_col);
+            let automorph_keys = &packing_keys[i].pack_pub_params_row_1s;
             assert_eq!(automorph_keys.len(), params.poly_len_log2);
-            for key in *automorph_keys {
+            for key in automorph_keys {
                 let slc = key.as_slice();
                 for col in 0..params.t_exp_left {
                     let start = col * 2 * params.poly_len;
@@ -2246,7 +2499,7 @@ where
             }
         }
 
-        let batch_size = second_dim_queries.len();
+        let batch_size = second_dim_query_cols.len();
         
         let q_1_bits = (rlwe_q_prime_1 as f64).log2().ceil() as usize;
         let q_2_bits = (rlwe_q_prime_2 as f64).log2().ceil() as usize;

@@ -4,9 +4,14 @@ use std::time::Instant;
 
 use log::debug;
 
-use spiral_rs::{arith::*, gadget::*, ntt::*, params::*, poly::*};
+use spiral_rs::{arith::*, discrete_gaussian::*, gadget::*, ntt::*, number_theory::*, params::*, poly::*};
 
 use crate::server::Precomp;
+use crate::measurement::get_vec_pm_size_bytes;
+use crate::client::raw_generate_expansion_params;
+
+use rand::SeedableRng;
+use rand_chacha::ChaCha20Rng;
 
 use super::util::*;
 
@@ -1204,14 +1209,10 @@ pub fn automorph_ntt_tables(poly_len: usize, log2_poly_len: usize) -> Vec<Vec<us
 // if there's a collision (two slots with same value), retry with a new random poly
 pub fn generate_automorph_tables_brute_force(params: &Params) -> Vec<Vec<usize>> {
     let mut tables = Vec::new();
-    for i in (1..=params.poly_len_log2).rev() {
+    for t in (1..2 * params.poly_len).step_by(2) {
         let mut table_candidate = vec![0usize; params.poly_len];
 
-        // for 2048 balls and 2^28 bins, we will have a collision ~1% of the time
-        // so, we redo if necessary
         loop {
-            let t = (1 << i) + 1;
-
             let poly = PolyMatrixRaw::random(&params, 1, 1);
             let poly_ntt = poly.ntt();
 
@@ -1256,8 +1257,7 @@ pub fn apply_automorph_ntt_raw<'a>(
     tables: &[Vec<usize>],
 ) {
     let poly_len = params.poly_len;
-    // table_idx = log2(poly_len / (t - 1))
-    let table_idx = (poly_len / (t - 1)).trailing_zeros() as usize;
+    let table_idx = (t - 1) / 2;
     let table = &tables[table_idx];
 
     for i in 0..poly_len {
@@ -1288,6 +1288,7 @@ pub fn apply_automorph_ntt<'a>(
     }
     // res
 }
+
 
 #[cfg(test)]
 mod test {
@@ -1591,4 +1592,1213 @@ mod test {
             );
         }
     }
+}
+
+// ============================================================================
+// InspiRING Packing
+// ============================================================================
+
+pub fn gadget_invert_transposed_alloc<'a>(
+    inp: &PolyMatrixRaw<'a>,
+    num_digits: usize,
+) -> PolyMatrixRaw<'a> {
+    assert_eq!(inp.cols, 1);
+
+    let params = inp.params;
+    let mut out = PolyMatrixRaw::zero(&params, inp.rows, num_digits);
+
+    let num_elems = num_digits;
+    let bits_per = get_bits_per(params, num_elems);
+    let mask = (1u64 << bits_per) - 1;
+
+    for i in 0..inp.rows {
+        for z in 0..params.poly_len {
+            let val = inp.get_poly(i, 0)[z];
+            for k in 0..num_elems {
+                let bit_offs = k * bits_per;
+                let piece = if bit_offs >= 64 { 0 } else { (val >> bit_offs) & mask };
+                out.get_poly_mut(i, k)[z] = piece;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(target_feature = "avx512f")]
+pub fn fast_multiply_no_reduce_in_range(
+    params: &Params,
+    res: &mut PolyMatrixNTT,
+    a: &PolyMatrixNTT,
+    b: &PolyMatrixNTT,
+    begin_a: usize,
+    begin_b: usize,
+    length: usize,
+) {
+    assert_eq!(params.crt_count, 2);
+    assert_eq!(params.poly_len % 1024, 0);
+
+    unsafe {
+        let a_ptr = a.as_slice().as_ptr();
+        let b_ptr = b.as_slice().as_ptr();
+        let res_ptr = res.as_mut_slice().as_mut_ptr();
+        let pol_sz = params.poly_len;
+
+        for idx in (0..pol_sz).step_by(8) {
+            let mut sum_lo = _mm512_setzero_si512();
+            let mut sum_hi = _mm512_setzero_si512();
+            for k in 0..length {
+                let p_x = a_ptr.add((begin_a + k) * 2 * pol_sz + idx);
+                let p_y = b_ptr.add((begin_b + k) * 2 * pol_sz + idx);
+
+                let x = _mm512_load_si512(p_x as *const _);
+                let x_lo = x;
+                let x_hi = _mm512_srli_epi64(x, 32);
+                let y = _mm512_load_si512(p_y as *const _);
+                let y_lo = y;
+                let y_hi = _mm512_srli_epi64(y, 32);
+
+                let product_lo = _mm512_mul_epu32(x_lo, y_lo);
+                let product_hi = _mm512_mul_epu32(x_hi, y_hi);
+
+                sum_lo = _mm512_add_epi64(sum_lo, product_lo);
+                sum_hi = _mm512_add_epi64(sum_hi, product_hi);
+            }
+
+            let p_z = res_ptr.add(idx);
+            _mm512_store_si512(p_z as *mut _, sum_lo);
+            let p_z = res_ptr.add(pol_sz + idx);
+            _mm512_store_si512(p_z as *mut _, sum_hi);
+        }
+    }
+}
+
+#[cfg(not(target_feature = "avx512f"))]
+pub fn fast_multiply_no_reduce_in_range(
+    params: &Params,
+    res: &mut PolyMatrixNTT,
+    a: &PolyMatrixNTT,
+    b: &PolyMatrixNTT,
+    begin_a: usize,
+    begin_b: usize,
+    length: usize,
+) {
+    assert_eq!(params.crt_count, 2);
+
+    let a_slc = a.as_slice();
+    let b_slc = b.as_slice();
+    let res_slc = res.as_mut_slice();
+    let pol_sz = params.poly_len;
+
+    for idx in 0..pol_sz {
+        let mut sum_lo: u64 = 0;
+        let mut sum_hi: u64 = 0;
+        for k in 0..length {
+            let ax = a_slc[(begin_a + k) * 2 * pol_sz + idx];
+            let bx = b_slc[(begin_b + k) * 2 * pol_sz + idx];
+            sum_lo = sum_lo.wrapping_add((ax & 0xFFFFFFFF).wrapping_mul(bx & 0xFFFFFFFF));
+            sum_hi = sum_hi.wrapping_add((ax >> 32).wrapping_mul(bx >> 32));
+        }
+        res_slc[idx] = sum_lo;
+        res_slc[pol_sz + idx] = sum_hi;
+    }
+}
+
+#[cfg(target_feature = "avx512f")]
+pub fn multiply_poly_avx_in_range(_params: &Params, res: &mut [u64], a: &[u64], b: &[u64], begin_a: usize, begin_b: usize, length: usize) {
+    unsafe {
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+        let res_ptr = res.as_mut_ptr();
+        let poly_sz = _params.poly_len;
+
+        for i in (0..poly_sz).step_by(8) {
+            let p_z = res_ptr.add(i);
+            let mut sum = _mm512_setzero_si512();
+            for k in 0..length {
+                let p_x = a_ptr.add((begin_a + k) * poly_sz + i);
+                let p_y = b_ptr.add((begin_b + k) * poly_sz + i);
+
+                let x = _mm512_load_si512(p_x as *const _);
+                let y = _mm512_load_si512(p_y as *const _);
+
+                let product = _mm512_mul_epu32(x, y);
+                sum = _mm512_add_epi64(sum, product);
+            }
+            _mm512_store_si512(p_z as *mut _, sum);
+        }
+    }
+}
+
+#[cfg(not(target_feature = "avx512f"))]
+pub fn multiply_poly_avx_in_range(_params: &Params, res: &mut [u64], a: &[u64], b: &[u64], begin_a: usize, begin_b: usize, length: usize) {
+    let poly_sz = _params.poly_len;
+    for i in 0..poly_sz {
+        let mut sum: u64 = 0;
+        for k in 0..length {
+            let ax = a[(begin_a + k) * poly_sz + i];
+            let bx = b[(begin_b + k) * poly_sz + i];
+            sum = sum.wrapping_add((ax & 0xFFFFFFFF).wrapping_mul(bx & 0xFFFFFFFF));
+        }
+        res[i] = sum;
+    }
+}
+
+pub fn fast_multiply_no_reduce_in_range_generic(
+    params: &Params,
+    res: &mut PolyMatrixNTT,
+    a: &PolyMatrixNTT,
+    b: &PolyMatrixNTT,
+    begin_a: usize,
+    begin_b: usize,
+    length: usize,
+) {
+    if params.crt_count == 1 {
+        let a_ptr = a.as_slice();
+        let b_ptr = b.as_slice();
+        let res_ptr = res.as_mut_slice();
+        multiply_poly_avx_in_range(params, res_ptr, a_ptr, b_ptr, begin_a, begin_b, length);
+    } else {
+        fast_multiply_no_reduce_in_range(params, res, a, b, begin_a, begin_b, length);
+    }
+}
+
+pub fn apply_automorph_ntt_double<'a>(
+    params: &'a Params,
+    tables: &[Vec<usize>],
+    mat: &PolyMatrixNTT<'a>,
+    res_1: &mut PolyMatrixNTT<'a>,
+    res_2: &mut PolyMatrixNTT<'a>,
+    t: usize,
+) {
+    for i in 0..mat.rows {
+        for j in 0..mat.cols {
+            let poly = mat.get_poly(i, j);
+            let mut res_1_poly: Vec<&mut [u64]> = res_1.get_poly_mut(i, j).chunks_exact_mut(params.poly_len).collect();
+            let mut res_2_poly: Vec<&mut [u64]> = res_2.get_poly_mut(i, j).chunks_exact_mut(params.poly_len).collect();
+            for (index, chunk) in poly.chunks_exact(params.poly_len).enumerate()
+            {
+                apply_automorph_ntt_raw(params, chunk, res_1_poly[index], t, tables);
+                apply_automorph_ntt_raw(params, chunk, res_2_poly[index], 2*params.poly_len - t, tables);
+            }
+        }
+    }
+}
+
+// --- InspiRING Types ---
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PackingType {
+    NoPacking,
+    CDKS,
+    InspiRING,
+}
+
+impl Default for PackingType {
+    fn default() -> Self {
+        PackingType::CDKS
+    }
+}
+
+#[derive(Clone)]
+pub struct PackParams<'a> {
+    pub params: &'a Params,
+    pub num_to_pack: usize,
+    pub tables: Vec<Vec<usize>>,
+    pub gen_pows: Vec<usize>,
+    pub mod_inv_poly: PolyMatrixNTT<'a>,
+    pub monomial_ntts: Vec<PolyMatrixNTT<'a>>,
+    pub neg_monomial_ntts: Vec<PolyMatrixNTT<'a>>,
+}
+
+impl PackParams<'_> {
+    pub fn new<'a>(params: &'a Params, num_to_pack: usize) -> PackParams<'a> {
+        debug!("Starting tables");
+        let tables = generate_automorph_tables_brute_force(params);
+        debug!("Got tables");
+        let gen: usize =
+            if num_to_pack < params.poly_len { (2 * params.poly_len / num_to_pack) + 1 } else { 5 };
+
+        let mut gen_pows = Vec::new();
+        for i in 0..params.poly_len {
+            gen_pows
+                .push(exponentiate_uint_mod(gen as u64, i as u64, 2 * params.poly_len as u64)
+                    as usize);
+        }
+        let mod_inv = invert_uint_mod(num_to_pack as u64, params.modulus).unwrap();
+        let mod_inv_poly = single_poly(params, mod_inv).ntt();
+
+        let mut monomial_ntts = Vec::new();
+        let mut neg_monomial_ntts = Vec::new();
+        for j in 0..params.poly_len {
+            let mut monomial = PolyMatrixRaw::zero(params, 1, 1);
+            monomial.get_poly_mut(0, 0)[j] = 1;
+            let mono_ntt = monomial.ntt();
+            monomial_ntts.push(mono_ntt.clone());
+            neg_monomial_ntts.push(-&mono_ntt);
+        }
+        PackParams {
+            params,
+            num_to_pack,
+            tables,
+            gen_pows,
+            mod_inv_poly,
+            monomial_ntts,
+            neg_monomial_ntts,
+        }
+    }
+
+    pub fn new_fast<'a>(params: &'a Params, num_to_pack: usize) -> PackParams<'a> {
+        let gen: usize =
+            if num_to_pack < params.poly_len { (2 * params.poly_len / num_to_pack) + 1 } else { 5 };
+
+        let mut gen_pows = Vec::new();
+        for i in 0..params.poly_len {
+            gen_pows
+                .push(exponentiate_uint_mod(gen as u64, i as u64, 2 * params.poly_len as u64)
+                    as usize);
+        }
+
+        PackParams {
+            params,
+            num_to_pack,
+            tables: vec![],
+            gen_pows,
+            mod_inv_poly: PolyMatrixNTT::zero(&params, 1, 1),
+            monomial_ntts: vec![],
+            neg_monomial_ntts: vec![],
+        }
+    }
+
+    pub fn empty<'a>(params: &'a Params) -> PackParams<'_> {
+        PackParams {
+            params,
+            num_to_pack: 0,
+            tables: vec![],
+            gen_pows: vec![],
+            mod_inv_poly: PolyMatrixNTT::zero(&params, 1, 1),
+            monomial_ntts: vec![],
+            neg_monomial_ntts: vec![],
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct PrecompInsPIR<'a> {
+    pub a_hat: PolyMatrixRaw<'a>,
+    pub bold_t_condensed: PolyMatrixNTT<'a>,
+    pub bold_t_bar_condensed: PolyMatrixNTT<'a>,
+    pub bold_t_hat_condensed: PolyMatrixNTT<'a>,
+}
+
+pub fn generate_rotations<'a>(
+    packing_params: &PackParams<'a>,
+    to_rotate: &PolyMatrixNTT<'a>,
+) -> PolyMatrixNTT<'a> {
+    let params = packing_params.params;
+    let num_to_pack = packing_params.num_to_pack;
+    let tables = &packing_params.tables;
+    let gen_pows = &packing_params.gen_pows;
+
+    let mut rotations_all = PolyMatrixNTT::zero(&params, num_to_pack - 1, params.t_exp_left);
+    for i in 0..num_to_pack - 1 {
+        let mut rotated_w = PolyMatrixNTT::zero(&params, 1, params.t_exp_left);
+        apply_automorph_ntt(&params, &tables, &to_rotate, &mut rotated_w, gen_pows[i]);
+        rotations_all.copy_into(&rotated_w, i, 0);
+    }
+    rotations_all
+}
+
+pub fn generate_rotations_double<'a>(
+    packing_params: &PackParams<'a>,
+    to_rotate: &PolyMatrixNTT<'a>,
+) -> (PolyMatrixNTT<'a>, PolyMatrixNTT<'a>) {
+    let params = packing_params.params;
+    let num_to_pack = packing_params.num_to_pack;
+    let tables = &packing_params.tables;
+    let gen_pows = &packing_params.gen_pows;
+    assert_eq!(num_to_pack, params.poly_len);
+
+    let num_rotations = params.poly_len / 2 - 1;
+
+    let mut rotations_all = PolyMatrixNTT::zero(&params, num_rotations, params.t_exp_left);
+    let mut rotations_bar_all = PolyMatrixNTT::zero(&params, num_rotations, params.t_exp_left);
+    for i in 0..num_rotations {
+        let mut rotated_w_1 = PolyMatrixNTT::zero(&params, 1, params.t_exp_left);
+        let mut rotated_w_2 = PolyMatrixNTT::zero(&params, 1, params.t_exp_left);
+        apply_automorph_ntt_double(&params, &tables, &to_rotate, &mut rotated_w_1, &mut rotated_w_2, gen_pows[i]);
+        rotations_all.copy_into(&rotated_w_1, i, 0);
+        rotations_bar_all.copy_into(&rotated_w_2, i, 0);
+    }
+    (rotations_all, rotations_bar_all)
+}
+
+// --- Offline/Online Packing Keys ---
+
+#[derive(Clone)]
+pub struct OfflinePackingKeys<'a> {
+    pub full_key: bool,
+    pub w_seed: [u8; 32],
+    pub v_seed: [u8; 32],
+    pub w_mask: Option<PolyMatrixNTT<'a>>,
+    pub v_mask: Option<PolyMatrixNTT<'a>>,
+    pub w_all: Option<PolyMatrixNTT<'a>>,
+    pub w_bar_all: Option<PolyMatrixNTT<'a>>,
+}
+
+impl OfflinePackingKeys<'_> {
+    pub fn init_empty<'a>() -> OfflinePackingKeys<'a> {
+        OfflinePackingKeys {
+            full_key: false,
+            w_seed: [0; 32],
+            v_seed: [0; 32],
+            w_mask: None,
+            w_all: None,
+            w_bar_all: None,
+            v_mask: None,
+        }
+    }
+
+    pub fn init<'a>(packing_params: &PackParams<'a>, w_seed: [u8; 32]) -> OfflinePackingKeys<'a> {
+        let w_mask = PolyMatrixNTT::random_rng(
+            &packing_params.params,
+            1,
+            packing_params.params.t_exp_left,
+            &mut ChaCha20Rng::from_seed(w_seed),
+        );
+        let x = generate_rotations(&packing_params, &w_mask);
+        let w_all = Some(x);
+        OfflinePackingKeys {
+            full_key: false,
+            w_seed,
+            v_seed: [0; 32],
+            w_mask: Some(w_mask),
+            w_all,
+            w_bar_all: None,
+            v_mask: None,
+        }
+    }
+
+    pub fn init_full<'a>(packing_params: &PackParams<'a>, w_seed: [u8; 32], v_seed: [u8; 32]) -> OfflinePackingKeys<'a> {
+        let w_mask = PolyMatrixNTT::random_rng(
+            &packing_params.params,
+            1,
+            packing_params.params.t_exp_left,
+            &mut ChaCha20Rng::from_seed(w_seed),
+        );
+        let v_mask = PolyMatrixNTT::random_rng(
+            &packing_params.params,
+            1,
+            packing_params.params.t_exp_left,
+            &mut ChaCha20Rng::from_seed(v_seed),
+        );
+
+        let (x, y) = generate_rotations_double(&packing_params, &w_mask);
+        let (w_all, w_bar_all) = (Some(x), Some(y));
+
+        OfflinePackingKeys {
+            full_key: true,
+            w_seed,
+            v_seed,
+            w_mask: Some(w_mask),
+            w_all,
+            w_bar_all,
+            v_mask: Some(v_mask),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct PackingKeys<'a> {
+    pub packing_type: PackingType,
+    // InspiRING fields
+    pub full_key: bool,
+    pub packing_params: Option<PackParams<'a>>,
+    pub y_body: Option<PolyMatrixNTT<'a>>,
+    pub z_body: Option<PolyMatrixNTT<'a>>,
+    pub y_body_condensed: Option<PolyMatrixNTT<'a>>,
+    pub z_body_condensed: Option<PolyMatrixNTT<'a>>,
+    pub expanded: bool,
+    pub y_all_condensed: Option<PolyMatrixNTT<'a>>,
+    pub y_bar_all_condensed: Option<PolyMatrixNTT<'a>>,
+    // CDKS fields
+    pub params: Option<Params>,
+    pub pack_pub_params_row_1s: Vec<PolyMatrixNTT<'a>>,
+    pub fake_pack_pub_params: Vec<PolyMatrixNTT<'a>>,
+}
+
+impl PackingKeys<'_> {
+    pub fn init_full<'a>(
+        packing_params: &PackParams<'a>,
+        sk_reg: &PolyMatrixRaw<'a>,
+        w_seed: [u8; 32],
+        v_seed: [u8; 32],
+    ) -> PackingKeys<'a> {
+        let w_mask: PolyMatrixNTT<'_> = PolyMatrixNTT::random_rng(
+            &packing_params.params,
+            1,
+            packing_params.params.t_exp_left,
+            &mut ChaCha20Rng::from_seed(w_seed),
+        );
+        let v_mask: PolyMatrixNTT<'_> = PolyMatrixNTT::random_rng(
+            &packing_params.params,
+            1,
+            packing_params.params.t_exp_left,
+            &mut ChaCha20Rng::from_seed(v_seed),
+        );
+        let y_body = generate_ksk_body(
+            &packing_params.params,
+            &sk_reg,
+            packing_params.gen_pows[1],
+            &w_mask,
+            &mut ChaCha20Rng::from_entropy(),
+        );
+        let z_body = generate_ksk_body(
+            &packing_params.params,
+            &sk_reg,
+            2 * packing_params.params.poly_len - 1,
+            &v_mask,
+            &mut ChaCha20Rng::from_entropy(),
+        );
+        let y_body_condensed = condense_matrix(&packing_params.params, &y_body);
+        let z_body_condensed = condense_matrix(&packing_params.params, &z_body);
+        PackingKeys {
+            packing_type: PackingType::InspiRING,
+            packing_params: Some(packing_params.clone()),
+            full_key: true,
+            y_body: Some(y_body),
+            z_body: Some(z_body),
+            y_body_condensed: Some(y_body_condensed),
+            z_body_condensed: Some(z_body_condensed),
+            expanded: false,
+            y_all_condensed: None,
+            y_bar_all_condensed: None,
+            params: None,
+            pack_pub_params_row_1s: vec![],
+            fake_pack_pub_params: vec![],
+        }
+    }
+
+    pub fn init<'a>(
+        packing_params: &PackParams<'a>,
+        sk_reg: &PolyMatrixRaw<'a>,
+        w_seed: [u8; 32],
+    ) -> PackingKeys<'a> {
+        let w_mask: PolyMatrixNTT<'_> = PolyMatrixNTT::random_rng(
+            &packing_params.params,
+            1,
+            packing_params.params.t_exp_left,
+            &mut ChaCha20Rng::from_seed(w_seed),
+        );
+        let y_body = generate_ksk_body(
+            &packing_params.params,
+            &sk_reg,
+            packing_params.gen_pows[1],
+            &w_mask,
+            &mut ChaCha20Rng::from_entropy(),
+        );
+        let y_body_condensed = condense_matrix(&packing_params.params, &y_body);
+        PackingKeys {
+            packing_type: PackingType::InspiRING,
+            packing_params: Some(packing_params.clone()),
+            full_key: false,
+            y_body: Some(y_body),
+            z_body: None,
+            y_body_condensed: Some(y_body_condensed),
+            z_body_condensed: None,
+            expanded: false,
+            y_all_condensed: None,
+            y_bar_all_condensed: None,
+            params: None,
+            pack_pub_params_row_1s: vec![],
+            fake_pack_pub_params: vec![],
+        }
+    }
+
+    pub fn init_cdks<'a>(
+        params: &'a Params,
+        sk_reg: &PolyMatrixRaw<'a>,
+        static_seed_2: [u8; 32],
+    ) -> PackingKeys<'a> {
+        let pack_pub_params = raw_generate_expansion_params(
+            &params,
+            &sk_reg,
+            params.poly_len_log2,
+            params.t_exp_left,
+            &mut ChaCha20Rng::from_entropy(),
+            &mut ChaCha20Rng::from_seed(static_seed_2),
+        );
+        let mut pack_pub_params_row_1s = pack_pub_params.to_vec();
+        for i in 0..pack_pub_params.len() {
+            pack_pub_params_row_1s[i] =
+                pack_pub_params[i].submatrix(1, 0, 1, pack_pub_params[i].cols);
+            pack_pub_params_row_1s[i] =
+                condense_matrix(&params, &pack_pub_params_row_1s[i]);
+        }
+
+        let mut fake_pack_pub_params = pack_pub_params.clone();
+        for i in 0..pack_pub_params.len() {
+            for col in 0..pack_pub_params[i].cols {
+                fake_pack_pub_params[i].get_poly_mut(1, col).fill(0);
+            }
+        }
+
+        PackingKeys {
+            packing_type: PackingType::CDKS,
+            packing_params: None,
+            full_key: false,
+            y_body: None,
+            z_body: None,
+            y_body_condensed: None,
+            z_body_condensed: None,
+            expanded: false,
+            y_all_condensed: None,
+            y_bar_all_condensed: None,
+            params: Some(params.clone()),
+            pack_pub_params_row_1s,
+            fake_pack_pub_params,
+        }
+    }
+
+    /// Create CDKS PackingKeys from pre-computed condensed row_1s.
+    pub fn init_cdks_from_keys<'a>(
+        params: Params,
+        pack_pub_params_row_1s: Vec<PolyMatrixNTT<'a>>,
+    ) -> PackingKeys<'a> {
+        PackingKeys {
+            packing_type: PackingType::CDKS,
+            packing_params: None,
+            full_key: false,
+            y_body: None,
+            z_body: None,
+            y_body_condensed: None,
+            z_body_condensed: None,
+            expanded: false,
+            y_all_condensed: None,
+            y_bar_all_condensed: None,
+            params: Some(params),
+            pack_pub_params_row_1s,
+            fake_pack_pub_params: vec![],
+        }
+    }
+
+    pub fn get_gamma(&self) -> usize {
+        if self.packing_type == PackingType::InspiRING {
+            self.packing_params.as_ref().unwrap().num_to_pack
+        } else {
+            self.params.as_ref().unwrap().poly_len
+        }
+    }
+
+    pub fn get_size_bytes(&self) -> usize {
+        if self.packing_type == PackingType::InspiRING {
+            if self.full_key {
+                get_vec_pm_size_bytes(&vec![self.y_body.as_ref().unwrap().clone()])
+                    + get_vec_pm_size_bytes(&vec![self.z_body.as_ref().unwrap().clone()])
+            } else {
+                get_vec_pm_size_bytes(&vec![self.y_body.as_ref().unwrap().clone()])
+            }
+        } else {
+            get_vec_pm_size_bytes(&self.pack_pub_params_row_1s)
+        }
+    }
+
+    pub fn expand(&mut self) {
+        assert_eq!(self.packing_type, PackingType::InspiRING);
+        if !self.expanded {
+            let packing_params = self.packing_params.as_ref().unwrap();
+            if self.full_key {
+                let (x, y) = generate_rotations_double(&packing_params, &self.y_body_condensed.as_ref().unwrap());
+                (self.y_all_condensed, self.y_bar_all_condensed) = (Some(x), Some(y));
+            } else {
+                let x = generate_rotations(&packing_params, &self.y_body_condensed.as_ref().unwrap());
+                self.y_all_condensed = Some(x);
+            }
+            self.expanded = true;
+        }
+    }
+}
+
+// --- Key Switching Key Body ---
+
+pub fn generate_ksk_body<'a>(
+    params: &'a Params,
+    sk_reg: &PolyMatrixRaw<'a>,
+    gen: usize,
+    mask: &PolyMatrixNTT<'a>,
+    rng: &mut ChaCha20Rng,
+) -> PolyMatrixNTT<'a> {
+    let tau_sk_reg = automorph_alloc(&sk_reg, gen);
+    let minus_s_times_mask = &sk_reg.ntt() * &(-mask);
+    let error_poly = PolyMatrixRaw::noise(
+        &params,
+        1,
+        params.t_exp_left,
+        &DiscreteGaussian::init(params.noise_width),
+        rng,
+    );
+    let g_exp_ntt = build_gadget(&params, 1, params.t_exp_left).ntt();
+    let ksk = &tau_sk_reg.ntt() * &g_exp_ntt;
+    let body = &minus_s_times_mask + &error_poly.ntt();
+    let result = &body + &ksk;
+    result
+}
+
+// --- Core InspiRING Packing Functions ---
+
+pub fn full_packing_with_preprocessing_offline<'a>(
+    packing_params: &PackParams<'a>,
+    w_all: &PolyMatrixNTT<'a>,
+    w_bar_all: &PolyMatrixNTT<'a>,
+    v_mask: &PolyMatrixNTT<'a>,
+    a_ct_tilde: &Vec<PolyMatrixNTT<'a>>,
+) -> PrecompInsPIR<'a> {
+    let params = packing_params.params;
+    let tables = &packing_params.tables;
+    let gen_pows = &packing_params.gen_pows;
+    let monomial_ntts = &packing_params.monomial_ntts;
+    let neg_monomial_ntts = &packing_params.neg_monomial_ntts;
+    let mod_inv_poly = &packing_params.mod_inv_poly;
+
+    let num_to_pack = packing_params.num_to_pack;
+    assert_eq!(num_to_pack, params.poly_len);
+    let num_to_pack_half = num_to_pack >> 1;
+
+    let non_zeros = a_ct_tilde.len();
+
+    let mut r_all = Vec::with_capacity(num_to_pack_half);
+    let mut r_bar_all = Vec::with_capacity(num_to_pack_half);
+    for i in 0..num_to_pack_half {
+        let mut r_pow_i = PolyMatrixNTT::zero(&params, 1, 1);
+        let mut r_bar_pow_i = PolyMatrixNTT::zero(&params, 1, 1);
+        for j in 0..non_zeros {
+            let pol2 = a_ct_tilde[j].get_poly(0, 0);
+
+            let res_poly = r_pow_i.get_poly_mut(0, 0);
+            let index = (j * packing_params.gen_pows[(params.poly_len - i) % params.poly_len])
+                % (2 * params.poly_len);
+            let pol1 = if index < params.poly_len {
+                monomial_ntts[index % params.poly_len].get_poly(0, 0)
+            } else {
+                neg_monomial_ntts[index % params.poly_len].get_poly(0, 0)
+            };
+            multiply_add_poly_avx(&params, res_poly, pol1, pol2);
+
+            let res_poly = r_bar_pow_i.get_poly_mut(0, 0);
+            let index = (2 * params.poly_len
+                - (j * packing_params.gen_pows[(params.poly_len - i) % params.poly_len]))
+                % (2 * params.poly_len);
+            let pol1 = if index < params.poly_len {
+                monomial_ntts[index % params.poly_len].get_poly(0, 0)
+            } else {
+                neg_monomial_ntts[index % params.poly_len].get_poly(0, 0)
+            };
+            multiply_add_poly_avx(&params, res_poly, pol1, pol2);
+            let reduction_steps = 1 << (64 - 2 * params.q2_bits - 1);
+            if (j + 1) % reduction_steps == 0 {
+                fast_reduce(&mut r_pow_i);
+                fast_reduce(&mut r_bar_pow_i);
+            }
+        }
+        fast_reduce(&mut r_pow_i);
+        fast_reduce(&mut r_bar_pow_i);
+
+        let mut r_pow_i_mul = PolyMatrixNTT::zero(&params, 1, 1);
+        let mut r_bar_pow_i_mul = PolyMatrixNTT::zero(&params, 1, 1);
+        scalar_multiply(&mut r_pow_i_mul, &mod_inv_poly, &r_pow_i);
+        scalar_multiply(&mut r_bar_pow_i_mul, &mod_inv_poly, &r_bar_pow_i);
+
+        let mut r_pow_i_mul_rotated = PolyMatrixNTT::zero(&params, 1, 1);
+        let mut r_bar_pow_i_mul_rotated = PolyMatrixNTT::zero(&params, 1, 1);
+        apply_automorph_ntt(&params, &tables, &r_pow_i_mul, &mut r_pow_i_mul_rotated, gen_pows[i]);
+        apply_automorph_ntt(
+            &params,
+            &tables,
+            &r_bar_pow_i_mul,
+            &mut r_bar_pow_i_mul_rotated,
+            2 * params.poly_len - gen_pows[i],
+        );
+
+        r_all.push(r_pow_i_mul_rotated);
+        r_bar_all.push(r_bar_pow_i_mul_rotated);
+    }
+
+    let mut bold_t_g = PolyMatrixNTT::zero(&params, num_to_pack_half - 1, params.t_exp_left);
+    let mut bold_t_bar_g = PolyMatrixNTT::zero(&params, num_to_pack_half - 1, params.t_exp_left);
+
+    for i in (0..num_to_pack_half - 1).rev() {
+        let gadget = gadget_invert_transposed_alloc(&r_all[i + 1].raw(), params.t_exp_left).ntt();
+        bold_t_g.copy_into(&gadget, i, 0);
+
+        let mut res = PolyMatrixNTT::zero(&params, 1, 1);
+        let poly_res = res.get_poly_mut(0, 0);
+        for k in 0..params.t_exp_left {
+            let poly1 = w_all.get_poly(i, k);
+            let poly2 = bold_t_g.get_poly(i, k);
+            multiply_add_poly_avx(params, poly_res, poly1, poly2);
+        }
+        fast_add_into(&mut r_all[i], &res);
+
+        let gadget = gadget_invert_transposed_alloc(&r_bar_all[i + 1].raw(), params.t_exp_left).ntt();
+        bold_t_bar_g.copy_into(&gadget, i, 0);
+
+        let mut res = PolyMatrixNTT::zero(&params, 1, 1);
+        let poly_res = res.get_poly_mut(0, 0);
+        for k in 0..params.t_exp_left {
+            let poly1 = w_bar_all.get_poly(i, k);
+            let poly2 = bold_t_bar_g.get_poly(i, k);
+            multiply_add_poly_avx(params, poly_res, poly1, poly2);
+        }
+        fast_add_into(&mut r_bar_all[i], &res);
+    }
+
+    let bold_t_hat = gadget_invert_transposed_alloc(&r_bar_all[0].raw(), params.t_exp_left).ntt();
+
+    let mut res = PolyMatrixNTT::zero(&params, 1, 1);
+    let poly_res = res.get_poly_mut(0, 0);
+    for k in 0..params.t_exp_left {
+        let poly1 = v_mask.get_poly(0, k);
+        let poly2 = bold_t_hat.get_poly(0, k);
+        multiply_add_poly_avx(params, poly_res, poly1, poly2);
+    }
+    fast_add_into(&mut r_all[0], &res);
+
+    PrecompInsPIR {
+        a_hat: r_all[0].raw(),
+        bold_t_condensed: condense_matrix(&params, &bold_t_g),
+        bold_t_bar_condensed: condense_matrix(&params, &bold_t_bar_g),
+        bold_t_hat_condensed: condense_matrix(&params, &bold_t_hat),
+    }
+}
+
+pub fn full_packing_with_preprocessing_offline_without_rotations<'a>(
+    packing_params: &PackParams<'a>,
+    w_all: &PolyMatrixNTT<'a>,
+    w_bar_all: &PolyMatrixNTT<'a>,
+    v_mask: &PolyMatrixNTT<'a>,
+    a_ct_tilde: &Vec<PolyMatrixNTT<'a>>,
+) -> PrecompInsPIR<'a> {
+    let params = packing_params.params;
+    let tables = &packing_params.tables;
+    let gen_pows = &packing_params.gen_pows;
+    let monomial_ntts = &packing_params.monomial_ntts;
+    let neg_monomial_ntts = &packing_params.neg_monomial_ntts;
+    let mod_inv_poly = &packing_params.mod_inv_poly;
+
+    let num_to_pack = packing_params.num_to_pack;
+    assert_eq!(num_to_pack, params.poly_len);
+    let num_to_pack_half = num_to_pack >> 1;
+
+    let non_zeros = a_ct_tilde.len();
+
+    let mut r_all = Vec::new();
+    let mut r_bar_all = Vec::new();
+    for i in 0..num_to_pack_half {
+        let mut r_pow_i = PolyMatrixNTT::zero(&params, 1, 1);
+        let mut r_bar_pow_i = PolyMatrixNTT::zero(&params, 1, 1);
+        for j in 0..non_zeros {
+            let pol2 = a_ct_tilde[j].get_poly(0, 0);
+
+            let res_poly = r_pow_i.get_poly_mut(0, 0);
+            let index = (j * packing_params.gen_pows[(params.poly_len - i) % params.poly_len])
+                % (2 * params.poly_len);
+            let pol1 = if index < params.poly_len {
+                monomial_ntts[index % params.poly_len].get_poly(0, 0)
+            } else {
+                neg_monomial_ntts[index % params.poly_len].get_poly(0, 0)
+            };
+            multiply_add_poly_avx(&params, res_poly, pol1, pol2);
+
+            let res_poly = r_bar_pow_i.get_poly_mut(0, 0);
+            let index = (2 * params.poly_len
+                - (j * packing_params.gen_pows[(params.poly_len - i) % params.poly_len]))
+                % (2 * params.poly_len);
+            let pol1 = if index < params.poly_len {
+                monomial_ntts[index % params.poly_len].get_poly(0, 0)
+            } else {
+                neg_monomial_ntts[index % params.poly_len].get_poly(0, 0)
+            };
+            multiply_add_poly_avx(&params, res_poly, pol1, pol2);
+            let reduction_steps = 1 << (64 - 2 * params.q2_bits - 1);
+            if (j + 1) % reduction_steps == 0 {
+                fast_reduce(&mut r_pow_i);
+                fast_reduce(&mut r_bar_pow_i);
+            }
+        }
+        fast_reduce(&mut r_pow_i);
+        fast_reduce(&mut r_bar_pow_i);
+
+        let mut r_pow_i_mul = PolyMatrixNTT::zero(&params, 1, 1);
+        let mut r_bar_pow_i_mul = PolyMatrixNTT::zero(&params, 1, 1);
+        scalar_multiply(&mut r_pow_i_mul, &mod_inv_poly, &r_pow_i);
+        scalar_multiply(&mut r_bar_pow_i_mul, &mod_inv_poly, &r_bar_pow_i);
+
+        let mut r_pow_i_mul_rotated = PolyMatrixNTT::zero(&params, 1, 1);
+        let mut r_bar_pow_i_mul_rotated = PolyMatrixNTT::zero(&params, 1, 1);
+        apply_automorph_ntt(&params, &tables, &r_pow_i_mul, &mut r_pow_i_mul_rotated, gen_pows[i]);
+        apply_automorph_ntt(
+            &params,
+            &tables,
+            &r_bar_pow_i_mul,
+            &mut r_bar_pow_i_mul_rotated,
+            2 * params.poly_len - gen_pows[i],
+        );
+
+        r_all.push(r_pow_i_mul_rotated.raw());
+        r_bar_all.push(r_bar_pow_i_mul_rotated.raw());
+    }
+
+    let mut bold_t_g = PolyMatrixNTT::zero(&params, num_to_pack_half - 1, params.t_exp_left);
+    let mut bold_t_bar_g = PolyMatrixNTT::zero(&params, num_to_pack_half - 1, params.t_exp_left);
+    let mut bold_t_g_prime = PolyMatrixNTT::zero(&params, num_to_pack_half - 1, params.t_exp_left);
+    let mut bold_t_bar_g_prime = PolyMatrixNTT::zero(&params, num_to_pack_half - 1, params.t_exp_left);
+
+    for i in (0..num_to_pack_half - 1).rev() {
+        let gadget = gadget_invert_transposed_alloc(&r_all[i + 1], params.t_exp_left).ntt();
+        bold_t_g.copy_into(&gadget, i, 0);
+
+        let mut rotated_gadget = PolyMatrixNTT::zero(&params, 1, params.t_exp_left);
+        apply_automorph_ntt(&params, &packing_params.tables, &gadget, &mut rotated_gadget, gen_pows[(params.poly_len - i) % params.poly_len]);
+        bold_t_g_prime.copy_into(&rotated_gadget, i, 0);
+
+        let mut res = PolyMatrixNTT::zero(&params, 1, 1);
+        let poly_res = res.get_poly_mut(0, 0);
+        for k in 0..params.t_exp_left {
+            let poly1 = w_all.get_poly(i, k);
+            let poly2 = bold_t_g.get_poly(i, k);
+            multiply_add_poly_avx(params, poly_res, poly1, poly2);
+        }
+        fast_reduce(&mut res);
+        r_all[i] = &r_all[i] + &res.raw();
+
+        let gadget = gadget_invert_transposed_alloc(&r_bar_all[i + 1], params.t_exp_left).ntt();
+        bold_t_bar_g.copy_into(&gadget, i, 0);
+
+        let mut rotated_gadget = PolyMatrixNTT::zero(&params, 1, params.t_exp_left);
+        apply_automorph_ntt(&params, &packing_params.tables, &gadget, &mut rotated_gadget, 2*params.poly_len - gen_pows[(params.poly_len - i) % params.poly_len]);
+        bold_t_bar_g_prime.copy_into(&rotated_gadget, i, 0);
+
+        let mut res = PolyMatrixNTT::zero(&params, 1, 1);
+        let poly_res = res.get_poly_mut(0, 0);
+        for k in 0..params.t_exp_left {
+            let poly1 = w_bar_all.get_poly(i, k);
+            let poly2 = bold_t_bar_g.get_poly(i, k);
+            multiply_add_poly_avx(params, poly_res, poly1, poly2);
+        }
+        fast_reduce(&mut res);
+        r_bar_all[i] = &r_bar_all[i] + &res.raw();
+    }
+
+    let bold_t_hat = gadget_invert_transposed_alloc(&r_bar_all[0], params.t_exp_left).ntt();
+
+    let mut res = PolyMatrixNTT::zero(&params, 1, 1);
+    let poly_res = res.get_poly_mut(0, 0);
+    for k in 0..params.t_exp_left {
+        let poly1 = v_mask.get_poly(0, k);
+        let poly2 = bold_t_hat.get_poly(0, k);
+        multiply_add_poly_avx(params, poly_res, poly1, poly2);
+    }
+    fast_reduce(&mut res);
+    r_all[0] = &r_all[0] + &res.raw();
+
+    PrecompInsPIR {
+        a_hat: r_all[0].clone(),
+        bold_t_condensed: condense_matrix(&params, &bold_t_g_prime),
+        bold_t_bar_condensed: condense_matrix(&params, &bold_t_bar_g_prime),
+        bold_t_hat_condensed: condense_matrix(&params, &bold_t_hat),
+    }
+}
+
+pub fn full_packing_with_preprocessing_online<'a>(
+    packing_params: &'a PackParams<'a>,
+    precomp_inspiring: &PrecompInsPIR<'a>,
+    b_poly: &PolyMatrixRaw<'a>,
+    y_all_condensed: &PolyMatrixNTT<'a>,
+    y_bar_all_condensed: &PolyMatrixNTT<'a>,
+    z_body_condensed: &PolyMatrixNTT<'a>,
+) -> PolyMatrixRaw<'a> {
+    let params = packing_params.params;
+
+    let a_hat = &precomp_inspiring.a_hat;
+    let bold_t_condensed = &precomp_inspiring.bold_t_condensed;
+    let bold_t_bar_condensed = &precomp_inspiring.bold_t_bar_condensed;
+    let bold_t_hat_condensed = &precomp_inspiring.bold_t_hat_condensed;
+
+    let now = Instant::now();
+
+    let num_to_pack = params.poly_len;
+    let num_to_pack_half = num_to_pack >> 1;
+
+    let mut sum_poly = PolyMatrixNTT::zero(&params, 1, 1);
+
+    let addition_capacity = 1 << (64 - 2 * params.q2_bits - 1);
+    let mut num_added = 0;
+
+    for i in 0..num_to_pack_half - 1 {
+        let mut temp_poly = PolyMatrixNTT::zero(&params, 1, 1);
+        fast_multiply_no_reduce_in_range_generic(
+            &params,
+            &mut temp_poly,
+            &y_all_condensed,
+            &bold_t_condensed,
+            i * params.t_exp_left,
+            i * params.t_exp_left,
+            params.t_exp_left,
+        );
+        fast_add_into_no_reduce(&mut sum_poly, &temp_poly);
+        num_added += params.t_exp_left;
+
+        let mut temp_poly = PolyMatrixNTT::zero(&params, 1, 1);
+        fast_multiply_no_reduce_in_range_generic(
+            &params,
+            &mut temp_poly,
+            &y_bar_all_condensed,
+            &bold_t_bar_condensed,
+            i * params.t_exp_left,
+            i * params.t_exp_left,
+            params.t_exp_left,
+        );
+        fast_add_into_no_reduce(&mut sum_poly, &temp_poly);
+        num_added += params.t_exp_left;
+
+        if (num_added >= addition_capacity) || (i == num_to_pack_half - 2) {
+            fast_reduce(&mut sum_poly);
+            num_added = 0;
+        }
+    }
+
+    let mut temp_poly = PolyMatrixNTT::zero(&params, 1, 1);
+    fast_multiply_no_reduce_in_range_generic(
+        &params,
+        &mut temp_poly,
+        &z_body_condensed,
+        &bold_t_hat_condensed,
+        0,
+        0,
+        params.t_exp_left,
+    );
+    fast_add_into(&mut sum_poly, &temp_poly);
+
+    let mut final_b_poly = PolyMatrixRaw::zero(&params, 1, 1);
+    add_raw(&mut final_b_poly, &b_poly, &sum_poly.raw());
+
+    let mut packed_raw = PolyMatrixRaw::zero(&params, 2, 1);
+    packed_raw.copy_into(&a_hat, 0, 0);
+    packed_raw.copy_into(&final_b_poly, 1, 0);
+
+    debug!("Packing online took {} us", now.elapsed().as_micros());
+
+    packed_raw
+}
+
+pub fn full_packing_with_preprocessing_online_without_rotations<'a>(
+    packing_params: &'a PackParams<'a>,
+    precomp_inspiring: &PrecompInsPIR<'a>,
+    b_poly: &PolyMatrixRaw<'a>,
+    y_condensed: &PolyMatrixNTT<'a>,
+    z_body_condensed: &PolyMatrixNTT<'a>,
+) -> PolyMatrixRaw<'a> {
+    let params = packing_params.params;
+
+    let a_hat = &precomp_inspiring.a_hat;
+    let bold_t_condensed = &precomp_inspiring.bold_t_condensed;
+    let bold_t_bar_condensed = &precomp_inspiring.bold_t_bar_condensed;
+    let bold_t_hat_condensed = &precomp_inspiring.bold_t_hat_condensed;
+
+    let now = Instant::now();
+
+    let num_to_pack = params.poly_len;
+    let num_to_pack_half = num_to_pack >> 1;
+
+    let mut sum_poly = PolyMatrixNTT::zero(&params, 1, 1);
+
+    let addition_capacity = 1 << (64 - 2 * params.q2_bits - 1);
+    let mut num_added = 0;
+
+    for i in 0..num_to_pack_half - 1 {
+        let mut temp_poly = PolyMatrixNTT::zero(&params, 1, 1);
+        fast_multiply_no_reduce_in_range_generic(
+            &params,
+            &mut temp_poly,
+            &y_condensed,
+            &bold_t_condensed,
+            0,
+            i * params.t_exp_left,
+            params.t_exp_left,
+        );
+        let mut rotated_temp = PolyMatrixNTT::zero(&params, 1, 1);
+        apply_automorph_ntt(&params, &packing_params.tables, &temp_poly, &mut rotated_temp, packing_params.gen_pows[i]);
+
+        fast_add_into_no_reduce(&mut sum_poly, &rotated_temp);
+        num_added += params.t_exp_left;
+
+        let mut temp_poly = PolyMatrixNTT::zero(&params, 1, 1);
+        fast_multiply_no_reduce_in_range_generic(
+            &params,
+            &mut temp_poly,
+            &y_condensed,
+            &bold_t_bar_condensed,
+            0,
+            i * params.t_exp_left,
+            params.t_exp_left,
+        );
+        let mut rotated_temp = PolyMatrixNTT::zero(&params, 1, 1);
+        apply_automorph_ntt(&params, &packing_params.tables, &temp_poly, &mut rotated_temp, 2 * params.poly_len - packing_params.gen_pows[i]);
+
+        fast_add_into_no_reduce(&mut sum_poly, &rotated_temp);
+        num_added += params.t_exp_left;
+
+        if (num_added >= addition_capacity) || (i == num_to_pack_half - 2) {
+            fast_reduce(&mut sum_poly);
+            num_added = 0;
+        }
+    }
+
+    let mut temp_poly = PolyMatrixNTT::zero(&params, 1, 1);
+    fast_multiply_no_reduce_in_range_generic(
+        &params,
+        &mut temp_poly,
+        &z_body_condensed,
+        &bold_t_hat_condensed,
+        0,
+        0,
+        params.t_exp_left,
+    );
+    fast_add_into(&mut sum_poly, &temp_poly);
+
+    let mut final_b_poly = PolyMatrixRaw::zero(&params, 1, 1);
+    add_raw(&mut final_b_poly, &b_poly, &sum_poly.raw());
+
+    let mut packed_raw = PolyMatrixRaw::zero(&params, 2, 1);
+    packed_raw.copy_into(&a_hat, 0, 0);
+    packed_raw.copy_into(&final_b_poly, 1, 0);
+
+    debug!("Packing online took {} us", now.elapsed().as_micros());
+
+    packed_raw
+}
+
+// --- Pack Many LWEs (InspiRING entry points) ---
+
+pub fn pack_many_lwes_inspir<'a>(
+    packing_params: &'a PackParams,
+    precomp_inspir_vec: &Vec<PrecompInsPIR<'a>>,
+    b_values: &[u64],
+    packing_keys: &PackingKeys<'a>,
+    gamma: usize,
+) -> Vec<PolyMatrixRaw<'a>> {
+    let num_rlwe_outputs = (b_values.len() as f64 / gamma as f64).ceil() as usize;
+
+    let mut res = Vec::with_capacity(num_rlwe_outputs);
+    let group_size = packing_params.params.poly_len / gamma;
+    for i in 0..num_rlwe_outputs {
+        let which_group = i / group_size;
+        let within_group = i % group_size;
+
+        let mut b_poly = PolyMatrixRaw::zero(&packing_params.params, 1, 1);
+
+        for j in 0..gamma {
+            let index = which_group * packing_params.params.poly_len + within_group * gamma + j;
+            if index >= b_values.len() {
+                continue;
+            }
+            b_poly.get_poly_mut(0, 0)[j] = b_values[index];
+        }
+
+        let packed = if gamma <= packing_params.params.poly_len / 2 {
+            let y_all_condensed = packing_keys.y_all_condensed.as_ref().unwrap();
+            full_packing_with_preprocessing_online(
+                &packing_params,
+                &precomp_inspir_vec[i],
+                &b_poly,
+                &y_all_condensed,
+                // For half-packing we'd use packing_with_preprocessing_online,
+                // but gamma=poly_len always so we use full_packing path
+                packing_keys.y_bar_all_condensed.as_ref().unwrap(),
+                packing_keys.z_body_condensed.as_ref().unwrap(),
+            )
+        } else {
+            let y_all_condensed = packing_keys.y_all_condensed.as_ref().unwrap();
+            let y_bar_all_condensed = packing_keys.y_bar_all_condensed.as_ref().unwrap();
+            let z_body_condensed = packing_keys.z_body_condensed.as_ref().unwrap();
+
+            full_packing_with_preprocessing_online(
+                &packing_params,
+                &precomp_inspir_vec[i],
+                &b_poly,
+                &y_all_condensed,
+                &y_bar_all_condensed,
+                &z_body_condensed,
+            )
+        };
+
+        res.push(packed);
+    }
+
+    res
+}
+
+pub fn pack_many_lwes_inspir_without_rotations<'a>(
+    packing_params: &'a PackParams,
+    precomp_inspir_vec: &Vec<PrecompInsPIR<'a>>,
+    b_values: &[u64],
+    packing_keys: &PackingKeys<'a>,
+    gamma: usize,
+) -> Vec<PolyMatrixRaw<'a>> {
+    let num_rlwe_outputs = (b_values.len() as f64 / gamma as f64).ceil() as usize;
+
+    let mut res = Vec::with_capacity(num_rlwe_outputs);
+    let group_size = packing_params.params.poly_len / gamma;
+    for i in 0..num_rlwe_outputs {
+        let which_group = i / group_size;
+        let within_group = i % group_size;
+
+        let mut b_poly = PolyMatrixRaw::zero(&packing_params.params, 1, 1);
+
+        for j in 0..gamma {
+            let index = which_group * packing_params.params.poly_len + within_group * gamma + j;
+            if index >= b_values.len() {
+                continue;
+            }
+            b_poly.get_poly_mut(0, 0)[j] = b_values[index];
+        }
+
+        let packed = {
+            let y_condensed = packing_keys.y_body_condensed.as_ref().unwrap();
+            let z_body_condensed = packing_keys.z_body_condensed.as_ref().unwrap();
+            full_packing_with_preprocessing_online_without_rotations(
+                &packing_params,
+                &precomp_inspir_vec[i],
+                &b_poly,
+                &y_condensed,
+                &z_body_condensed,
+            )
+        };
+
+        res.push(packed);
+    }
+
+    res
+}
+
+/// Fully online InspiRING packing for a small number of CTs known only at online time.
+/// Does offline precomp + online packing in one call (gamma = poly_len, full packing).
+pub fn packing_fully_online_without_rotations<'a>(
+    packing_params: &'a PackParams<'a>,
+    offline_packing_keys: &OfflinePackingKeys<'a>,
+    a_ct_tilde: &Vec<PolyMatrixNTT<'a>>,
+    packing_keys: &PackingKeys<'a>,
+    b_poly: &PolyMatrixRaw<'a>,
+) -> PolyMatrixRaw<'a> {
+    let w_all = offline_packing_keys.w_all.as_ref().unwrap();
+    let w_bar_all = offline_packing_keys.w_bar_all.as_ref().unwrap();
+    let v_mask = offline_packing_keys.v_mask.as_ref().unwrap();
+
+    let precomp_inspiring = full_packing_with_preprocessing_offline_without_rotations(
+        packing_params, w_all, w_bar_all, v_mask, a_ct_tilde,
+    );
+    let y_condensed = packing_keys.y_body_condensed.as_ref().unwrap();
+    let z_body_condensed = packing_keys.z_body_condensed.as_ref().unwrap();
+    full_packing_with_preprocessing_online_without_rotations(
+        packing_params, &precomp_inspiring, b_poly, y_condensed, z_body_condensed,
+    )
 }

@@ -1,4 +1,5 @@
-use ypir::scheme::{run_ypir_batched, run_ypir_batched_word};
+use ypir::scheme::run_ypir_batched;
+use ypir::packing::PackingType;
 
 use clap::Parser;
 
@@ -22,6 +23,9 @@ struct Args {
     /// Run word-based SimplePIR (plain LWE over Z_{2^64})
     #[clap(long, action)]
     word: bool,
+    /// Use InspiRING packing instead of CDKS
+    #[clap(long, action)]
+    inspiring: bool,
     /// Output report file (optional)
     /// where results will be written in JSON.
     out_report_json: Option<String>,
@@ -42,6 +46,7 @@ fn main() {
         verbose,
         is_simplepir,
         word,
+        inspiring,
     } = args;
 
     if verbose {
@@ -62,18 +67,15 @@ fn main() {
         panic!("Items can be at must be at most 8 bits.");
     }
 
-    #[cfg(not(feature="cuda"))]
-    if is_simplepir {
-        assert_eq!(num_clients, 1, "SimplePIR variant only supports 1 client.");
-    }
+    let packing = if inspiring { PackingType::InspiRING } else { PackingType::CDKS };
 
-
+    let packing_str = if inspiring { " + InspiRING" } else { "" };
     let mode_str = if word {
-        "w/ Word SimplePIR"
+        format!("w/ Word SimplePIR{}", packing_str)
     } else if is_simplepir {
-        "w/ SimplePIR"
+        format!("w/ SimplePIR{}", packing_str)
     } else {
-        "w/ DoublePIR"
+        format!("w/ DoublePIR{}", packing_str)
     };
 
     println!(
@@ -85,11 +87,7 @@ fn main() {
         trials
     );
 
-    let measurement = if word {
-        run_ypir_batched_word(num_items, item_size_bits, num_clients, trials)
-    } else {
-        run_ypir_batched(num_items, item_size_bits, num_clients, is_simplepir, trials)
-    };
+    let measurement = run_ypir_batched(num_items, item_size_bits, num_clients, is_simplepir, word, trials, packing);
     println!(
         "Measurement completed. See the README for details on what the following fields mean."
     );

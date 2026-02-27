@@ -8,6 +8,7 @@ use spiral_rs::{
 };
 
 use super::convolution::negacyclic_matrix_u32;
+use super::packing::PackingType;
 use super::{lwe::*, noise_analysis::measure_noise_width_squared, scheme::*, util::*};
 
 pub fn rlwe_to_lwe<'a>(params: &'a Params, ct: &PolyMatrixRaw<'a>) -> Vec<u64> {
@@ -176,10 +177,43 @@ pub fn generate_pseudorandom_matrix_word(
     poly_len: usize,
     db_rows: usize,
 ) -> Vec<u64> {
+    assert_eq!(db_rows % poly_len, 0);
+    let num_blocks = db_rows / poly_len;
     let mut rng_pub = ChaCha20Rng::from_seed(get_seed(seed));
+
+    // Generate one random polynomial per block, then apply negperm.
+    // This matches the ring path: generate_pseudorandom_query applies negperm(a)
+    // before the NTT multiply, so the hint uses negperm(a). Building M_{negperm(a)}
+    // means: hint_0 = negperm(a)·d (matches ring), query = M_{negperm(a)}^T·s = a·s (matches ring).
     let mut out = vec![0u64; poly_len * db_rows];
-    for idx in 0..poly_len * db_rows {
-        out[idx] = rng_pub.sample::<u64, _>(rand::distributions::Standard);
+    for block in 0..num_blocks {
+        // Generate random polynomial a(X)
+        let mut poly = vec![0u64; poly_len];
+        for idx in 0..poly_len {
+            poly[idx] = rng_pub.sample::<u64, _>(rand::distributions::Standard);
+        }
+
+        // Apply negperm in Z_{2^64}: ā = [a_0, -a_{N-1}, -a_{N-2}, ..., -a_1]
+        let mut nega_poly = vec![0u64; poly_len];
+        nega_poly[0] = poly[0];
+        for k in 1..poly_len {
+            nega_poly[k] = (0u64).wrapping_sub(poly[poly_len - k]);
+        }
+
+        // Build negacyclic matrix M_{ā} where ā = negperm(a):
+        //   M[i,j] = ā[i-j]       if i >= j
+        //   M[i,j] = -ā[N+i-j]    if i < j
+        for i in 0..poly_len {
+            for j in 0..poly_len {
+                let col = block * poly_len + j;
+                let val = if i >= j {
+                    nega_poly[i - j]
+                } else {
+                    (0u64).wrapping_sub(nega_poly[poly_len + i - j])
+                };
+                out[i * db_rows + col] = val;
+            }
+        }
     }
     out
 }
@@ -210,7 +244,7 @@ impl<'p, 'c> YClient<'p, 'c> {
         &self,
         public_seed_idx: u8,
         dim_log2: usize,
-        packing: bool,
+        packing_type: PackingType,
         index: usize,
         embedding_width: Option<usize>,
         weights: Option<&[u64]>,
@@ -257,32 +291,30 @@ impl<'p, 'c> YClient<'p, 'c> {
                 }
             }
 
-            if packing {
+            // say we have a PolyMatrix. this is a matrix of polynomials. 1x1 matrix means we have one polynomial
+            // converting a PolyMatrixRaw to PolyMatrixNTT would be an isomorphic transformation (1x1 matrix -> 1x1 matrix), but each element is an NTT instead of a polynomial (should be same size, but we do CRT so num_crt times larger)
+
+            // at this point we have a polynomial in NTT form where (if is_nonzero) the desired index encrypts the value 1 (times the modulus scale (q/p) and divided by the inverse of the polynomial length for the NTT)
+              // if public_seed_idx == SEED_0 {
+            //     out.push(scalar.pad_top(1));
+            //     continue;
+            // }
+
+            let ct = if multiply_ct && PackingType::CDKS == packing_type {
+                // recall a RLWE CT: (a, -s*a + e + µ*floor(q/p))
+                // when we do negacyclic NTT/iNTT, we scale the result by the dimension of the polynomial (recall: q \equiv 1 mod 2N)
+                // upon decryption, we cancel -s*a, so the scale doesn't matter for those term. to correctly get µ, we have to downscale
+                // both the µ and noise e have to be pre-scaled, hence these scalar_mutliply_alloc and encrypt_matrix_scaled_reg calls
+                // InspiRING normalizes via mod_inv_poly = 1/N on mask side during offline precomp,
+                // so the query should NOT be pre-divided by N.
                 let factor =
-                    invert_uint_mod(self.params.poly_len as u64, self.params.modulus).unwrap();
-                // say we have a PolyMatrix. this is a matrix of polynomials. 1x1 matrix means we have one polynomial
-                // converting a PolyMatrixRaw to PolyMatrixNTT would be an isomorphic transformation (1x1 matrix -> 1x1 matrix), but each element is an NTT instead of a polynomial (should be same size, but we do CRT so num_crt times larger)
+                     invert_uint_mod(self.params.poly_len as u64, self.params.modulus).unwrap();
+
                 scalar = scalar_multiply_alloc(
                     &PolyMatrixRaw::single_value(self.params, factor).ntt(),
                     &scalar.ntt(),
                 )
                 .raw();
-                // at this point we have a polynomial in NTT form where (if is_nonzero) the desired index encrypts the value 1 (times the modulus scale (q/p) and divided by the inverse of the polynomial length for the NTT)
-            }
-
-            // if public_seed_idx == SEED_0 {
-            //     out.push(scalar.pad_top(1));
-            //     continue;
-            // }
-
-            let ct = if multiply_ct {
-                // recall a RLWE CT: (a, -s*a + e + µ*floor(q/p))
-                // when we do negacyclic NTT/iNTT, we scale the result by the dimension of the polynomial (recall: q \equiv 1 mod 2N)
-                // upon decryption, we cancel -s*a, so the scale doesn't matter for those term. to correctly get µ, we have to downscale
-                // both the µ and noise e have to be pre-scaled, hence these scalar_mutliply_alloc and encrypt_matrix_scaled_reg calls
-                let factor =
-                    invert_uint_mod(self.params.poly_len as u64, self.params.modulus).unwrap();
-
                 self.inner.encrypt_matrix_scaled_reg(
                     &scalar.ntt(),
                     &mut ChaCha20Rng::from_entropy(),
@@ -352,12 +384,12 @@ impl<'p, 'c> YClient<'p, 'c> {
         &self,
         public_seed_idx: u8,
         dim_log2: usize,
-        packing: bool,
+        packing_type: PackingType,
         index_row: usize,
         embedding_width: Option<usize>,
         weights: Option<&[u64]>,
     ) -> Vec<u64> {
-        if public_seed_idx == SEED_0 && !packing {
+        if public_seed_idx == SEED_0 && packing_type == PackingType::NoPacking {
             let lwe_params = LWEParams::default();
             let dim = 1 << (dim_log2 + self.params.poly_len_log2);
 
@@ -389,7 +421,7 @@ impl<'p, 'c> YClient<'p, 'c> {
         } else {
             // only do this if we're packing. what is packing?
             // weirdly I think this conditional is just a way of having the same interface for generating the two queries, even though the operation is entirely separate (different moduli space, encryption method)
-            let out = self.generate_query_impl(public_seed_idx, dim_log2, packing, index_row, embedding_width, weights);
+            let out = self.generate_query_impl(public_seed_idx, dim_log2, packing_type, index_row, embedding_width, weights);
             // at this point, we have fully encrypted the vector with all 0s and 1 at index using RLWE.
             // say the length of that vector is l_2, and the length of the RLWE poly is d_2. then we have m_2 = l_2/d_2 RLWE CTs
             assert_eq!(out.len(), (1<<dim_log2));
@@ -452,27 +484,31 @@ impl<'p, 'c> YClient<'p, 'c> {
             s[i] = if x > q / 2 { x as i64 - q as i64 } else { x as i64 };
         }
 
-        // scale = floor(2^64 / pt_modulus)
+        // scale = floor(2^64 / pt_modulus) = Δ_W (full scale in Z_W).
+        // The server pre-multiplies intermediate by inv_N mod Q before CDKS packing.
+        // CDKS multiplies b-values by N, so N * inv_N = 1 mod Q — noise is NOT amplified.
         let scale: u64 = (1u128 << 64).wrapping_div(self.params.pt_modulus as u128) as u64;
 
-        // Sample noise
         let dg = DiscreteGaussian::init(self.params.noise_width);
         let mut rng = ChaCha20Rng::from_entropy();
+        let q_to_word: u128 = (1u128 << 64) / q as u128; // floor(2^64 / Q)
 
         let mut query = vec![0u64; db_rows];
         for j in 0..db_rows {
-            // q[j] = sum_i(s[i] * A[i*db_rows+j])
+            // q[j] = -sum_i(s[i] * A[i*db_rows+j]) + e + δ·scale
             let mut val: u64 = 0;
             for i in 0..poly_len {
-                val = val.wrapping_add((s[i] as u64).wrapping_mul(a[i * db_rows + j]));
+                val = val.wrapping_sub((s[i] as u64).wrapping_mul(a[i * db_rows + j]));
             }
 
-            // Add noise
+            // Add noise: sample in Z_Q, lift to Z_{2^64} preserving sign
             let e = dg.sample(q, &mut rng);
-            // e is in Z_Q, but we need it in Z_{2^64}
-            // scale up: e_word = e * floor(2^64 / Q)
-            let e_scale = (1u128 << 64).wrapping_div(q as u128) as u64;
-            val = val.wrapping_add((e as u64).wrapping_mul(e_scale));
+            let e_word: u64 = if e <= q / 2 {
+                (e as u128 * q_to_word) as u64
+            } else {
+                0u64.wrapping_sub(((q - e) as u128 * q_to_word) as u64)
+            };
+            val = val.wrapping_add(e_word);
 
             // Add indicator
             if j == target_row {

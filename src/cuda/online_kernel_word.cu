@@ -102,13 +102,14 @@ __global__ void word_decompose_u64_bytes(
 
 // ---------- Combine + modswitch + CRT-pack ----------
 
-// Tensor core path: combine lo/hi int32 → u64, modswitch, CRT-pack
+// Tensor core path: combine lo/hi int32 → u64, modswitch to Z_Q, multiply by inv_N
 __global__ void word_combine_modswitch_crt(
     uint64_t* __restrict__ out,        // batch × db_cols (row-major, batch is outer)
     const int32_t* __restrict__ lo,    // col-major M×N = db_cols × batch
     const int32_t* __restrict__ hi,
     size_t count,
-    uint64_t q, uint64_t mod0, uint64_t mod1)
+    uint64_t q, uint64_t mod0, uint64_t mod1,
+    uint64_t inv_n)
 {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
@@ -118,16 +119,18 @@ __global__ void word_combine_modswitch_crt(
     __uint128_t prod = (__uint128_t)val * q + (((__uint128_t)1) << 63);
     uint64_t val_q = (uint64_t)(prod >> 64);
 
-    uint64_t crt0 = val_q % mod0;
-    uint64_t crt1 = val_q % mod1;
-    out[idx] = crt0 | (crt1 << 32);
+    // Multiply by inv_N mod Q: compensates for CDKS packing multiplying by N
+    val_q = (uint64_t)((__uint128_t)val_q * inv_n % q);
+
+    out[idx] = val_q;
 }
 
-// SIMT path: modswitch u64, CRT-pack (in-place on col-major output)
+// SIMT path: modswitch u64 to Z_Q (in-place on col-major output), multiply by inv_N
 __global__ void word_modswitch_crt_inplace(
     uint64_t* __restrict__ data,
     size_t count,
-    uint64_t q, uint64_t mod0, uint64_t mod1)
+    uint64_t q, uint64_t mod0, uint64_t mod1,
+    uint64_t inv_n)
 {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
@@ -136,9 +139,10 @@ __global__ void word_modswitch_crt_inplace(
     __uint128_t prod = (__uint128_t)val * q + (((__uint128_t)1) << 63);
     uint64_t val_q = (uint64_t)(prod >> 64);
 
-    uint64_t crt0 = val_q % mod0;
-    uint64_t crt1 = val_q % mod1;
-    data[idx] = crt0 | (crt1 << 32);
+    // Multiply by inv_N mod Q: compensates for CDKS packing multiplying by N
+    val_q = (uint64_t)((__uint128_t)val_q * inv_n % q);
+
+    data[idx] = val_q;
 }
 
 // ---------- GEMM spec for 15 tensor core GEMMs ----------
@@ -199,7 +203,7 @@ uint32_t word_ceil_log2_u64(uint64_t x) {
 #endif
 }
 
-__global__ void __launch_bounds__(1024, 1) word_pack_lwes_and_mod_switch(
+__global__ void __launch_bounds__(1024) word_pack_lwes_and_mod_switch(
     uint8_t* d_response_out,           // points to this batch item's response start
     const uint64_t* d_intermediate,    // points to this batch item's intermediate start
     const uint64_t* d_y_constants,
@@ -226,27 +230,30 @@ __global__ void __launch_bounds__(1024, 1) word_pack_lwes_and_mod_switch(
     size_t ell = params.log2_poly_len;
     uint64_t modulus = params.modulus;
 
+    // Cooperative NTT decomposition (used in post-FFT code)
     size_t threads_per_crt = blockDim.x / crt_count;
     size_t my_crt = tid / threads_per_crt;
     size_t local_tid = tid % threads_per_crt;
 
-    // Scratch indexed by output_idx only (per-stream)
+    // Per-warp decomposition (used in FFT loop)
+    size_t warp_id = tid / 32;
+    size_t lane_id = tid % 32;
+    size_t num_warps = blockDim.x / 32;
+
+    // Scratch layout: working_set | result_ntt | temp_raw | temp_ntt
+    // (intermediate buffers removed — fused into registers + ct_odd reuse)
     uint64_t* my_scratch = d_scratch + output_idx * scratch_size_per_output;
 
     size_t working_set_size = (1 << (ell - 1));
-    uint64_t* working_set       = my_scratch;
-    uint64_t* y_times_ct_odd    = working_set + working_set_size * poly_len;
-    uint64_t* neg_y_times_ct_odd = y_times_ct_odd + poly_len;
-    uint64_t* ct_sum_1          = neg_y_times_ct_odd + poly_len;
-    uint64_t* w_times_ginv_ct   = ct_sum_1 + poly_len;
-    uint64_t* result_ntt        = w_times_ginv_ct + poly_len;
-    uint64_t* temp_raw          = result_ntt + 2 * convd_len;
-    uint64_t* temp_ntt          = temp_raw + 2 * poly_len;
+    uint64_t* working_set = my_scratch;
+    uint64_t* result_ntt  = working_set + working_set_size * poly_len;
+    uint64_t* temp_raw    = result_ntt + 2 * convd_len;
+    uint64_t* temp_ntt    = temp_raw + 2 * poly_len;
 
     // b_values from this batch item's intermediate
     const uint64_t* b_values = d_intermediate + output_idx * poly_len;
 
-    size_t precomp_vals_per_output  = ((1 << ell) - 1) * t_exp_left * poly_len;
+    size_t precomp_vals_per_output   = ((1 << ell) - 1) * t_exp_left * poly_len;
     size_t precomp_tables_per_output = ell * poly_len;
     const uint64_t* my_precomp_res    = d_precomp_res    + output_idx * 2 * convd_len;
     const uint64_t* my_precomp_vals   = d_precomp_vals   + output_idx * precomp_vals_per_output;
@@ -258,13 +265,19 @@ __global__ void __launch_bounds__(1024, 1) word_pack_lwes_and_mod_switch(
     // response already offset to this batch item + output
     uint8_t* my_response = d_response_out + output_idx * response_bytes_per_output;
 
+    // Zero working set (cooperative, all threads)
     for (size_t i = tid; i < working_set_size * poly_len; i += blockDim.x)
         working_set[i] = 0;
     __syncthreads();
 
-    size_t idx_precomp = 0;
+    // ── FFT-style packing (per-warp parallelism) ──
+    // Each warp independently processes a subset of tree nodes.
+    // Intermediate values (y_times, neg_y_times, w_ginv) stay in registers.
+    // ct_odd is reused as ct_sum_1 storage for the automorphism permutation.
+    // Only __syncthreads() between levels (not between nodes within a level).
 
-    // FFT-style packing
+    size_t idx_precomp_base = 0;
+
     for (size_t cur_ell = 1; cur_ell <= ell; cur_ell++) {
         size_t num_in  = 1 << (ell - cur_ell + 1);
         size_t num_out = num_in >> 1;
@@ -272,14 +285,20 @@ __global__ void __launch_bounds__(1024, 1) word_pack_lwes_and_mod_switch(
 
         const uint64_t* y     = d_y_constants + (cur_ell - 1) * convd_len;
         const uint64_t* neg_y = d_y_constants + ell * convd_len + (cur_ell - 1) * convd_len;
+        size_t pub_param_idx = ell - cur_ell;
+        const uint64_t* w = my_pub_params + pub_param_idx * t_exp_left * poly_len;
 
-        for (size_t i = 0; i < num_out; i++) {
-            uint64_t* ct_even = working_set + i * poly_len;
+        for (size_t node = warp_id; node < num_out; node += num_warps) {
+            uint64_t* ct_even = working_set + node * poly_len;
+            const uint64_t* ginv_ct = my_precomp_vals
+                + (idx_precomp_base + node) * t_exp_left * poly_len;
 
             if (cur_ell > 1) {
-                uint64_t* ct_odd = working_set + (num_out + i) * poly_len;
+                uint64_t* ct_odd = working_set + (num_out + node) * poly_len;
 
-                for (size_t z = tid; z < poly_len; z += blockDim.x) {
+                // Phase 1: y_mult + y_add fused.
+                // Write ct_sum_1 into ct_odd (which is consumed and no longer needed).
+                for (size_t z = lane_id; z < poly_len; z += 32) {
                     uint64_t ct_val = ct_odd[z];
                     uint64_t ct_lo = ct_val & 0xFFFFFFFF;
                     uint64_t ct_hi = ct_val >> 32;
@@ -291,65 +310,71 @@ __global__ void __launch_bounds__(1024, 1) word_pack_lwes_and_mod_switch(
 
                     uint64_t prod_lo = barrett_raw_u64(ct_lo * y_lo,     params.barrett_cr[0], params.moduli[0]);
                     uint64_t prod_hi = barrett_raw_u64(ct_hi * y_hi,     params.barrett_cr[1], params.moduli[1]);
-                    y_times_ct_odd[z] = (prod_lo & 0xFFFFFFFF) | ((prod_hi & 0xFFFFFFFF) << 32);
+                    uint64_t y_times = (prod_lo & 0xFFFFFFFF) | ((prod_hi & 0xFFFFFFFF) << 32);
 
                     prod_lo = barrett_raw_u64(ct_lo * neg_y_lo, params.barrett_cr[0], params.moduli[0]);
                     prod_hi = barrett_raw_u64(ct_hi * neg_y_hi, params.barrett_cr[1], params.moduli[1]);
-                    neg_y_times_ct_odd[z] = (prod_lo & 0xFFFFFFFF) | ((prod_hi & 0xFFFFFFFF) << 32);
+                    uint64_t neg_y_times = (prod_lo & 0xFFFFFFFF) | ((prod_hi & 0xFFFFFFFF) << 32);
+
+                    uint64_t orig = ct_even[z];
+                    ct_even[z] = orig + y_times;
+                    ct_odd[z]  = orig + neg_y_times;  // ct_sum_1 stored in ct_odd
                 }
-                __syncthreads();
+                __syncwarp();
 
-                for (size_t z = tid; z < poly_len; z += blockDim.x) {
-                    ct_sum_1[z] = ct_even[z] + neg_y_times_ct_odd[z];
-                    ct_even[z]  = ct_even[z] + y_times_ct_odd[z];
-                }
-                __syncthreads();
-            }
+                // Phase 2: w_ginv + automorph + reduce fused.
+                const uint64_t* table = my_precomp_tables + (ell - cur_ell) * poly_len;
+                for (size_t z = lane_id; z < poly_len; z += 32) {
+                    // w × ginv inner product
+                    uint64_t sum_lo = 0, sum_hi = 0;
+                    for (size_t k = 0; k < t_exp_left; k++) {
+                        uint64_t w_val = w[k * poly_len + z];
+                        uint64_t g_val = ginv_ct[k * poly_len + z];
+                        sum_lo += (w_val & 0xFFFFFFFF) * (g_val & 0xFFFFFFFF);
+                        sum_hi += (w_val >> 32)         * (g_val >> 32);
+                    }
+                    uint64_t res_lo = barrett_raw_u64(sum_lo, params.barrett_cr[0], params.moduli[0]);
+                    uint64_t res_hi = barrett_raw_u64(sum_hi, params.barrett_cr[1], params.moduli[1]);
+                    uint64_t w_ginv_val = (res_lo & 0xFFFFFFFF) | ((res_hi & 0xFFFFFFFF) << 32);
 
-            size_t pub_param_idx = ell - cur_ell;
-            const uint64_t* w       = my_pub_params + pub_param_idx * t_exp_left * poly_len;
-            const uint64_t* ginv_ct = my_precomp_vals + idx_precomp * t_exp_left * poly_len;
-            idx_precomp++;
-
-            for (size_t z = tid; z < poly_len; z += blockDim.x) {
-                uint64_t sum_lo = 0, sum_hi = 0;
-                for (size_t k = 0; k < t_exp_left; k++) {
-                    uint64_t w_val = w[k * poly_len + z];
-                    uint64_t g_val = ginv_ct[k * poly_len + z];
-                    sum_lo += (w_val & 0xFFFFFFFF) * (g_val & 0xFFFFFFFF);
-                    sum_hi += (w_val >> 32)         * (g_val >> 32);
-                }
-                uint64_t res_lo = barrett_raw_u64(sum_lo, params.barrett_cr[0], params.moduli[0]);
-                uint64_t res_hi = barrett_raw_u64(sum_hi, params.barrett_cr[1], params.moduli[1]);
-                w_times_ginv_ct[z] = (res_lo & 0xFFFFFFFF) | ((res_hi & 0xFFFFFFFF) << 32);
-            }
-            __syncthreads();
-
-            if (cur_ell > 1) {
-                size_t table_idx = ell - cur_ell;
-                const uint64_t* table = my_precomp_tables + table_idx * poly_len;
-                for (size_t z = tid; z < poly_len; z += blockDim.x) {
+                    // Automorphism: permuted read from ct_odd (= ct_sum_1)
                     size_t src_idx = (size_t)table[z];
-                    ct_even[z] += ct_sum_1[src_idx];
-                }
-                __syncthreads();
-            }
+                    uint64_t automorph_val = ct_odd[src_idx];
 
-            bool do_reduce = true;
-            for (size_t z = tid; z < poly_len; z += blockDim.x) {
-                ct_even[z] += w_times_ginv_ct[z];
-                if (do_reduce) {
-                    uint64_t val = ct_even[z];
+                    // Accumulate + Barrett reduce
+                    uint64_t val = ct_even[z] + automorph_val + w_ginv_val;
+                    uint64_t lo = barrett_raw_u64(val & 0xFFFFFFFF, params.barrett_cr[0], params.moduli[0]);
+                    uint64_t hi = barrett_raw_u64(val >> 32,        params.barrett_cr[1], params.moduli[1]);
+                    ct_even[z] = (lo & 0xFFFFFFFF) | ((hi & 0xFFFFFFFF) << 32);
+                }
+
+            } else {
+                // cur_ell == 1: only w_ginv + reduce (no y-multiply, no automorphism)
+                for (size_t z = lane_id; z < poly_len; z += 32) {
+                    uint64_t sum_lo = 0, sum_hi = 0;
+                    for (size_t k = 0; k < t_exp_left; k++) {
+                        uint64_t w_val = w[k * poly_len + z];
+                        uint64_t g_val = ginv_ct[k * poly_len + z];
+                        sum_lo += (w_val & 0xFFFFFFFF) * (g_val & 0xFFFFFFFF);
+                        sum_hi += (w_val >> 32)         * (g_val >> 32);
+                    }
+                    uint64_t res_lo = barrett_raw_u64(sum_lo, params.barrett_cr[0], params.moduli[0]);
+                    uint64_t res_hi = barrett_raw_u64(sum_hi, params.barrett_cr[1], params.moduli[1]);
+                    uint64_t w_ginv_val = (res_lo & 0xFFFFFFFF) | ((res_hi & 0xFFFFFFFF) << 32);
+
+                    uint64_t val = ct_even[z] + w_ginv_val;
                     uint64_t lo = barrett_raw_u64(val & 0xFFFFFFFF, params.barrett_cr[0], params.moduli[0]);
                     uint64_t hi = barrett_raw_u64(val >> 32,        params.barrett_cr[1], params.moduli[1]);
                     ct_even[z] = (lo & 0xFFFFFFFF) | ((hi & 0xFFFFFFFF) << 32);
                 }
             }
-            __syncthreads();
         }
+
+        idx_precomp_base += num_out;
+        __syncthreads();  // barrier between tree levels
     }
 
-    // Final reduction on working_set[0]
+    // Final reduction on working_set[0] (cooperative, all threads)
     for (size_t z = tid; z < poly_len; z += blockDim.x) {
         uint64_t val = working_set[z];
         uint64_t lo = barrett_raw_u64(val & 0xFFFFFFFF, params.barrett_cr[0], params.moduli[0]);
@@ -503,6 +528,7 @@ struct WordOnlineContext {
     uint64_t modulus;    // Q = moduli[0] * moduli[1]
     uint64_t mod0;
     uint64_t mod1;
+    uint64_t inv_n;      // N^{-1} mod Q, compensates CDKS N-multiplication
     uint64_t rlwe_q_prime_1;
     uint64_t rlwe_q_prime_2;
 };
@@ -531,7 +557,8 @@ void* ypir_word_online_init(
     uint64_t mod1_inv_mod0,
     uint64_t barrett_cr_0_modulus,
     uint64_t barrett_cr_1_modulus,
-    size_t max_batch_size)
+    size_t max_batch_size,
+    uint64_t inv_n)
 {
     WordOnlineContext* ctx = new WordOnlineContext();
 
@@ -546,13 +573,14 @@ void* ypir_word_online_init(
     ctx->mod0            = moduli[0];
     ctx->mod1            = moduli[1];
     ctx->modulus         = moduli[0] * moduli[1];
+    ctx->inv_n           = inv_n;
 
     // Precompute sizes
     size_t ell       = 31 - __builtin_clz(poly_len);
     size_t convd_len = crt_count * poly_len;
     size_t ws_size   = (1 << (ell - 1));
     ctx->scratch_per_output =
-        (ws_size * poly_len) + poly_len + poly_len + poly_len + poly_len
+        (ws_size * poly_len)
         + (2 * convd_len) + (2 * poly_len) + convd_len;
     ctx->pub_params_size_per_batch = ell * t_exp_left * poly_len;
 
@@ -791,14 +819,14 @@ void ypir_word_online_compute_batch(
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
         }
 
-        // Combine + modswitch + CRT-pack
+        // Combine + modswitch + multiply by inv_N
         {
             size_t count = M * N;
             int threads = 256;
             int blocks = (count + threads - 1) / threads;
             word_combine_modswitch_crt<<<blocks, threads>>>(
                 ctx->d_intermediate, ctx->d_partials[0], ctx->d_partials[1],
-                count, ctx->modulus, ctx->mod0, ctx->mod1);
+                count, ctx->modulus, ctx->mod0, ctx->mod1, ctx->inv_n);
             CUDA_ASSERT(cudaGetLastError());
         }
 
@@ -831,13 +859,13 @@ void ypir_word_online_compute_batch(
             abort();
         }
 
-        // Modswitch + CRT-pack in-place, then copy to d_intermediate
+        // Modswitch + multiply by inv_N in-place, then copy to d_intermediate
         {
             size_t count = M * N;
             int threads = 256;
             int blocks = (count + threads - 1) / threads;
             word_modswitch_crt_inplace<<<blocks, threads>>>(
-                ctx->d_result_u64, count, ctx->modulus, ctx->mod0, ctx->mod1);
+                ctx->d_result_u64, count, ctx->modulus, ctx->mod0, ctx->mod1, ctx->inv_n);
             CUDA_ASSERT(cudaGetLastError());
         }
         CUDA_ASSERT(cudaMemcpy(ctx->d_intermediate, ctx->d_result_u64,

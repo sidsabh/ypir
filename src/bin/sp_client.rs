@@ -12,7 +12,7 @@ use spiral_rs::poly::{PolyMatrix, PolyMatrixRaw};
 use ypir::api::sp_messages::{SetupParams, SimplePIRQuery, SimplePIRQueryBatch, SimplePIRResponseBatch};
 use ypir::client::{decrypt_ct_reg_measured, pack_query, raw_generate_expansion_params, YClient};
 use ypir::modulus_switch::ModulusSwitch;
-use ypir::packing::condense_matrix;
+use ypir::packing::{condense_matrix, PackingType};
 use ypir::params::{params_for_scenario_simplepir, GetQPrime};
 use ypir::scheme::{SEED_0, STATIC_SEED_2};
 
@@ -306,7 +306,7 @@ fn process_batch(
             let query_row = y_client.generate_query(
                 SEED_0,
                 params.db_dim_1,
-                true,
+                PackingType::CDKS,
                 row_index,
                 Some(embedding_width),
                 Some(weights.as_slice()),

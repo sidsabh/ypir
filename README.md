@@ -7,7 +7,7 @@ YPIR-SP (6 client batching):
 RUST_LOG=debug cargo run --release -- 262144 184320 6 1 -i
 ```
 Performance Results:
-Hint Prep. Throughput 1.81 GB/sec
+Hint Prep. Throughput 3.04 GB/sec
 Throughput: 127.36 GB/sec
 
 YPIR (6 client batching):

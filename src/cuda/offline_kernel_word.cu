@@ -100,21 +100,16 @@ __global__ void combine_modswitch_crt(
     const int32_t* __restrict__ lo,    // db_cols * poly_len (col-major)
     const int32_t* __restrict__ hi,    // db_cols * poly_len (col-major)
     size_t db_cols, size_t poly_len,
-    uint64_t q, uint64_t mod0, uint64_t mod1)
+    uint64_t q, uint64_t mod0, uint64_t mod1,
+    uint64_t inv_n)
 {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t total = db_cols * poly_len;
     if (idx >= total) return;
 
-    // idx in col-major: col = idx / poly_len... wait no.
-    // cuBLAS output is col-major M×N where M=db_cols, N=poly_len
-    // so idx = col_in_output * M + row_in_output
-    // but we want row-major poly_len × db_cols
-    size_t col = idx % db_cols;   // M dimension
-    size_t row = idx / db_cols;   // N dimension
-    // col-major index: row * db_cols + col = idx  -- no that's row-major
-    // col-major: col * poly_len + row
-    size_t cm_idx = col * poly_len + row;
+    size_t col = idx % db_cols;   // M dimension (db_cols)
+    size_t row = idx / db_cols;   // N dimension (poly_len)
+    size_t cm_idx = col + row * db_cols;  // ColMajor M×N: element(i,j) = data[i + j*M]
 
     uint64_t val = (uint64_t)(uint32_t)lo[cm_idx] | ((uint64_t)(uint32_t)hi[cm_idx] << 32);
 
@@ -122,18 +117,19 @@ __global__ void combine_modswitch_crt(
     __uint128_t prod = (__uint128_t)val * q + (((__uint128_t)1) << 63);
     uint64_t val_q = (uint64_t)(prod >> 64);
 
-    // CRT-pack
-    uint64_t crt0 = val_q % mod0;
-    uint64_t crt1 = val_q % mod1;
-    out[row * db_cols + col] = crt0 | (crt1 << 32);
+    // Multiply by inv_N mod Q: compensates for CDKS packing multiplying by N
+    val_q = (uint64_t)((__uint128_t)val_q * inv_n % q);
+
+    out[row * db_cols + col] = val_q;
 }
 
-// SIMT path: modswitch u64 result, CRT-pack
+// SIMT path: modswitch u64 result to Z_Q
 __global__ void modswitch_crt_u64(
     uint64_t* __restrict__ out,        // poly_len * db_cols (row-major)
     const uint64_t* __restrict__ in,   // db_cols * poly_len (col-major from CUTLASS)
     size_t db_cols, size_t poly_len,
-    uint64_t q, uint64_t mod0, uint64_t mod1)
+    uint64_t q, uint64_t mod0, uint64_t mod1,
+    uint64_t inv_n)
 {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t total = db_cols * poly_len;
@@ -141,16 +137,17 @@ __global__ void modswitch_crt_u64(
 
     size_t col = idx % db_cols;
     size_t row = idx / db_cols;
-    size_t cm_idx = col * poly_len + row;
+    size_t cm_idx = col + row * db_cols;  // ColMajor M×N: element(i,j) = data[i + j*M]
 
     uint64_t val = in[cm_idx];
 
     __uint128_t prod = (__uint128_t)val * q + (((__uint128_t)1) << 63);
     uint64_t val_q = (uint64_t)(prod >> 64);
 
-    uint64_t crt0 = val_q % mod0;
-    uint64_t crt1 = val_q % mod1;
-    out[row * db_cols + col] = crt0 | (crt1 << 32);
+    // Multiply by inv_N mod Q: compensates for CDKS packing multiplying by N
+    val_q = (uint64_t)((__uint128_t)val_q * inv_n % q);
+
+    out[row * db_cols + col] = val_q;
 }
 
 // ---------- Context ----------
@@ -209,6 +206,7 @@ struct WordOfflineContext {
     uint64_t modulus;   // Q
     uint64_t mod0;
     uint64_t mod1;
+    uint64_t inv_n;     // N^{-1} mod Q, compensates CDKS N-multiplication
 };
 
 extern "C" {
@@ -222,7 +220,8 @@ void* init_word_offline_context(
     uint32_t poly_len,
     uint64_t modulus,
     uint64_t mod0,
-    uint64_t mod1)
+    uint64_t mod1,
+    uint64_t inv_n)
 {
     WordOfflineContext* ctx = new WordOfflineContext();
     ctx->db_cols = db_cols;
@@ -232,6 +231,7 @@ void* init_word_offline_context(
     ctx->modulus = modulus;
     ctx->mod0 = mod0;
     ctx->mod1 = mod1;
+    ctx->inv_n = inv_n;
     ctx->has_tensor_cores = false;
     ctx->cublas_handle = nullptr;
     ctx->d_db_u16 = nullptr;
@@ -389,13 +389,13 @@ int compute_hint_0_word_gpu(void* context, uint64_t* hint_0_out)
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
         }
 
-        // Combine lo/hi → u64, modswitch, CRT-pack
+        // Combine lo/hi → u64, modswitch, multiply by inv_N
         {
             int threads = 256;
             int blocks = (total + threads - 1) / threads;
             combine_modswitch_crt<<<blocks, threads>>>(
                 ctx->d_out, ctx->d_partials[0], ctx->d_partials[1],
-                M, N, ctx->modulus, ctx->mod0, ctx->mod1);
+                M, N, ctx->modulus, ctx->mod0, ctx->mod1, ctx->inv_n);
             CUDA_CHECK(cudaGetLastError());
         }
     } else {
@@ -422,13 +422,13 @@ int compute_hint_0_word_gpu(void* context, uint64_t* hint_0_out)
             return -1;
         }
 
-        // Modswitch + CRT-pack
+        // Modswitch + multiply by inv_N
         {
             int threads = 256;
             int blocks = (total + threads - 1) / threads;
             modswitch_crt_u64<<<blocks, threads>>>(
                 ctx->d_out, ctx->d_result_u64,
-                M, N, ctx->modulus, ctx->mod0, ctx->mod1);
+                M, N, ctx->modulus, ctx->mod0, ctx->mod1, ctx->inv_n);
             CUDA_CHECK(cudaGetLastError());
         }
     }

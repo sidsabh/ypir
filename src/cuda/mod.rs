@@ -779,6 +779,7 @@ extern "C" {
         modulus: u64,
         mod0: u64,
         mod1: u64,
+        inv_n: u64,
     ) -> *mut std::ffi::c_void;
 
     fn compute_hint_0_word_gpu(context: *mut std::ffi::c_void, hint_0_out: *mut u64) -> i32;
@@ -810,6 +811,8 @@ impl WordOfflineContext {
         mod0: u64,
         mod1: u64,
     ) -> Result<Self, String> {
+        let inv_n = spiral_rs::number_theory::invert_uint_mod(poly_len as u64, modulus)
+            .expect("Failed to compute inv_N mod Q");
         let ctx = unsafe {
             init_word_offline_context(
                 db.as_ptr(),
@@ -821,6 +824,7 @@ impl WordOfflineContext {
                 modulus,
                 mod0,
                 mod1,
+                inv_n,
             )
         };
         if ctx.is_null() {
@@ -875,6 +879,7 @@ extern "C" {
         barrett_cr_0_modulus: u64,
         barrett_cr_1_modulus: u64,
         max_batch_size: usize,
+        inv_n: u64,
     ) -> *mut std::ffi::c_void;
 
     fn ypir_word_online_init_packing(
@@ -925,6 +930,8 @@ impl WordOnlineContext {
         let poly_len = params.poly_len;
         let crt_count = params.crt_count;
         let num_rlwe_outputs = db_cols / poly_len;
+        let inv_n = spiral_rs::number_theory::invert_uint_mod(poly_len as u64, params.modulus)
+            .expect("Failed to compute inv_N mod Q");
 
         let (forward_table, forward_prime_table, inverse_table, inverse_prime_table) =
             SPOnlineContext::flatten_ntt_tables(params);
@@ -951,6 +958,7 @@ impl WordOnlineContext {
                 params.barrett_cr_0_modulus,
                 params.barrett_cr_1_modulus,
                 max_batch_size,
+                inv_n,
             )
         };
 
