@@ -810,9 +810,14 @@ impl WordOfflineContext {
         modulus: u64,
         mod0: u64,
         mod1: u64,
+        apply_inv_n: bool,
     ) -> Result<Self, String> {
-        let inv_n = spiral_rs::number_theory::invert_uint_mod(poly_len as u64, modulus)
-            .expect("Failed to compute inv_N mod Q");
+        let inv_n = if apply_inv_n {
+            spiral_rs::number_theory::invert_uint_mod(poly_len as u64, modulus)
+                .expect("Failed to compute inv_N mod Q")
+        } else {
+            1u64
+        };
         let ctx = unsafe {
             init_word_offline_context(
                 db.as_ptr(),
@@ -899,6 +904,34 @@ extern "C" {
         batch_size: usize,
     );
 
+    fn ypir_word_online_compute_matmul_only(
+        context: *mut std::ffi::c_void,
+        queries: *const u64,
+        intermediate_out: *mut u64,
+        batch_size: usize,
+    );
+
+    fn ypir_word_online_init_packing_inspir(
+        context: *mut std::ffi::c_void,
+        bold_t_condensed: *const u64, bold_t_size: usize,
+        bold_t_bar_condensed: *const u64, bold_t_bar_size: usize,
+        bold_t_hat_condensed: *const u64, bold_t_hat_size: usize,
+        a_hat: *const u64, a_hat_size: usize,
+        num_iter: usize,
+        tables: *const u32, num_tables: usize,
+        gen_pows: *const u32, num_rotations: usize,
+    );
+
+    fn ypir_word_online_compute_batch_inspir(
+        context: *mut std::ffi::c_void,
+        queries: *const u64,
+        y_body_condensed: *const u64,
+        z_body_condensed: *const u64,
+        response_out: *mut u8,
+        response_bytes_per_batch: usize,
+        batch_size: usize,
+    );
+
     fn ypir_word_online_free(context: *mut std::ffi::c_void);
 }
 
@@ -926,12 +959,17 @@ impl WordOnlineContext {
         rlwe_q_prime_2: u64,
         params: &spiral_rs::params::Params,
         max_batch_size: usize,
+        apply_inv_n: bool,
     ) -> Result<Self, String> {
         let poly_len = params.poly_len;
         let crt_count = params.crt_count;
         let num_rlwe_outputs = db_cols / poly_len;
-        let inv_n = spiral_rs::number_theory::invert_uint_mod(poly_len as u64, params.modulus)
-            .expect("Failed to compute inv_N mod Q");
+        let inv_n = if apply_inv_n {
+            spiral_rs::number_theory::invert_uint_mod(poly_len as u64, params.modulus)
+                .expect("Failed to compute inv_N mod Q")
+        } else {
+            1u64
+        };
 
         let (forward_table, forward_prime_table, inverse_table, inverse_prime_table) =
             SPOnlineContext::flatten_ntt_tables(params);
@@ -1022,8 +1060,96 @@ impl WordOnlineContext {
         result
     }
 
+    /// Upload InspiRING packing precomp data (bold_t, bold_t_bar, bold_t_hat, a_hat)
+    /// and expand permutation tables, then allocate per-stream client data buffers.
+    /// Data must be in dense condensed format (stride = poly_len per polynomial).
+    pub fn init_packing_inspir(
+        &self,
+        bold_t_condensed: &[u64],
+        bold_t_bar_condensed: &[u64],
+        bold_t_hat_condensed: &[u64],
+        a_hat: &[u64],
+        num_iter: usize,
+        tables: &[u32],
+        num_tables: usize,
+        gen_pows: &[u32],
+    ) {
+        unsafe {
+            ypir_word_online_init_packing_inspir(
+                self.ctx,
+                bold_t_condensed.as_ptr(), bold_t_condensed.len() * std::mem::size_of::<u64>(),
+                bold_t_bar_condensed.as_ptr(), bold_t_bar_condensed.len() * std::mem::size_of::<u64>(),
+                bold_t_hat_condensed.as_ptr(), bold_t_hat_condensed.len() * std::mem::size_of::<u64>(),
+                a_hat.as_ptr(), a_hat.len() * std::mem::size_of::<u64>(),
+                num_iter,
+                tables.as_ptr(), num_tables,
+                gen_pows.as_ptr(), gen_pows.len(),
+            );
+        }
+    }
+
+    /// Run GEMM + GPU expand + InspiRING packing on GPU.
+    /// y_body_condensed is the unexpanded client key (tiny, t_exp_left × poly_len per client).
+    /// The GPU expands it into y_all/y_bar_all via permutation tables uploaded at init.
+    pub fn compute_batch_inspir(
+        &self,
+        queries: &[u64],
+        y_body_condensed: &[u64],
+        z_body_condensed: &[u64],
+        response_bytes_per_output: usize,
+        batch_size: usize,
+    ) -> Vec<Vec<Vec<u8>>> {
+        let response_bytes_per_batch = self.num_rlwe_outputs * response_bytes_per_output;
+        let mut response_flat = vec![0u8; batch_size * response_bytes_per_batch];
+
+        unsafe {
+            ypir_word_online_compute_batch_inspir(
+                self.ctx,
+                queries.as_ptr(),
+                y_body_condensed.as_ptr(),
+                z_body_condensed.as_ptr(),
+                response_flat.as_mut_ptr(),
+                response_bytes_per_batch,
+                batch_size,
+            );
+        }
+
+        let mut result = Vec::with_capacity(batch_size);
+        for b in 0..batch_size {
+            let batch_start = b * response_bytes_per_batch;
+            let mut outputs = Vec::with_capacity(self.num_rlwe_outputs);
+            for o in 0..self.num_rlwe_outputs {
+                let output_start = batch_start + o * response_bytes_per_output;
+                let output_end = output_start + response_bytes_per_output;
+                outputs.push(response_flat[output_start..output_end].to_vec());
+            }
+            result.push(outputs);
+        }
+        result
+    }
+
+    /// Run only Step 1 (GEMM + modswitch + inv_N) and return CRT-packed intermediates.
+    /// Used for InspiRING packing (packing done on CPU).
+    pub fn compute_matmul_only(&self, queries: &[u64], batch_size: usize) -> Vec<u64> {
+        let total = self.db_cols * batch_size;
+        let mut intermediate = vec![0u64; total];
+        unsafe {
+            ypir_word_online_compute_matmul_only(
+                self.ctx,
+                queries.as_ptr(),
+                intermediate.as_mut_ptr(),
+                batch_size,
+            );
+        }
+        intermediate
+    }
+
     pub fn num_rlwe_outputs(&self) -> usize {
         self.num_rlwe_outputs
+    }
+
+    pub fn db_cols(&self) -> usize {
+        self.db_cols
     }
 }
 

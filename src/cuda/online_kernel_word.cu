@@ -478,6 +478,179 @@ __global__ void __launch_bounds__(1024) word_pack_lwes_and_mod_switch(
     }
 }
 
+// ---------- InspiRING packing kernel ----------
+// Implements full_packing_with_preprocessing_online (with_rotations):
+//   sum = Σ_{i=0..num_iter-1} (y_all[i] · bold_t[i] + y_bar_all[i] · bold_t_bar[i])
+//       + z_body · bold_t_hat
+//   final_b = INTT(CRT_compose(sum)) + b_values   (no N multiplication)
+//   output  = modswitch([a_hat; final_b])
+
+__global__ void __launch_bounds__(1024) word_pack_lwes_inspir_and_mod_switch(
+    uint8_t* d_response_out,
+    const uint64_t* d_intermediate,     // b_values (Z_Q, one per coefficient per output)
+    const uint64_t* d_bold_t,           // per-output precomp, dense condensed
+    const uint64_t* d_bold_t_bar,
+    const uint64_t* d_bold_t_hat,
+    const uint64_t* d_a_hat,            // per-output, raw domain (Z_Q)
+    const uint64_t* d_y_all,            // per-client, dense condensed
+    const uint64_t* d_y_bar_all,
+    const uint64_t* d_z_body,           // per-client
+    uint64_t* d_scratch,                // per-stream scratch
+    size_t num_outputs,
+    size_t num_iter,                    // poly_len/2 - 1
+    size_t t_exp_left,
+    uint64_t rlwe_q_prime_1,
+    uint64_t rlwe_q_prime_2,
+    size_t response_bytes_per_output,
+    size_t inspir_scratch_per_output,
+    NTTParams params)
+{
+    size_t output_idx = blockIdx.x;
+    size_t tid = threadIdx.x;
+    size_t poly_len = params.poly_len;
+    uint64_t modulus = params.modulus;
+
+    // Cooperative NTT decomposition
+    size_t crt_count = params.crt_count;
+    size_t threads_per_crt = blockDim.x / crt_count;
+    size_t my_crt = tid / threads_per_crt;
+    size_t local_tid = tid % threads_per_crt;
+
+    // Scratch: temp_ntt (2 * poly_len) + temp_raw (2 * poly_len)
+    uint64_t* my_scratch = d_scratch + output_idx * inspir_scratch_per_output;
+    uint64_t* temp_ntt = my_scratch;
+    uint64_t* temp_raw = temp_ntt + 2 * poly_len;
+
+    // Per-output precomp pointers (dense condensed, stride = poly_len)
+    size_t bold_t_per_output = num_iter * t_exp_left * poly_len;
+    const uint64_t* my_bold_t     = d_bold_t     + output_idx * bold_t_per_output;
+    const uint64_t* my_bold_t_bar = d_bold_t_bar + output_idx * bold_t_per_output;
+    const uint64_t* my_bold_t_hat = d_bold_t_hat + output_idx * t_exp_left * poly_len;
+    const uint64_t* my_a_hat      = d_a_hat      + output_idx * poly_len;
+
+    // b_values from GEMM intermediate (Z_Q values, inv_N=1)
+    const uint64_t* b_values = d_intermediate + output_idx * poly_len;
+
+    uint8_t* my_response = d_response_out + output_idx * response_bytes_per_output;
+
+    // Load Barrett constants (will be cached in L1)
+    uint64_t bcr0 = params.barrett_cr[0];
+    uint64_t bcr1 = params.barrett_cr[1];
+    uint64_t mod0 = params.moduli[0];
+    uint64_t mod1 = params.moduli[1];
+
+    // Compute addition capacity (match Rust: 1 << (64 - 2*q2_bits - 1))
+    size_t q2_bits_0 = word_ceil_log2_u64(mod0);
+    size_t q2_bits_1 = word_ceil_log2_u64(mod1);
+    size_t max_q2_bits = q2_bits_0 > q2_bits_1 ? q2_bits_0 : q2_bits_1;
+    size_t addition_capacity = (size_t)1 << (64 - 2 * max_q2_bits - 1);
+
+    // ── Main loop: inner products in condensed NTT domain ──
+    for (size_t z = tid; z < poly_len; z += blockDim.x) {
+        uint64_t acc_lo = 0, acc_hi = 0;
+        size_t num_added = 0;
+
+        for (size_t i = 0; i < num_iter; i++) {
+            size_t base = i * t_exp_left * poly_len;
+
+            // y_all × bold_t inner product (t_exp_left terms)
+            for (size_t k = 0; k < t_exp_left; k++) {
+                uint64_t y_val = d_y_all[base + k * poly_len + z];
+                uint64_t t_val = my_bold_t[base + k * poly_len + z];
+                acc_lo += (y_val & 0xFFFFFFFF) * (t_val & 0xFFFFFFFF);
+                acc_hi += (y_val >> 32)         * (t_val >> 32);
+            }
+            num_added += t_exp_left;
+
+            // y_bar_all × bold_t_bar inner product (t_exp_left terms)
+            for (size_t k = 0; k < t_exp_left; k++) {
+                uint64_t yb_val = d_y_bar_all[base + k * poly_len + z];
+                uint64_t tb_val = my_bold_t_bar[base + k * poly_len + z];
+                acc_lo += (yb_val & 0xFFFFFFFF) * (tb_val & 0xFFFFFFFF);
+                acc_hi += (yb_val >> 32)         * (tb_val >> 32);
+            }
+            num_added += t_exp_left;
+
+            // Periodic Barrett reduction (match Rust reduction schedule)
+            if (num_added >= addition_capacity || i == num_iter - 1) {
+                acc_lo = barrett_raw_u64(acc_lo, bcr0, mod0);
+                acc_hi = barrett_raw_u64(acc_hi, bcr1, mod1);
+                num_added = 0;
+            }
+        }
+
+        // Final term: z_body × bold_t_hat (t_exp_left terms)
+        {
+            uint64_t fin_lo = 0, fin_hi = 0;
+            for (size_t k = 0; k < t_exp_left; k++) {
+                uint64_t z_val  = d_z_body[k * poly_len + z];
+                uint64_t th_val = my_bold_t_hat[k * poly_len + z];
+                fin_lo += (z_val & 0xFFFFFFFF) * (th_val & 0xFFFFFFFF);
+                fin_hi += (z_val >> 32)         * (th_val >> 32);
+            }
+            fin_lo = barrett_raw_u64(fin_lo, bcr0, mod0);
+            fin_hi = barrett_raw_u64(fin_hi, bcr1, mod1);
+
+            // Add final term with Barrett (matches fast_add_into with reduce)
+            acc_lo = acc_lo + fin_lo;
+            if (acc_lo >= mod0) acc_lo -= mod0;
+            acc_hi = acc_hi + fin_hi;
+            if (acc_hi >= mod1) acc_hi -= mod1;
+        }
+
+        // Store CRT components for INTT
+        temp_ntt[z]            = acc_lo;
+        temp_ntt[poly_len + z] = acc_hi;
+    }
+    __syncthreads();
+
+    // ── INTT both CRT components ──
+    if (my_crt < crt_count)
+        ntt_inverse_kernel_parallel(temp_ntt + my_crt * poly_len, &params, my_crt, local_tid, threads_per_crt);
+    __syncthreads();
+
+    // ── CRT compose + add b_values → raw domain ──
+    for (size_t z = tid; z < poly_len; z += blockDim.x) {
+        uint64_t x     = temp_ntt[z];
+        uint64_t y_val = temp_ntt[poly_len + z];
+        uint64_t sum_raw = crt_compose_2(x, y_val, &params);
+
+        // final_b = sum_raw + b_values[z] (mod Q, no N multiplication)
+        uint64_t final_b = sum_raw + b_values[z];
+        final_b -= modulus * (final_b >= modulus);
+
+        temp_raw[poly_len + z] = final_b;   // body (row 1)
+        temp_raw[z]            = my_a_hat[z]; // mask (row 0, a_hat already raw)
+    }
+    __syncthreads();
+
+    // ── Modswitch and bit-pack (same format as CDKS) ──
+    size_t q_1_bits = word_ceil_log2_u64(rlwe_q_prime_2);
+    size_t q_2_bits = word_ceil_log2_u64(rlwe_q_prime_1);
+
+    // Zero response bytes
+    for (size_t i = tid; i < response_bytes_per_output; i += blockDim.x)
+        my_response[i] = 0;
+    __syncthreads();
+
+    // Row 0 (mask/a_hat): rescale Q → q_prime_2
+    for (size_t z = tid; z < poly_len; z += blockDim.x) {
+        uint64_t val = temp_raw[z];
+        double d_val = (double)val;
+        uint64_t val_rescaled = (uint64_t)((d_val * (double)rlwe_q_prime_2) / (double)modulus + 0.5);
+        word_write_arbitrary_bits(my_response, val_rescaled, z * q_1_bits, q_1_bits);
+    }
+    __syncthreads();
+
+    // Row 1 (body/final_b): rescale Q → q_prime_1
+    for (size_t z = tid; z < poly_len; z += blockDim.x) {
+        uint64_t val = temp_raw[poly_len + z];
+        double d_val = (double)val;
+        uint64_t val_rescaled = (uint64_t)((d_val * (double)rlwe_q_prime_1) / (double)modulus + 0.5);
+        word_write_arbitrary_bits(my_response, val_rescaled, poly_len * q_1_bits + z * q_2_bits, q_2_bits);
+    }
+}
+
 // ---------- Context ----------
 
 struct WordOnlineContext {
@@ -531,7 +704,61 @@ struct WordOnlineContext {
     uint64_t inv_n;      // N^{-1} mod Q, compensates CDKS N-multiplication
     uint64_t rlwe_q_prime_1;
     uint64_t rlwe_q_prime_2;
+
+    // InspiRING packing data (per-output precomp, uploaded once)
+    bool is_inspir;
+    uint64_t* d_bold_t_condensed;      // num_outputs * bold_t_per_output
+    uint64_t* d_bold_t_bar_condensed;  // same
+    uint64_t* d_bold_t_hat_condensed;  // num_outputs * t_exp_left * poly_len
+    uint64_t* d_a_hat;                 // num_outputs * poly_len (raw domain)
+    size_t bold_t_per_output;          // num_iter * t_exp_left * poly_len
+    size_t num_iter;                   // poly_len/2 - 1
+    size_t inspir_scratch_per_output;  // 4 * poly_len (temp_ntt + temp_raw)
+
+    // Per-stream InspiRING client data buffers
+    uint64_t* d_y_all_streams;         // num_streams * y_all_per_client
+    uint64_t* d_y_bar_all_streams;     // same
+    uint64_t* d_z_body_streams;        // num_streams * z_body_per_client
+    size_t y_all_per_client;           // num_iter * t_exp_left * poly_len
+    size_t z_body_per_client;          // t_exp_left * poly_len
+
+    // Expand data (uploaded once during init, used by expand_rotations_double kernel)
+    uint32_t* d_tables;                // num_tables * poly_len
+    uint32_t* d_gen_pows;              // num_rotations
+    size_t num_tables;
+    size_t num_rotations;              // poly_len/2 - 1
+    uint64_t* d_y_body_streams;        // num_streams * z_body_per_client (expand input)
 };
+
+// ---------- Expand rotations kernel ----------
+// Generates y_all and y_bar_all from y_body via permutation tables.
+// Each block handles one rotation. Threads loop over poly_len elements.
+__global__ void expand_rotations_double(
+    uint64_t* __restrict__ d_y_all,         // [num_rotations * t_exp_left * poly_len]
+    uint64_t* __restrict__ d_y_bar_all,     // same
+    const uint64_t* __restrict__ d_y_body,  // [t_exp_left * poly_len] condensed
+    const uint32_t* __restrict__ d_tables,  // [num_tables * poly_len]
+    const uint32_t* __restrict__ d_gen_pows,// [num_rotations]
+    size_t t_exp_left,
+    size_t poly_len)
+{
+    size_t rot = blockIdx.x;
+    uint32_t t = d_gen_pows[rot];
+    uint32_t tidx1 = (t - 1) / 2;
+    uint32_t tidx2 = (2 * (uint32_t)poly_len - t - 1) / 2;
+    const uint32_t* tab1 = d_tables + (size_t)tidx1 * poly_len;
+    const uint32_t* tab2 = d_tables + (size_t)tidx2 * poly_len;
+
+    for (size_t k = 0; k < t_exp_left; k++) {
+        const uint64_t* src = d_y_body + k * poly_len;
+        uint64_t* dst1 = d_y_all + (rot * t_exp_left + k) * poly_len;
+        uint64_t* dst2 = d_y_bar_all + (rot * t_exp_left + k) * poly_len;
+        for (size_t z = threadIdx.x; z < poly_len; z += blockDim.x) {
+            dst1[z] = src[tab1[z]];
+            dst2[z] = src[tab2[z]];
+        }
+    }
+}
 
 // ---------- C API ----------
 
@@ -626,6 +853,26 @@ void* ypir_word_online_init(
     ctx->d_scratch_batch = nullptr;
     ctx->d_pub_params_all = nullptr;
     ctx->d_all_responses = nullptr;
+
+    // InspiRING fields (initialized later via init_packing_inspir if needed)
+    ctx->is_inspir = false;
+    ctx->d_bold_t_condensed = nullptr;
+    ctx->d_bold_t_bar_condensed = nullptr;
+    ctx->d_bold_t_hat_condensed = nullptr;
+    ctx->d_a_hat = nullptr;
+    ctx->bold_t_per_output = 0;
+    ctx->num_iter = 0;
+    ctx->inspir_scratch_per_output = 0;
+    ctx->d_y_all_streams = nullptr;
+    ctx->d_y_bar_all_streams = nullptr;
+    ctx->d_z_body_streams = nullptr;
+    ctx->y_all_per_client = 0;
+    ctx->z_body_per_client = 0;
+    ctx->d_tables = nullptr;
+    ctx->d_gen_pows = nullptr;
+    ctx->num_tables = 0;
+    ctx->num_rotations = 0;
+    ctx->d_y_body_streams = nullptr;
 
     {
         int device;
@@ -753,6 +1000,109 @@ void ypir_word_online_init_packing(
     ctx->d_scratch_batch = new uint64_t*[num_streams];
     for (size_t i = 0; i < num_streams; i++) {
         CUDA_ASSERT(cudaMalloc(&ctx->d_scratch_batch[i], per_stream_bytes));
+    }
+
+    CUDA_ASSERT(cudaDeviceSynchronize());
+}
+
+void ypir_word_online_init_packing_inspir(
+    void* context,
+    const uint64_t* bold_t_condensed,      size_t bold_t_size,
+    const uint64_t* bold_t_bar_condensed,  size_t bold_t_bar_size,
+    const uint64_t* bold_t_hat_condensed,  size_t bold_t_hat_size,
+    const uint64_t* a_hat,                 size_t a_hat_size,
+    size_t num_iter,      // poly_len/2 - 1
+    const uint32_t* tables,                size_t num_tables,
+    const uint32_t* gen_pows,              size_t num_rotations)
+{
+    WordOnlineContext* ctx = (WordOnlineContext*)context;
+    if (!ctx) return;
+
+    ctx->is_inspir = true;
+    ctx->num_iter = num_iter;
+    size_t poly_len = ctx->ntt_params.poly_len;
+    size_t t_exp = ctx->t_exp_left;
+
+    // Per-output precomp sizes (dense condensed, stride = poly_len)
+    ctx->bold_t_per_output = num_iter * t_exp * poly_len;
+    ctx->inspir_scratch_per_output = 4 * poly_len;  // temp_ntt + temp_raw
+
+    // Per-client data sizes
+    ctx->y_all_per_client  = num_iter * t_exp * poly_len;
+    ctx->z_body_per_client = t_exp * poly_len;
+
+    // Upload per-output precomp data
+    CUDA_ALLOC_AND_COPY(ctx->d_bold_t_condensed,     bold_t_condensed,     bold_t_size);
+    CUDA_ALLOC_AND_COPY(ctx->d_bold_t_bar_condensed, bold_t_bar_condensed, bold_t_bar_size);
+    CUDA_ALLOC_AND_COPY(ctx->d_bold_t_hat_condensed, bold_t_hat_condensed, bold_t_hat_size);
+    CUDA_ALLOC_AND_COPY(ctx->d_a_hat,                a_hat,                a_hat_size);
+
+    printf("InspiRING precomp uploaded: bold_t %.2f MB, bold_t_bar %.2f MB, bold_t_hat %.2f MB, a_hat %.2f MB\n",
+        bold_t_size / 1e6, bold_t_bar_size / 1e6, bold_t_hat_size / 1e6, a_hat_size / 1e6);
+
+    // Upload expand permutation tables and generator powers (once, shared across all clients)
+    ctx->num_tables = num_tables;
+    ctx->num_rotations = num_rotations;
+    CUDA_ALLOC_AND_COPY(ctx->d_tables, tables, num_tables * poly_len * sizeof(uint32_t));
+    CUDA_ALLOC_AND_COPY(ctx->d_gen_pows, gen_pows, num_rotations * sizeof(uint32_t));
+
+    printf("Expand tables uploaded: %zu tables × %zu = %.2f MB, gen_pows %zu × 4 = %.2f KB\n",
+        num_tables, poly_len,
+        num_tables * poly_len * sizeof(uint32_t) / 1e6,
+        num_rotations, num_rotations * 4 / 1e3);
+
+    // ── Determine num_streams based on remaining GPU memory ──
+    // Per-stream: y_all + y_bar_all (generated by expand) + z_body + y_body (expand input) + scratch
+
+    size_t per_stream_bytes =
+        ctx->y_all_per_client * sizeof(uint64_t) +       // y_all (generated by expand kernel)
+        ctx->y_all_per_client * sizeof(uint64_t) +       // y_bar_all (generated by expand kernel)
+        ctx->z_body_per_client * sizeof(uint64_t) +      // z_body (uploaded)
+        ctx->z_body_per_client * sizeof(uint64_t) +      // y_body (uploaded, expand input)
+        ctx->num_rlwe_outputs * ctx->inspir_scratch_per_output * sizeof(uint64_t);  // scratch
+
+    size_t free_mem, total_mem;
+    CUDA_ASSERT(cudaMemGetInfo(&free_mem, &total_mem));
+    size_t usable = (free_mem * 9) / 10;
+
+    size_t num_streams = usable / per_stream_bytes;
+    if (num_streams < 1) {
+        fprintf(stderr, "ERROR: Not enough GPU memory for even 1 InspiRING stream. "
+                "Required per stream: %.2f MB, free: %.2f MB\n",
+                per_stream_bytes / 1e6, free_mem / 1e6);
+        abort();
+    }
+    if (num_streams > ctx->max_batch_size) num_streams = ctx->max_batch_size;
+    ctx->num_streams = num_streams;
+
+    printf("InspiRING GPU: %.1f MB free, per-stream %.2f MB (y_all %.2f + y_body %.2f + scratch %.2f), "
+           "using %zu parallel streams (expand on GPU)\n",
+        free_mem / 1e6, per_stream_bytes / 1e6,
+        ctx->y_all_per_client * sizeof(uint64_t) * 2 / 1e6,
+        ctx->z_body_per_client * sizeof(uint64_t) * 2 / 1e6,
+        ctx->num_rlwe_outputs * ctx->inspir_scratch_per_output * sizeof(uint64_t) / 1e6,
+        num_streams);
+
+    // Create CUDA streams
+    ctx->streams = new cudaStream_t[num_streams];
+    for (size_t i = 0; i < num_streams; i++) {
+        CUDA_ASSERT(cudaStreamCreate(&ctx->streams[i]));
+    }
+
+    // Per-stream client data buffers
+    size_t y_all_bytes     = ctx->y_all_per_client * sizeof(uint64_t);
+    size_t z_body_bytes    = ctx->z_body_per_client * sizeof(uint64_t);
+    size_t scratch_bytes   = ctx->num_rlwe_outputs * ctx->inspir_scratch_per_output * sizeof(uint64_t);
+
+    CUDA_ASSERT(cudaMalloc(&ctx->d_y_all_streams,     num_streams * y_all_bytes));
+    CUDA_ASSERT(cudaMalloc(&ctx->d_y_bar_all_streams, num_streams * y_all_bytes));
+    CUDA_ASSERT(cudaMalloc(&ctx->d_z_body_streams,    num_streams * z_body_bytes));
+    CUDA_ASSERT(cudaMalloc(&ctx->d_y_body_streams,    num_streams * z_body_bytes));
+
+    // Per-stream scratch allocations
+    ctx->d_scratch_batch = new uint64_t*[num_streams];
+    for (size_t i = 0; i < num_streams; i++) {
+        CUDA_ASSERT(cudaMalloc(&ctx->d_scratch_batch[i], scratch_bytes));
     }
 
     CUDA_ASSERT(cudaDeviceSynchronize());
@@ -942,6 +1292,316 @@ void ypir_word_online_compute_batch(
                            cudaMemcpyDeviceToHost));
 }
 
+// Step 1 only: GEMM + modswitch + inv_N, then copy intermediates to host.
+// Used for InspiRING packing (packing done on CPU).
+void ypir_word_online_compute_matmul_only(
+    void* context,
+    const uint64_t* queries,          // batch_size × db_rows (raw u64)
+    uint64_t* intermediate_out,       // host buffer: batch_size × db_cols
+    size_t batch_size)
+{
+    WordOnlineContext* ctx = (WordOnlineContext*)context;
+    if (!ctx || batch_size == 0) return;
+    if (batch_size > ctx->max_batch_size) {
+        fprintf(stderr, "batch_size %zu exceeds max_batch_size %zu\n", batch_size, ctx->max_batch_size);
+        abort();
+    }
+
+    size_t M = ctx->db_cols;
+    size_t K = ctx->db_rows;
+    size_t N = batch_size;
+
+    // ── Step 1: GEMM (full batch, default stream) ──
+
+    if (ctx->has_tensor_cores) {
+        // Upload queries and decompose to bytes
+        size_t q_elems = N * K;
+        uint64_t* d_query_raw;
+        CUDA_ALLOC_AND_COPY(d_query_raw, queries, q_elems * sizeof(uint64_t));
+        {
+            int threads = 256;
+            int blocks = (q_elems + threads - 1) / threads;
+            word_decompose_u64_bytes<<<blocks, threads>>>(
+                ctx->d_query_bytes[0], ctx->d_query_bytes[1],
+                ctx->d_query_bytes[2], ctx->d_query_bytes[3],
+                ctx->d_query_bytes[4], ctx->d_query_bytes[5],
+                ctx->d_query_bytes[6], ctx->d_query_bytes[7],
+                d_query_raw, q_elems);
+            CUDA_ASSERT(cudaGetLastError());
+        }
+        CUDA_ASSERT(cudaFree(d_query_raw));
+
+        // 15 cuBLAS GEMMs
+        for (int g = 0; g < 15; g++) {
+            const WordGemmSpec& s = WORD_ONLINE_SPECS[g];
+            CUBLAS_CHECK(cublasGemmEx(ctx->cublas_handle,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                (int)M, (int)N, (int)K,
+                &s.alpha,
+                ctx->d_db_bytes[s.db_b],    CUDA_R_8I, (int)ctx->db_rows_padded,
+                ctx->d_query_bytes[s.q_b],  CUDA_R_8I, (int)K,
+                &s.beta,
+                ctx->d_partials[s.out],     CUDA_R_32I, (int)M,
+                CUBLAS_COMPUTE_32I,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        }
+
+        // Combine + modswitch + multiply by inv_N
+        {
+            size_t count = M * N;
+            int threads = 256;
+            int blocks = (count + threads - 1) / threads;
+            word_combine_modswitch_crt<<<blocks, threads>>>(
+                ctx->d_intermediate, ctx->d_partials[0], ctx->d_partials[1],
+                count, ctx->modulus, ctx->mod0, ctx->mod1, ctx->inv_n);
+            CUDA_ASSERT(cudaGetLastError());
+        }
+
+    } else {
+        // Upload queries
+        size_t q_elems = N * K;
+        CUDA_ASSERT(cudaMemcpy(ctx->d_query_buf, queries,
+                               q_elems * sizeof(uint64_t), cudaMemcpyHostToDevice));
+
+        // CUTLASS GEMM: uint16 DB × uint64 query → uint64
+        cutlass::gemm::GemmCoord problem_size(M, N, K);
+        uint64_t alpha = 1, beta = 0;
+        CutlassGemmWord::Arguments args{
+            problem_size,
+            {ctx->d_db_u16, (int)ctx->db_rows_padded},
+            {ctx->d_query_buf, (int)K},
+            {ctx->d_result_u64, (int)M},
+            {ctx->d_result_u64, (int)M},
+            {alpha, beta}, 1
+        };
+        CutlassGemmWord gemm_op;
+        cutlass::Status status = gemm_op.initialize(args, nullptr);
+        if (status != cutlass::Status::kSuccess) {
+            fprintf(stderr, "CUTLASS init failed: %s\n", cutlassGetStatusString(status));
+            abort();
+        }
+        status = gemm_op();
+        if (status != cutlass::Status::kSuccess) {
+            fprintf(stderr, "CUTLASS GEMM failed: %s\n", cutlassGetStatusString(status));
+            abort();
+        }
+
+        // Modswitch + multiply by inv_N in-place, then copy to d_intermediate
+        {
+            size_t count = M * N;
+            int threads = 256;
+            int blocks = (count + threads - 1) / threads;
+            word_modswitch_crt_inplace<<<blocks, threads>>>(
+                ctx->d_result_u64, count, ctx->modulus, ctx->mod0, ctx->mod1, ctx->inv_n);
+            CUDA_ASSERT(cudaGetLastError());
+        }
+        CUDA_ASSERT(cudaMemcpy(ctx->d_intermediate, ctx->d_result_u64,
+                               M * N * sizeof(uint64_t), cudaMemcpyDeviceToDevice));
+    }
+
+    CUDA_ASSERT(cudaDeviceSynchronize());
+
+    // Download intermediates to host
+    CUDA_ASSERT(cudaMemcpy(intermediate_out, ctx->d_intermediate,
+                           M * N * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+}
+
+void ypir_word_online_compute_batch_inspir(
+    void* context,
+    const uint64_t* queries,                  // batch_size × db_rows (raw u64)
+    const uint64_t* y_body_condensed,         // batch_size × z_body_per_client (tiny, expand input)
+    const uint64_t* z_body_condensed,         // batch_size × z_body_per_client
+    uint8_t* response_out,
+    size_t response_bytes_per_batch,
+    size_t batch_size)
+{
+    WordOnlineContext* ctx = (WordOnlineContext*)context;
+    if (!ctx || batch_size == 0) return;
+    if (batch_size > ctx->max_batch_size) {
+        fprintf(stderr, "batch_size %zu exceeds max_batch_size %zu\n", batch_size, ctx->max_batch_size);
+        abort();
+    }
+
+    GpuTimer t;
+
+    size_t M = ctx->db_cols;
+    size_t K = ctx->db_rows;
+    size_t N = batch_size;
+
+    size_t poly_len    = ctx->ntt_params.poly_len;
+    size_t num_outputs = ctx->num_rlwe_outputs;
+
+    // ── Step 1: GEMM (full batch, default stream) ──
+
+    t.tic();
+
+    if (ctx->has_tensor_cores) {
+        size_t q_elems = N * K;
+        uint64_t* d_query_raw;
+        CUDA_ALLOC_AND_COPY(d_query_raw, queries, q_elems * sizeof(uint64_t));
+        {
+            int threads = 256;
+            int blocks = (q_elems + threads - 1) / threads;
+            word_decompose_u64_bytes<<<blocks, threads>>>(
+                ctx->d_query_bytes[0], ctx->d_query_bytes[1],
+                ctx->d_query_bytes[2], ctx->d_query_bytes[3],
+                ctx->d_query_bytes[4], ctx->d_query_bytes[5],
+                ctx->d_query_bytes[6], ctx->d_query_bytes[7],
+                d_query_raw, q_elems);
+            CUDA_ASSERT(cudaGetLastError());
+        }
+        CUDA_ASSERT(cudaFree(d_query_raw));
+
+        for (int g = 0; g < 15; g++) {
+            const WordGemmSpec& s = WORD_ONLINE_SPECS[g];
+            CUBLAS_CHECK(cublasGemmEx(ctx->cublas_handle,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                (int)M, (int)N, (int)K,
+                &s.alpha,
+                ctx->d_db_bytes[s.db_b],    CUDA_R_8I, (int)ctx->db_rows_padded,
+                ctx->d_query_bytes[s.q_b],  CUDA_R_8I, (int)K,
+                &s.beta,
+                ctx->d_partials[s.out],     CUDA_R_32I, (int)M,
+                CUBLAS_COMPUTE_32I,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        }
+
+        {
+            size_t count = M * N;
+            int threads = 256;
+            int blocks = (count + threads - 1) / threads;
+            word_combine_modswitch_crt<<<blocks, threads>>>(
+                ctx->d_intermediate, ctx->d_partials[0], ctx->d_partials[1],
+                count, ctx->modulus, ctx->mod0, ctx->mod1, ctx->inv_n);
+            CUDA_ASSERT(cudaGetLastError());
+        }
+
+    } else {
+        size_t q_elems = N * K;
+        CUDA_ASSERT(cudaMemcpy(ctx->d_query_buf, queries,
+                               q_elems * sizeof(uint64_t), cudaMemcpyHostToDevice));
+
+        cutlass::gemm::GemmCoord problem_size(M, N, K);
+        uint64_t alpha = 1, beta = 0;
+        CutlassGemmWord::Arguments args{
+            problem_size,
+            {ctx->d_db_u16, (int)ctx->db_rows_padded},
+            {ctx->d_query_buf, (int)K},
+            {ctx->d_result_u64, (int)M},
+            {ctx->d_result_u64, (int)M},
+            {alpha, beta}, 1
+        };
+        CutlassGemmWord gemm_op;
+        cutlass::Status status = gemm_op.initialize(args, nullptr);
+        if (status != cutlass::Status::kSuccess) {
+            fprintf(stderr, "CUTLASS init failed: %s\n", cutlassGetStatusString(status));
+            abort();
+        }
+        status = gemm_op();
+        if (status != cutlass::Status::kSuccess) {
+            fprintf(stderr, "CUTLASS GEMM failed: %s\n", cutlassGetStatusString(status));
+            abort();
+        }
+
+        {
+            size_t count = M * N;
+            int threads = 256;
+            int blocks = (count + threads - 1) / threads;
+            word_modswitch_crt_inplace<<<blocks, threads>>>(
+                ctx->d_result_u64, count, ctx->modulus, ctx->mod0, ctx->mod1, ctx->inv_n);
+            CUDA_ASSERT(cudaGetLastError());
+        }
+        CUDA_ASSERT(cudaMemcpy(ctx->d_intermediate, ctx->d_result_u64,
+                               M * N * sizeof(uint64_t), cudaMemcpyDeviceToDevice));
+    }
+
+    CUDA_ASSERT(cudaDeviceSynchronize());
+    float ms1 = t.toc_ms();
+
+    // ── Step 2: InspiRING packing (chunked by num_streams) ──
+
+    t.tic();
+
+    size_t resp_bytes_per_batch = num_outputs * ctx->response_bytes_per_output;
+    size_t z_body_bytes = ctx->z_body_per_client * sizeof(uint64_t);
+    int threads_pack = 1024;
+
+    for (size_t chunk_start = 0; chunk_start < batch_size; chunk_start += ctx->num_streams) {
+        size_t chunk_end = chunk_start + ctx->num_streams;
+        if (chunk_end > batch_size) chunk_end = batch_size;
+
+        for (size_t i = chunk_start; i < chunk_end; i++) {
+            size_t s = i - chunk_start;
+            cudaStream_t stream = ctx->streams[s];
+
+            // Per-stream buffer pointers
+            uint64_t* d_y_body_s    = ctx->d_y_body_streams    + s * ctx->z_body_per_client;
+            uint64_t* d_y_all_s     = ctx->d_y_all_streams     + s * ctx->y_all_per_client;
+            uint64_t* d_y_bar_all_s = ctx->d_y_bar_all_streams + s * ctx->y_all_per_client;
+            uint64_t* d_z_body_s    = ctx->d_z_body_streams    + s * ctx->z_body_per_client;
+
+            // Async upload y_body (tiny, ~48KB) and z_body (~48KB)
+            CUDA_ASSERT(cudaMemcpyAsync(d_y_body_s,
+                y_body_condensed + i * ctx->z_body_per_client,
+                z_body_bytes, cudaMemcpyHostToDevice, stream));
+            CUDA_ASSERT(cudaMemcpyAsync(d_z_body_s,
+                z_body_condensed + i * ctx->z_body_per_client,
+                z_body_bytes, cudaMemcpyHostToDevice, stream));
+
+            // Expand y_body → y_all + y_bar_all via permutation tables
+            expand_rotations_double<<<ctx->num_rotations, 256, 0, stream>>>(
+                d_y_all_s, d_y_bar_all_s,
+                d_y_body_s,
+                ctx->d_tables,
+                ctx->d_gen_pows,
+                ctx->t_exp_left,
+                poly_len);
+            CUDA_ASSERT(cudaGetLastError());
+
+            // Pointers for this batch item
+            uint8_t* d_resp_i = ctx->d_all_responses + i * resp_bytes_per_batch;
+            const uint64_t* d_inter_i = ctx->d_intermediate + i * M;
+
+            word_pack_lwes_inspir_and_mod_switch<<<num_outputs, threads_pack, 0, stream>>>(
+                d_resp_i,
+                d_inter_i,
+                ctx->d_bold_t_condensed,
+                ctx->d_bold_t_bar_condensed,
+                ctx->d_bold_t_hat_condensed,
+                ctx->d_a_hat,
+                d_y_all_s,
+                d_y_bar_all_s,
+                d_z_body_s,
+                ctx->d_scratch_batch[s],
+                num_outputs,
+                ctx->num_iter,
+                ctx->t_exp_left,
+                ctx->rlwe_q_prime_1,
+                ctx->rlwe_q_prime_2,
+                ctx->response_bytes_per_output,
+                ctx->inspir_scratch_per_output,
+                ctx->ntt_params);
+            CUDA_ASSERT(cudaGetLastError());
+        }
+
+        for (size_t i = chunk_start; i < chunk_end; i++) {
+            size_t s = i - chunk_start;
+            CUDA_ASSERT(cudaStreamSynchronize(ctx->streams[s]));
+        }
+    }
+
+    float ms2 = t.toc_ms();
+
+    printf("Word InspiRING Step1(%s) %.3f ms, Step2 (%zu streams, %zu chunks) %.3f ms\n",
+           ctx->has_tensor_cores ? "TC" : "SIMT", ms1,
+           ctx->num_streams, (batch_size + ctx->num_streams - 1) / ctx->num_streams, ms2);
+
+    // Download all responses
+    CUDA_ASSERT(cudaMemcpy(response_out, ctx->d_all_responses,
+                           batch_size * resp_bytes_per_batch,
+                           cudaMemcpyDeviceToHost));
+}
+
 void ypir_word_online_free(void* context)
 {
     WordOnlineContext* ctx = (WordOnlineContext*)context;
@@ -966,6 +1626,18 @@ void ypir_word_online_free(void* context)
 
     if (ctx->d_pub_params_all) cudaFree(ctx->d_pub_params_all);
     if (ctx->d_all_responses)  cudaFree(ctx->d_all_responses);
+
+    // InspiRING allocations
+    if (ctx->d_bold_t_condensed)     cudaFree(ctx->d_bold_t_condensed);
+    if (ctx->d_bold_t_bar_condensed) cudaFree(ctx->d_bold_t_bar_condensed);
+    if (ctx->d_bold_t_hat_condensed) cudaFree(ctx->d_bold_t_hat_condensed);
+    if (ctx->d_a_hat)                cudaFree(ctx->d_a_hat);
+    if (ctx->d_y_all_streams)        cudaFree(ctx->d_y_all_streams);
+    if (ctx->d_y_bar_all_streams)    cudaFree(ctx->d_y_bar_all_streams);
+    if (ctx->d_z_body_streams)       cudaFree(ctx->d_z_body_streams);
+    if (ctx->d_tables)               cudaFree(ctx->d_tables);
+    if (ctx->d_gen_pows)             cudaFree(ctx->d_gen_pows);
+    if (ctx->d_y_body_streams)       cudaFree(ctx->d_y_body_streams);
 
     // Free per-stream scratch and streams
     if (ctx->d_scratch_batch) {

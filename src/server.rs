@@ -938,7 +938,7 @@ where
                 let w_bar_all = offline_packing_keys.w_bar_all.as_ref().unwrap();
                 let v_mask = offline_packing_keys.v_mask.as_ref().unwrap();
 
-                let precomp_i = crate::packing::full_packing_with_preprocessing_offline_without_rotations(
+                let precomp_i = crate::packing::full_packing_with_preprocessing_offline(
                     &packing_params,
                     w_all,
                     w_bar_all,
@@ -1170,6 +1170,7 @@ where
                 params.modulus,
                 params.moduli[0],
                 params.moduli[1],
+                packing != PackingType::InspiRING,
             ).expect("Failed to initialize Word offline GPU context");
             let init_time = init_start.elapsed();
 
@@ -1202,6 +1203,8 @@ where
         if let Some(measurement) = measurement {
             measurement.offline.simplepir_prep_time_ms = simplepir_prep_time_ms as usize;
         }
+
+        // With apply_inv_n=false for InspiRING, the GPU hint already has the correct scaling.
 
         let now = Instant::now();
         let y_constants = generate_y_constants(&params);
@@ -1245,7 +1248,7 @@ where
                 let w_bar_all = offline_packing_keys.w_bar_all.as_ref().unwrap();
                 let v_mask = offline_packing_keys.v_mask.as_ref().unwrap();
 
-                let precomp_i = crate::packing::full_packing_with_preprocessing_offline_without_rotations(
+                let precomp_i = crate::packing::full_packing_with_preprocessing_offline(
                     &packing_params,
                     w_all,
                     w_bar_all,
@@ -1296,43 +1299,99 @@ where
                     params.get_q_prime_2(),
                     params,
                     256, // max_batch_size
+                    packing != PackingType::InspiRING,
                 ) {
                     Ok(ctx) => {
-                        // Flatten packing data (same as SP path)
-                        let mut y_constants_flat = Vec::new();
-                        for m in &y_constants.0 { y_constants_flat.extend_from_slice(m.as_slice()); }
-                        for m in &y_constants.1 { y_constants_flat.extend_from_slice(m.as_slice()); }
+                        if packing == PackingType::InspiRING {
+                            // InspiRING: upload bold_t, bold_t_bar, bold_t_hat, a_hat
+                            let inspir_vec = inspir_precomp_vec.as_ref().unwrap();
+                            let mut bold_t_flat = Vec::new();
+                            let mut bold_t_bar_flat = Vec::new();
+                            let mut bold_t_hat_flat = Vec::new();
+                            let mut a_hat_flat = Vec::new();
 
-                        let mut precomp_res_flat = Vec::new();
-                        let mut precomp_vals_flat = Vec::new();
-                        let mut precomp_tables_flat = Vec::new();
+                            for precomp_i in inspir_vec {
+                                for row in 0..precomp_i.bold_t_condensed.rows {
+                                    for col in 0..precomp_i.bold_t_condensed.cols {
+                                        let poly = precomp_i.bold_t_condensed.get_poly(row, col);
+                                        bold_t_flat.extend_from_slice(&poly[..params.poly_len]);
+                                    }
+                                }
+                                for row in 0..precomp_i.bold_t_bar_condensed.rows {
+                                    for col in 0..precomp_i.bold_t_bar_condensed.cols {
+                                        let poly = precomp_i.bold_t_bar_condensed.get_poly(row, col);
+                                        bold_t_bar_flat.extend_from_slice(&poly[..params.poly_len]);
+                                    }
+                                }
+                                for row in 0..precomp_i.bold_t_hat_condensed.rows {
+                                    for col in 0..precomp_i.bold_t_hat_condensed.cols {
+                                        let poly = precomp_i.bold_t_hat_condensed.get_poly(row, col);
+                                        bold_t_hat_flat.extend_from_slice(&poly[..params.poly_len]);
+                                    }
+                                }
+                                a_hat_flat.extend_from_slice(precomp_i.a_hat.get_poly(0, 0));
+                            }
 
-                        for (res, vals, tables) in &precomp {
-                            precomp_res_flat.extend_from_slice(res.as_slice());
-                            for v in vals {
-                                let condensed = condense_matrix(params, v);
-                                for row in 0..v.rows {
-                                    let poly = condensed.get_poly(row, 0);
-                                    precomp_vals_flat.extend_from_slice(&poly[..params.poly_len]);
+                            let num_iter = params.poly_len / 2 - 1;
+
+                            // Flatten permutation tables and gen_pows for GPU expand
+                            let pp = inspir_packing_params.as_ref().unwrap();
+                            let tables_flat: Vec<u32> = pp.tables.iter()
+                                .flat_map(|t| t.iter().map(|&v| v as u32))
+                                .collect();
+                            let num_tables = pp.tables.len();
+                            let gen_pows_flat: Vec<u32> = pp.gen_pows[..num_iter]
+                                .iter()
+                                .map(|&v| v as u32)
+                                .collect();
+
+                            ctx.init_packing_inspir(
+                                &bold_t_flat,
+                                &bold_t_bar_flat,
+                                &bold_t_hat_flat,
+                                &a_hat_flat,
+                                num_iter,
+                                &tables_flat,
+                                num_tables,
+                                &gen_pows_flat,
+                            );
+                        } else {
+                            // CDKS: flatten packing data (same as SP path)
+                            let mut y_constants_flat = Vec::new();
+                            for m in &y_constants.0 { y_constants_flat.extend_from_slice(m.as_slice()); }
+                            for m in &y_constants.1 { y_constants_flat.extend_from_slice(m.as_slice()); }
+
+                            let mut precomp_res_flat = Vec::new();
+                            let mut precomp_vals_flat = Vec::new();
+                            let mut precomp_tables_flat = Vec::new();
+
+                            for (res, vals, tables) in &precomp {
+                                precomp_res_flat.extend_from_slice(res.as_slice());
+                                for v in vals {
+                                    let condensed = condense_matrix(params, v);
+                                    for row in 0..v.rows {
+                                        let poly = condensed.get_poly(row, 0);
+                                        precomp_vals_flat.extend_from_slice(&poly[..params.poly_len]);
+                                    }
+                                }
+                                // Extract CDKS tables in the order CUDA expects:
+                                // table[0] → t=(1<<ell)+1, table[1] → t=(1<<(ell-1))+1, ..., table[ell-1] → t=3
+                                for cur_ell in (1..=params.poly_len_log2).rev() {
+                                    let t = (1 << cur_ell) + 1;
+                                    let full_table_idx = (t - 1) / 2;
+                                    for &val in &tables[full_table_idx] {
+                                        precomp_tables_flat.push(val as u64);
+                                    }
                                 }
                             }
-                            // Extract CDKS tables in the order CUDA expects:
-                            // table[0] → t=(1<<ell)+1, table[1] → t=(1<<(ell-1))+1, ..., table[ell-1] → t=3
-                            for cur_ell in (1..=params.poly_len_log2).rev() {
-                                let t = (1 << cur_ell) + 1;
-                                let full_table_idx = (t - 1) / 2;
-                                for &val in &tables[full_table_idx] {
-                                    precomp_tables_flat.push(val as u64);
-                                }
-                            }
+
+                            ctx.init_packing(
+                                &y_constants_flat,
+                                &precomp_res_flat,
+                                &precomp_vals_flat,
+                                &precomp_tables_flat,
+                            );
                         }
-
-                        ctx.init_packing(
-                            &y_constants_flat,
-                            &precomp_res_flat,
-                            &precomp_vals_flat,
-                            &precomp_tables_flat,
-                        );
 
                         debug!("Word CUDA online context initialized");
                         Some(std::sync::Arc::new(ctx))
@@ -1920,10 +1979,8 @@ where
                     let packing_params = offline_vals.packing_params.as_ref().unwrap();
                     let precomp_inspir_vec = offline_vals.precomp_inspir_vec.as_ref().unwrap();
 
-                    let expand_start = Instant::now();
-                    pk.expand();
-                    debug!("pk.expand(): {} us", expand_start.elapsed().as_micros());
-                    let packed = pack_many_lwes_inspir_without_rotations(
+                    pk.expand(packing_params);
+                    let packed = pack_many_lwes_inspir(
                         packing_params,
                         precomp_inspir_vec,
                         intermediate,
@@ -2019,7 +2076,8 @@ where
 
     
     /// Online computation for word-based SimplePIR (GPU path).
-    /// GEMM + modswitch + CRT-pack + packing all on GPU.
+    /// CDKS: GEMM + packing all on GPU.
+    /// InspiRING: GEMM on GPU, packing on CPU.
     #[cfg(feature = "cuda")]
     pub fn perform_online_computation_simplepir_word(
         &self,
@@ -2028,13 +2086,9 @@ where
         packing_keys: &mut [PackingKeys<'a>],
         mut measurement: Option<&mut Measurement>,
     ) -> Vec<Vec<Vec<u8>>> {
-
-
         assert!(self.ypir_params.is_simplepir);
         let params = self.params;
         let batch_size = word_queries.len();
-
-        let online_start = Instant::now();
 
         let ctx = offline_vals.word_cuda_context.as_ref()
             .expect("Word CUDA context not initialized");
@@ -2046,32 +2100,85 @@ where
             queries_flat.extend_from_slice(query);
         }
 
-        // Flatten CDKS pack_pub_params_row_1s
-        let mut pub_params_flat: Vec<u64> = Vec::new();
-        for pk in packing_keys.iter() {
-            for key in pk.pack_pub_params_row_1s.iter() {
-                let slc = key.as_slice();
-                for col in 0..params.t_exp_left {
-                    let start = col * 2 * params.poly_len;
-                    pub_params_flat.extend_from_slice(&slc[start..start + params.poly_len]);
+        if offline_vals.packing_type == PackingType::InspiRING {
+            // InspiRING: GEMM + packing all on GPU
+            let online_start = Instant::now();
+
+            let q_1_bits = (params.get_q_prime_2() as f64).log2().ceil() as usize;
+            let q_2_bits = (params.get_q_prime_1() as f64).log2().ceil() as usize;
+            let response_bytes_per_output = ((q_1_bits + q_2_bits) * params.poly_len + 7) / 8;
+
+            // Flatten y_body and z_body (tiny, ~48KB each per client)
+            // GPU will expand y_body → y_all + y_bar_all via permutation tables
+            let y_body_per_client = params.t_exp_left * params.poly_len;
+            let z_body_per_client = params.t_exp_left * params.poly_len;
+
+            let mut y_body_flat: Vec<u64> = Vec::with_capacity(batch_size * y_body_per_client);
+            let mut z_body_flat: Vec<u64> = Vec::with_capacity(batch_size * z_body_per_client);
+
+            for pk in packing_keys.iter() {
+                let y_body = pk.y_body_condensed.as_ref().unwrap();
+                let z_body = pk.z_body_condensed.as_ref().unwrap();
+
+                for row in 0..y_body.rows {
+                    for col in 0..y_body.cols {
+                        y_body_flat.extend_from_slice(&y_body.get_poly(row, col)[..params.poly_len]);
+                    }
+                }
+                for row in 0..z_body.rows {
+                    for col in 0..z_body.cols {
+                        z_body_flat.extend_from_slice(&z_body.get_poly(row, col)[..params.poly_len]);
+                    }
                 }
             }
+
+            let result = ctx.compute_batch_inspir(
+                &queries_flat,
+                &y_body_flat,
+                &z_body_flat,
+                response_bytes_per_output,
+                batch_size,
+            );
+
+            let online_time_ms = online_start.elapsed().as_millis();
+            debug!("Word GPU InspiRING online time: {} ms", online_time_ms);
+
+            if let Some(ref mut m) = measurement {
+                m.online.first_pass_time_ms = online_time_ms as usize;
+            }
+
+            result
+        } else {
+            // CDKS: full GPU path (matmul + packing on GPU)
+            let online_start = Instant::now();
+
+            // Flatten CDKS pack_pub_params_row_1s
+            let mut pub_params_flat: Vec<u64> = Vec::new();
+            for pk in packing_keys.iter() {
+                for key in pk.pack_pub_params_row_1s.iter() {
+                    let slc = key.as_slice();
+                    for col in 0..params.t_exp_left {
+                        let start = col * 2 * params.poly_len;
+                        pub_params_flat.extend_from_slice(&slc[start..start + params.poly_len]);
+                    }
+                }
+            }
+
+            let q_1_bits = (params.get_q_prime_2() as f64).log2().ceil() as usize;
+            let q_2_bits = (params.get_q_prime_1() as f64).log2().ceil() as usize;
+            let response_bytes_per_output = ((q_1_bits + q_2_bits) * params.poly_len + 7) / 8;
+
+            let result = ctx.compute_batch(&queries_flat, &pub_params_flat, response_bytes_per_output, batch_size);
+
+            let online_time_ms = online_start.elapsed().as_millis();
+            debug!("Word GPU online time: {} ms", online_time_ms);
+
+            if let Some(ref mut m) = measurement {
+                m.online.first_pass_time_ms = online_time_ms as usize;
+            }
+
+            result
         }
-
-        let q_1_bits = (params.get_q_prime_2() as f64).log2().ceil() as usize;
-        let q_2_bits = (params.get_q_prime_1() as f64).log2().ceil() as usize;
-        let response_bytes_per_output = ((q_1_bits + q_2_bits) * params.poly_len + 7) / 8;
-
-        let result = ctx.compute_batch(&queries_flat, &pub_params_flat, response_bytes_per_output, batch_size);
-
-        let online_time_ms = online_start.elapsed().as_millis();
-        debug!("Word GPU online time: {} ms", online_time_ms);
-
-        if let Some(ref mut m) = measurement {
-            m.online.first_pass_time_ms = online_time_ms as usize;
-        }
-
-        result
     }
 
     /// Online computation for word-based SimplePIR (CPU path).
@@ -2156,10 +2263,8 @@ where
                     let packing_params = offline_vals.packing_params.as_ref().unwrap();
                     let precomp_inspir_vec = offline_vals.precomp_inspir_vec.as_ref().unwrap();
 
-                    let expand_start = Instant::now();
-                    pk.expand();
-                    debug!("pk.expand(): {} us", expand_start.elapsed().as_micros());
-                    let packed = pack_many_lwes_inspir_without_rotations(
+                    pk.expand(packing_params);
+                    let packed = pack_many_lwes_inspir(
                         packing_params,
                         precomp_inspir_vec,
                         intermediate,
@@ -2375,10 +2480,6 @@ where
                 PackingType::InspiRING => {
                     let packing_params = offline_vals.packing_params.as_ref().unwrap();
                     let precomp_inspir_vec = offline_vals.precomp_inspir_vec.as_ref().unwrap();
-
-                    let expand_start = Instant::now();
-                    pk.expand();
-                    debug!("pk.expand(): {} us", expand_start.elapsed().as_micros());
 
                     // Mask packing: only the first special_offs b-values (offline-known a-vectors)
                     let packed = pack_many_lwes_inspir_without_rotations(

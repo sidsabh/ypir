@@ -54,8 +54,8 @@ pub fn run_ypir_batched(
 ) -> Measurement {
     #[cfg(feature = "cuda")]
     assert!(
-        packing != PackingType::InspiRING,
-        "GPU does not support InspiRING packing. Use CDKS packing or run on CPU."
+        packing != PackingType::InspiRING || word,
+        "GPU InspiRING packing only supported for word SimplePIR. Use CDKS packing or run on CPU."
     );
 
     let params = if is_simplepir || word {
@@ -248,9 +248,9 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, word: bool, tri
         // ONLINE PHASE (unified: server handles both packing types)
         // ================================================================
 
-        let start_online_comp = Instant::now();
-
         let mut packing_keys: Vec<PackingKeys> = query_meta.iter().map(|(_, _, pk)| pk.clone()).collect();
+
+        let start_online_comp = Instant::now();
 
         let responses: Vec<Vec<Vec<u8>>> = if word {
             let query_slices: Vec<&[u64]> = word_queries_storage.iter().map(|q| q.as_slice()).collect();

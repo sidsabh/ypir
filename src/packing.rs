@@ -2012,7 +2012,7 @@ pub struct PackingKeys<'a> {
     pub packing_type: PackingType,
     // InspiRING fields
     pub full_key: bool,
-    pub packing_params: Option<PackParams<'a>>,
+    pub gamma: usize,
     pub y_body: Option<PolyMatrixNTT<'a>>,
     pub z_body: Option<PolyMatrixNTT<'a>>,
     pub y_body_condensed: Option<PolyMatrixNTT<'a>>,
@@ -2026,8 +2026,8 @@ pub struct PackingKeys<'a> {
     pub fake_pack_pub_params: Vec<PolyMatrixNTT<'a>>,
 }
 
-impl PackingKeys<'_> {
-    pub fn init_full<'a>(
+impl<'a> PackingKeys<'a> {
+    pub fn init_full(
         packing_params: &PackParams<'a>,
         sk_reg: &PolyMatrixRaw<'a>,
         w_seed: [u8; 32],
@@ -2063,7 +2063,7 @@ impl PackingKeys<'_> {
         let z_body_condensed = condense_matrix(&packing_params.params, &z_body);
         PackingKeys {
             packing_type: PackingType::InspiRING,
-            packing_params: Some(packing_params.clone()),
+            gamma: packing_params.num_to_pack,
             full_key: true,
             y_body: Some(y_body),
             z_body: Some(z_body),
@@ -2078,7 +2078,7 @@ impl PackingKeys<'_> {
         }
     }
 
-    pub fn init<'a>(
+    pub fn init(
         packing_params: &PackParams<'a>,
         sk_reg: &PolyMatrixRaw<'a>,
         w_seed: [u8; 32],
@@ -2099,7 +2099,7 @@ impl PackingKeys<'_> {
         let y_body_condensed = condense_matrix(&packing_params.params, &y_body);
         PackingKeys {
             packing_type: PackingType::InspiRING,
-            packing_params: Some(packing_params.clone()),
+            gamma: packing_params.num_to_pack,
             full_key: false,
             y_body: Some(y_body),
             z_body: None,
@@ -2114,7 +2114,7 @@ impl PackingKeys<'_> {
         }
     }
 
-    pub fn init_cdks<'a>(
+    pub fn init_cdks(
         params: &'a Params,
         sk_reg: &PolyMatrixRaw<'a>,
         static_seed_2: [u8; 32],
@@ -2144,7 +2144,7 @@ impl PackingKeys<'_> {
 
         PackingKeys {
             packing_type: PackingType::CDKS,
-            packing_params: None,
+            gamma: 0,
             full_key: false,
             y_body: None,
             z_body: None,
@@ -2160,13 +2160,13 @@ impl PackingKeys<'_> {
     }
 
     /// Create CDKS PackingKeys from pre-computed condensed row_1s.
-    pub fn init_cdks_from_keys<'a>(
+    pub fn init_cdks_from_keys(
         params: Params,
         pack_pub_params_row_1s: Vec<PolyMatrixNTT<'a>>,
     ) -> PackingKeys<'a> {
         PackingKeys {
             packing_type: PackingType::CDKS,
-            packing_params: None,
+            gamma: 0,
             full_key: false,
             y_body: None,
             z_body: None,
@@ -2183,7 +2183,7 @@ impl PackingKeys<'_> {
 
     pub fn get_gamma(&self) -> usize {
         if self.packing_type == PackingType::InspiRING {
-            self.packing_params.as_ref().unwrap().num_to_pack
+            self.gamma
         } else {
             self.params.as_ref().unwrap().poly_len
         }
@@ -2202,15 +2202,14 @@ impl PackingKeys<'_> {
         }
     }
 
-    pub fn expand(&mut self) {
+    pub fn expand(&mut self, packing_params: &PackParams<'a>) {
         assert_eq!(self.packing_type, PackingType::InspiRING);
         if !self.expanded {
-            let packing_params = self.packing_params.as_ref().unwrap();
             if self.full_key {
-                let (x, y) = generate_rotations_double(&packing_params, &self.y_body_condensed.as_ref().unwrap());
+                let (x, y) = generate_rotations_double(packing_params, &self.y_body_condensed.as_ref().unwrap());
                 (self.y_all_condensed, self.y_bar_all_condensed) = (Some(x), Some(y));
             } else {
-                let x = generate_rotations(&packing_params, &self.y_body_condensed.as_ref().unwrap());
+                let x = generate_rotations(packing_params, &self.y_body_condensed.as_ref().unwrap());
                 self.y_all_condensed = Some(x);
             }
             self.expanded = true;
@@ -2529,12 +2528,12 @@ pub fn full_packing_with_preprocessing_online<'a>(
     let num_to_pack_half = num_to_pack >> 1;
 
     let mut sum_poly = PolyMatrixNTT::zero(&params, 1, 1);
+    let mut temp_poly = PolyMatrixNTT::zero(&params, 1, 1);
 
     let addition_capacity = 1 << (64 - 2 * params.q2_bits - 1);
     let mut num_added = 0;
 
     for i in 0..num_to_pack_half - 1 {
-        let mut temp_poly = PolyMatrixNTT::zero(&params, 1, 1);
         fast_multiply_no_reduce_in_range_generic(
             &params,
             &mut temp_poly,
@@ -2547,7 +2546,6 @@ pub fn full_packing_with_preprocessing_online<'a>(
         fast_add_into_no_reduce(&mut sum_poly, &temp_poly);
         num_added += params.t_exp_left;
 
-        let mut temp_poly = PolyMatrixNTT::zero(&params, 1, 1);
         fast_multiply_no_reduce_in_range_generic(
             &params,
             &mut temp_poly,
@@ -2566,7 +2564,7 @@ pub fn full_packing_with_preprocessing_online<'a>(
         }
     }
 
-    let mut temp_poly = PolyMatrixNTT::zero(&params, 1, 1);
+    // Final term
     fast_multiply_no_reduce_in_range_generic(
         &params,
         &mut temp_poly,
@@ -2610,12 +2608,13 @@ pub fn full_packing_with_preprocessing_online_without_rotations<'a>(
     let num_to_pack_half = num_to_pack >> 1;
 
     let mut sum_poly = PolyMatrixNTT::zero(&params, 1, 1);
+    let mut temp_poly = PolyMatrixNTT::zero(&params, 1, 1);
 
     let addition_capacity = 1 << (64 - 2 * params.q2_bits - 1);
     let mut num_added = 0;
 
     for i in 0..num_to_pack_half - 1 {
-        let mut temp_poly = PolyMatrixNTT::zero(&params, 1, 1);
+        // bold_t: multiply then automorph directly into sum_poly
         fast_multiply_no_reduce_in_range_generic(
             &params,
             &mut temp_poly,
@@ -2625,13 +2624,10 @@ pub fn full_packing_with_preprocessing_online_without_rotations<'a>(
             i * params.t_exp_left,
             params.t_exp_left,
         );
-        let mut rotated_temp = PolyMatrixNTT::zero(&params, 1, 1);
-        apply_automorph_ntt(&params, &packing_params.tables, &temp_poly, &mut rotated_temp, packing_params.gen_pows[i]);
-
-        fast_add_into_no_reduce(&mut sum_poly, &rotated_temp);
+        apply_automorph_ntt(&params, &packing_params.tables, &temp_poly, &mut sum_poly, packing_params.gen_pows[i]);
         num_added += params.t_exp_left;
 
-        let mut temp_poly = PolyMatrixNTT::zero(&params, 1, 1);
+        // bold_t_bar: multiply then automorph directly into sum_poly
         fast_multiply_no_reduce_in_range_generic(
             &params,
             &mut temp_poly,
@@ -2641,10 +2637,7 @@ pub fn full_packing_with_preprocessing_online_without_rotations<'a>(
             i * params.t_exp_left,
             params.t_exp_left,
         );
-        let mut rotated_temp = PolyMatrixNTT::zero(&params, 1, 1);
-        apply_automorph_ntt(&params, &packing_params.tables, &temp_poly, &mut rotated_temp, 2 * params.poly_len - packing_params.gen_pows[i]);
-
-        fast_add_into_no_reduce(&mut sum_poly, &rotated_temp);
+        apply_automorph_ntt(&params, &packing_params.tables, &temp_poly, &mut sum_poly, 2 * params.poly_len - packing_params.gen_pows[i]);
         num_added += params.t_exp_left;
 
         if (num_added >= addition_capacity) || (i == num_to_pack_half - 2) {
@@ -2653,7 +2646,7 @@ pub fn full_packing_with_preprocessing_online_without_rotations<'a>(
         }
     }
 
-    let mut temp_poly = PolyMatrixNTT::zero(&params, 1, 1);
+    // Final term
     fast_multiply_no_reduce_in_range_generic(
         &params,
         &mut temp_poly,
