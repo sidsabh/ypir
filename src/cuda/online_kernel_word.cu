@@ -2,7 +2,7 @@
  * Word-Based SimplePIR Online Kernel
  *
  * Step 1: query × DB in Z_{2^64}, modswitch to Z_Q, CRT-pack.
- *   Tensor cores (SM≥75): 15 cuBLAS int8 GEMMs with 2 accumulators
+ *   Tensor cores (SM≥80): 2 CUTLASS uint8 GEMMs (one per DB byte) + fused accumulate
  *   SIMT fallback:        1 CUTLASS uint16×uint64→uint64 GEMM
  *
  * Step 2: LWE packing + mod switch — identical to online_kernel_sp.cu
@@ -16,7 +16,6 @@
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdint>
-#include <cublas_v2.h>
 #include "ntt.cuh"
 
 #include "cutlass/cutlass.h"
@@ -34,14 +33,6 @@
     CUDA_ASSERT(cudaMalloc(&(dst), (size)));     \
     CUDA_ASSERT(cudaMemcpy((dst), (src), (size), cudaMemcpyHostToDevice)); \
 } while (0)
-
-#define CUBLAS_CHECK(call) do { \
-    cublasStatus_t status_ = (call); \
-    if (status_ != CUBLAS_STATUS_SUCCESS) { \
-        fprintf(stderr, "cuBLAS error at %s:%d: %d\n", __FILE__, __LINE__, (int)status_); \
-        abort(); \
-    } \
-} while(0)
 
 // ---------- CUTLASS SIMT GEMM: uint16 × uint64 → uint64 ----------
 using CutlassGemmWord = cutlass::gemm::device::Gemm<
@@ -62,111 +53,159 @@ using CutlassGemmWord = cutlass::gemm::device::Gemm<
     2
 >;
 
+// ---------- CUTLASS Tensor Core GEMM: uint8 × uint8 → int32 ----------
+
+// SM80+ (Ampere): wider instruction shape
+using CutlassGemmU8TC_Sm80 = cutlass::gemm::device::Gemm<
+    uint8_t, cutlass::layout::RowMajor,
+    uint8_t, cutlass::layout::ColumnMajor,
+    int32_t, cutlass::layout::ColumnMajor,
+    int32_t,
+    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<128, 256, 64>,
+    cutlass::gemm::GemmShape<64, 64, 64>,
+    cutlass::gemm::GemmShape<16, 8, 32>,
+    cutlass::epilogue::thread::LinearCombination<int32_t, 4, int32_t, int32_t>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>, 3
+>;
+
+// SM75 (Turing): u8 IMMA with 8×8×16 instruction shape
+using CutlassGemmU8TC_Sm75 = cutlass::gemm::device::Gemm<
+    uint8_t, cutlass::layout::RowMajor,
+    uint8_t, cutlass::layout::ColumnMajor,
+    int32_t, cutlass::layout::ColumnMajor,
+    int32_t,
+    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm75,
+    cutlass::gemm::GemmShape<128, 256, 64>,
+    cutlass::gemm::GemmShape<64, 64, 64>,
+    cutlass::gemm::GemmShape<8, 8, 16>,
+    cutlass::epilogue::thread::LinearCombination<int32_t, 4, int32_t, int32_t>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>, 3
+>;
+
+// Helper: run the correct TC GEMM based on SM version
+static cutlass::Status run_u8tc_gemm(bool is_sm80,
+    int M, int wide_N, int K,
+    const uint8_t* A, int lda,
+    const uint8_t* B, int ldb,
+    int32_t* C, int ldc)
+{
+    int32_t alpha = 1, beta = 0;
+    cutlass::gemm::GemmCoord problem_size(M, wide_N, K);
+    if (is_sm80) {
+        CutlassGemmU8TC_Sm80::Arguments args{
+            problem_size, {A, lda}, {B, ldb}, {C, ldc}, {C, ldc}, {alpha, beta}, 1
+        };
+        CutlassGemmU8TC_Sm80 gemm_op;
+        auto s = gemm_op.initialize(args, nullptr);
+        if (s != cutlass::Status::kSuccess) return s;
+        return gemm_op();
+    } else {
+        CutlassGemmU8TC_Sm75::Arguments args{
+            problem_size, {A, lda}, {B, ldb}, {C, ldc}, {C, ldc}, {alpha, beta}, 1
+        };
+        CutlassGemmU8TC_Sm75 gemm_op;
+        auto s = gemm_op.initialize(args, nullptr);
+        if (s != cutlass::Status::kSuccess) return s;
+        return gemm_op();
+    }
+}
+
 // ---------- Decomposition kernels ----------
 
+// DB u16 → 2 uint8 byte slices (for TC path)
 __global__ void word_decompose_u16_bytes(
-    int8_t* __restrict__ b0,
-    int8_t* __restrict__ b1,
+    uint8_t* __restrict__ b0,
+    uint8_t* __restrict__ b1,
     const uint16_t* __restrict__ data,
     size_t count)
 {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < count) {
         uint16_t v = data[idx];
-        b0[idx] = (int8_t)((v & 0xFF) ^ 0x80);
-        b1[idx] = (int8_t)(((v >> 8) & 0xFF) ^ 0x80);
+        b0[idx] = (uint8_t)(v & 0xFF);
+        b1[idx] = (uint8_t)((v >> 8) & 0xFF);
     }
 }
 
-__global__ void word_decompose_u64_bytes(
-    int8_t* __restrict__ b0, int8_t* __restrict__ b1,
-    int8_t* __restrict__ b2, int8_t* __restrict__ b3,
-    int8_t* __restrict__ b4, int8_t* __restrict__ b5,
-    int8_t* __restrict__ b6, int8_t* __restrict__ b7,
+// Query u64 → 8 uint8 byte slices, packed contiguously for wide GEMM.
+// Output layout: K × (8*N) column-major with stride K.
+// Byte slice i occupies columns [i*N, (i+1)*N).
+__global__ void word_decompose_u64_bytes_packed(
+    uint8_t* __restrict__ out,  // K × (8*N) contiguous
     const uint64_t* __restrict__ data,
-    size_t count)
+    size_t K, size_t N)
 {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < count) {
-        uint64_t v = data[idx];
-        b0[idx] = (int8_t)((v & 0xFF) ^ 0x80);
-        b1[idx] = (int8_t)(((v >> 8) & 0xFF) ^ 0x80);
-        b2[idx] = (int8_t)(((v >> 16) & 0xFF) ^ 0x80);
-        b3[idx] = (int8_t)(((v >> 24) & 0xFF) ^ 0x80);
-        b4[idx] = (int8_t)(((v >> 32) & 0xFF) ^ 0x80);
-        b5[idx] = (int8_t)(((v >> 40) & 0xFF) ^ 0x80);
-        b6[idx] = (int8_t)(((v >> 48) & 0xFF) ^ 0x80);
-        b7[idx] = (int8_t)(((v >> 56) & 0xFF) ^ 0x80);
-    }
+    if (idx >= K * N) return;
+    // data is K × N column-major: idx = k + n*K
+    uint64_t v = data[idx];
+    out[idx + 0*K*N] = (uint8_t)(v & 0xFF);
+    out[idx + 1*K*N] = (uint8_t)((v >> 8) & 0xFF);
+    out[idx + 2*K*N] = (uint8_t)((v >> 16) & 0xFF);
+    out[idx + 3*K*N] = (uint8_t)((v >> 24) & 0xFF);
+    out[idx + 4*K*N] = (uint8_t)((v >> 32) & 0xFF);
+    out[idx + 5*K*N] = (uint8_t)((v >> 40) & 0xFF);
+    out[idx + 6*K*N] = (uint8_t)((v >> 48) & 0xFF);
+    out[idx + 7*K*N] = (uint8_t)((v >> 56) & 0xFF);
 }
 
-// ---------- Bias correction helpers ----------
+// ---------- Fused accumulate + modswitch kernels ----------
 
-__global__ void word_compute_row_sums_i8(
-    int32_t* __restrict__ sums,
-    const int8_t* __restrict__ data,
-    size_t M, size_t K, size_t stride)
-{
-    size_t m = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (m >= M) return;
-    int32_t s = 0;
-    for (size_t k = 0; k < K; k++)
-        s += (int32_t)data[k + m * stride];
-    sums[m] = s;
-}
-
-__global__ void word_compute_col_sums_i8(
-    int32_t* __restrict__ sums,
-    const int8_t* __restrict__ data,
-    size_t N, size_t K)
-{
-    size_t n = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (n >= N) return;
-    int32_t s = 0;
-    for (size_t k = 0; k < K; k++)
-        s += (int32_t)data[k + n * K];
-    sums[n] = s;
-}
-
-__global__ void word_accumulate_shifted_u64(
-    uint64_t* __restrict__ accum,
-    const int32_t* __restrict__ gemm_out,
-    const int32_t* __restrict__ row_sums,
-    const int32_t* __restrict__ col_sums,
-    uint64_t shift,
-    size_t MN, size_t M, size_t K)
+// Accumulate 8 specs from db_b=0 GEMM output into uint64 accumulator.
+// GEMM output is M × (8*N) column-major. For spec (db_b=0, q_b=i),
+// the column for batch item n is at column i*N+n.
+__global__ void word_accumulate_db0(
+    uint64_t* __restrict__ accum,           // M × N col-major
+    const int32_t* __restrict__ gemm_out,   // M × (8*N) col-major
+    size_t M, size_t N)
 {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= MN) return;
+    if (idx >= M * N) return;
     size_t m = idx % M;
     size_t n = idx / M;
-    int64_t corrected = (int64_t)gemm_out[idx]
-                        + (int64_t)128 * (int64_t)row_sums[m]
-                        + (int64_t)128 * (int64_t)col_sums[n]
-                        + (int64_t)16384 * (int64_t)K;
-    accum[idx] += (uint64_t)corrected * shift;
+    uint64_t acc = 0;
+    acc += (uint64_t)(uint32_t)gemm_out[m + (0*N+n)*M];             // q_b=0, shift=1
+    acc += (uint64_t)(uint32_t)gemm_out[m + (1*N+n)*M] << 8;        // q_b=1, shift=2^8
+    acc += (uint64_t)(uint32_t)gemm_out[m + (2*N+n)*M] << 16;       // q_b=2, shift=2^16
+    acc += (uint64_t)(uint32_t)gemm_out[m + (3*N+n)*M] << 24;       // q_b=3, shift=2^24
+    acc += (uint64_t)(uint32_t)gemm_out[m + (4*N+n)*M] << 32;       // q_b=4, shift=2^32
+    acc += (uint64_t)(uint32_t)gemm_out[m + (5*N+n)*M] << 40;       // q_b=5, shift=2^40
+    acc += (uint64_t)(uint32_t)gemm_out[m + (6*N+n)*M] << 48;       // q_b=6, shift=2^48
+    acc += (uint64_t)(uint32_t)gemm_out[m + (7*N+n)*M] << 56;       // q_b=7, shift=2^56
+    accum[idx] = acc;
 }
 
-// ---------- Modswitch + CRT-pack ----------
-
-// Tensor core path: modswitch u64 accumulator to Z_Q, multiply by inv_N (in-place)
-__global__ void word_modswitch_u64_inplace(
-    uint64_t* __restrict__ data,
-    size_t count,
-    uint64_t q, uint64_t mod0, uint64_t mod1,
-    uint64_t inv_n)
+// Accumulate 7 specs from db_b=1, add to existing accumulator, and modswitch.
+// db_b=1 shifts start at 2^8 (q_b=0..6). db_b=1,q_b=7 would be 2^64 ≡ 0.
+__global__ void word_accumulate_db1_and_modswitch(
+    uint64_t* __restrict__ accum,           // M × N col-major (has db0 partial)
+    const int32_t* __restrict__ gemm_out,   // M × (8*N) col-major
+    size_t M, size_t N,
+    uint64_t q, uint64_t inv_n)
 {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= count) return;
-
-    uint64_t val = data[idx];
-    __uint128_t prod = (__uint128_t)val * q + (((__uint128_t)1) << 63);
+    if (idx >= M * N) return;
+    size_t m = idx % M;
+    size_t n = idx / M;
+    uint64_t acc = accum[idx];
+    acc += (uint64_t)(uint32_t)gemm_out[m + (0*N+n)*M] << 8;        // q_b=0, shift=2^8
+    acc += (uint64_t)(uint32_t)gemm_out[m + (1*N+n)*M] << 16;       // q_b=1, shift=2^16
+    acc += (uint64_t)(uint32_t)gemm_out[m + (2*N+n)*M] << 24;       // q_b=2, shift=2^24
+    acc += (uint64_t)(uint32_t)gemm_out[m + (3*N+n)*M] << 32;       // q_b=3, shift=2^32
+    acc += (uint64_t)(uint32_t)gemm_out[m + (4*N+n)*M] << 40;       // q_b=4, shift=2^40
+    acc += (uint64_t)(uint32_t)gemm_out[m + (5*N+n)*M] << 48;       // q_b=5, shift=2^48
+    acc += (uint64_t)(uint32_t)gemm_out[m + (6*N+n)*M] << 56;       // q_b=6, shift=2^56
+    // Modswitch: round(acc * q / 2^64), then multiply by inv_n mod q
+    __uint128_t prod = (__uint128_t)acc * q + (((__uint128_t)1) << 63);
     uint64_t val_q = (uint64_t)(prod >> 64);
     val_q = (uint64_t)((__uint128_t)val_q * inv_n % q);
-    data[idx] = val_q;
+    accum[idx] = val_q;
 }
 
-// SIMT path: modswitch u64 to Z_Q (in-place on col-major output), multiply by inv_N
+// ---------- Modswitch ----------
+
+// SIMT path: modswitch u64 to Z_Q (in-place), multiply by inv_N
 __global__ void word_modswitch_crt_inplace(
     uint64_t* __restrict__ data,
     size_t count,
@@ -179,38 +218,9 @@ __global__ void word_modswitch_crt_inplace(
     uint64_t val = data[idx];
     __uint128_t prod = (__uint128_t)val * q + (((__uint128_t)1) << 63);
     uint64_t val_q = (uint64_t)(prod >> 64);
-
-    // Multiply by inv_N mod Q: compensates for CDKS packing multiplying by N
     val_q = (uint64_t)((__uint128_t)val_q * inv_n % q);
-
     data[idx] = val_q;
 }
-
-// ---------- GEMM spec for 15 tensor core GEMMs ----------
-
-struct WordGemmSpec {
-    int db_b;
-    int q_b;
-    uint64_t shift;
-};
-
-static const WordGemmSpec WORD_ONLINE_SPECS[15] = {
-    {0, 0, 1ULL},
-    {0, 1, 1ULL << 8},
-    {1, 0, 1ULL << 8},
-    {0, 2, 1ULL << 16},
-    {1, 1, 1ULL << 16},
-    {0, 3, 1ULL << 24},
-    {1, 2, 1ULL << 24},
-    {0, 4, 1ULL << 32},
-    {1, 3, 1ULL << 32},
-    {0, 5, 1ULL << 40},
-    {1, 4, 1ULL << 40},
-    {0, 6, 1ULL << 48},
-    {1, 5, 1ULL << 48},
-    {0, 7, 1ULL << 56},
-    {1, 6, 1ULL << 56},
-};
 
 // ---------- Step 2: Pack LWEs and mod switch ----------
 // Streamed variant: batch_idx is passed as a parameter (not blockIdx.y).
@@ -694,14 +704,12 @@ __global__ void __launch_bounds__(1024) word_pack_lwes_inspir_and_mod_switch(
 
 struct WordOnlineContext {
     bool has_tensor_cores;
-    cublasHandle_t cublas_handle;
+    bool is_sm80;
 
-    // Tensor core path
-    int8_t* d_db_bytes[2];         // DB decomposed (centered), persistent
-    int8_t* d_query_bytes[8];      // Per-batch query byte slices (centered)
-    int32_t* d_temp;               // Single temp buffer for cuBLAS output
-    int32_t* d_db_row_sums[2];     // Row sums of centered DB bytes, M int32 each
-    int32_t* d_query_col_sums[8];  // Col sums of centered query bytes, max_N int32 each
+    // Tensor core path (CUTLASS uint8, 2 wide GEMMs)
+    uint8_t* d_db_bytes[2];            // DB decomposed bytes, persistent, M×K_padded
+    uint8_t* d_query_bytes_packed;     // K × (8*max_N) contiguous, per-batch
+    int32_t* d_gemm_out;              // M × (8*max_N) int32, reused per DB byte
 
     // SIMT path
     uint16_t* d_db_u16;            // DB as-is, persistent
@@ -878,10 +886,9 @@ void* ypir_word_online_init(
 
     // Detect tensor cores
     ctx->has_tensor_cores = false;
-    ctx->cublas_handle = nullptr;
-    ctx->d_temp = nullptr;
-    for (int i = 0; i < 2; i++) { ctx->d_db_bytes[i] = nullptr; ctx->d_db_row_sums[i] = nullptr; }
-    for (int i = 0; i < 8; i++) { ctx->d_query_bytes[i] = nullptr; ctx->d_query_col_sums[i] = nullptr; }
+    for (int i = 0; i < 2; i++) ctx->d_db_bytes[i] = nullptr;
+    ctx->d_query_bytes_packed = nullptr;
+    ctx->d_gemm_out = nullptr;
     ctx->d_db_u16 = nullptr;
     ctx->d_query_buf = nullptr;
     ctx->d_result_u64 = nullptr;
@@ -924,15 +931,10 @@ void* ypir_word_online_init(
         CUDA_ASSERT(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
         int sm = major * 10 + minor;
         ctx->has_tensor_cores = (sm >= 75);
-
-        if (ctx->has_tensor_cores && db_rows > 133000) {
-            fprintf(stderr, "ERROR: db_rows=%zu exceeds max safe K for int8 tensor core accumulation.\n", db_rows);
-            delete ctx;
-            return nullptr;
-        }
+        ctx->is_sm80 = (sm >= 80);
 
         printf("Word online GEMM (%s): M=%zu, K=%zu, max_batch=%zu\n",
-               ctx->has_tensor_cores ? "tensor core" : "CUTLASS SIMT",
+               ctx->has_tensor_cores ? (ctx->is_sm80 ? "CUTLASS TC Sm80" : "CUTLASS TC Sm75") : "CUTLASS SIMT",
                db_cols, db_rows, max_batch_size);
     }
 
@@ -941,7 +943,7 @@ void* ypir_word_online_init(
     size_t max_N = max_batch_size;
 
     if (ctx->has_tensor_cores) {
-        // Upload + decompose DB
+        // Upload + decompose DB to uint8 bytes
         size_t db_elems = M * db_rows_padded;
         uint16_t* d_db_raw;
         CUDA_ALLOC_AND_COPY(d_db_raw, db, db_elems * sizeof(uint16_t));
@@ -956,27 +958,11 @@ void* ypir_word_online_init(
         }
         CUDA_ASSERT(cudaFree(d_db_raw));
 
-        // Compute row sums of centered DB bytes (for bias correction)
-        for (int i = 0; i < 2; i++) {
-            CUDA_ASSERT(cudaMalloc(&ctx->d_db_row_sums[i], M * sizeof(int32_t)));
-            int t = 256, b = (M + t - 1) / t;
-            word_compute_row_sums_i8<<<b, t>>>(ctx->d_db_row_sums[i], ctx->d_db_bytes[i],
-                                               M, K, db_rows_padded);
-            CUDA_ASSERT(cudaGetLastError());
-        }
+        // Packed query byte buffer: K × (8*max_N) contiguous
+        CUDA_ASSERT(cudaMalloc(&ctx->d_query_bytes_packed, K * 8 * max_N));
 
-        // Pre-allocate query byte buffers and col sum buffers (full max_batch)
-        size_t q_elems = max_N * db_rows_padded;
-        for (int i = 0; i < 8; i++) {
-            CUDA_ASSERT(cudaMalloc(&ctx->d_query_bytes[i], q_elems));
-            CUDA_ASSERT(cudaMalloc(&ctx->d_query_col_sums[i], max_N * sizeof(int32_t)));
-        }
-
-        // Single temp buffer for cuBLAS output (d_intermediate serves as uint64 accumulator)
-        CUDA_ASSERT(cudaMalloc(&ctx->d_temp, max_N * M * sizeof(int32_t)));
-
-        CUBLAS_CHECK(cublasCreate(&ctx->cublas_handle));
-        CUBLAS_CHECK(cublasSetMathMode(ctx->cublas_handle, CUBLAS_TENSOR_OP_MATH));
+        // GEMM output buffer: M × (8*max_N) int32, reused for each DB byte
+        CUDA_ASSERT(cudaMalloc(&ctx->d_gemm_out, M * 8 * max_N * sizeof(int32_t)));
 
     } else {
         // SIMT: keep DB as u16
@@ -1190,66 +1176,53 @@ void ypir_word_online_compute_batch(
     t.tic();
 
     if (ctx->has_tensor_cores) {
-        // Upload queries and decompose to centered bytes
+        // Upload queries and decompose to packed uint8 bytes
         size_t q_elems = N * K;
         uint64_t* d_query_raw;
         CUDA_ALLOC_AND_COPY(d_query_raw, queries, q_elems * sizeof(uint64_t));
         {
             int threads = 256;
             int blocks = (q_elems + threads - 1) / threads;
-            word_decompose_u64_bytes<<<blocks, threads>>>(
-                ctx->d_query_bytes[0], ctx->d_query_bytes[1],
-                ctx->d_query_bytes[2], ctx->d_query_bytes[3],
-                ctx->d_query_bytes[4], ctx->d_query_bytes[5],
-                ctx->d_query_bytes[6], ctx->d_query_bytes[7],
-                d_query_raw, q_elems);
+            word_decompose_u64_bytes_packed<<<blocks, threads>>>(
+                ctx->d_query_bytes_packed, d_query_raw, K, N);
             CUDA_ASSERT(cudaGetLastError());
         }
         CUDA_ASSERT(cudaFree(d_query_raw));
 
-        // Compute column sums of centered query bytes (for bias correction)
-        for (int i = 0; i < 8; i++) {
-            int t = 256, b = (N + t - 1) / t;
-            word_compute_col_sums_i8<<<b, t>>>(ctx->d_query_col_sums[i],
-                                               ctx->d_query_bytes[i], N, K);
-            CUDA_ASSERT(cudaGetLastError());
-        }
-
-        // Zero uint64 accumulator (reuse d_intermediate)
         size_t count = M * N;
-        CUDA_ASSERT(cudaMemset(ctx->d_intermediate, 0, count * sizeof(uint64_t)));
 
-        // 15 cuBLAS GEMMs with bias correction + uint64 accumulation
-        int32_t alpha_one = 1, beta_zero = 0;
-        for (int g = 0; g < 15; g++) {
-            const WordGemmSpec& s = WORD_ONLINE_SPECS[g];
-            CUBLAS_CHECK(cublasGemmEx(ctx->cublas_handle,
-                CUBLAS_OP_T, CUBLAS_OP_N,
-                (int)M, (int)N, (int)K,
-                &alpha_one,
-                ctx->d_db_bytes[s.db_b],    CUDA_R_8I, (int)ctx->db_rows_padded,
-                ctx->d_query_bytes[s.q_b],  CUDA_R_8I, (int)K,
-                &beta_zero,
-                ctx->d_temp,                CUDA_R_32I, (int)M,
-                CUBLAS_COMPUTE_32I,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        // GEMM 0: DB[0]^T × Q_packed → gemm_out  (M × 8N)
+        {
+            auto status = run_u8tc_gemm(ctx->is_sm80, M, 8*N, K,
+                ctx->d_db_bytes[0], (int)ctx->db_rows_padded,
+                ctx->d_query_bytes_packed, (int)K,
+                ctx->d_gemm_out, (int)M);
+            if (status != cutlass::Status::kSuccess) { fprintf(stderr, "CUTLASS TC GEMM 0 failed\n"); abort(); }
+        }
 
-            int threads = 256;
-            int blocks = (count + threads - 1) / threads;
-            word_accumulate_shifted_u64<<<blocks, threads>>>(
-                ctx->d_intermediate, ctx->d_temp,
-                ctx->d_db_row_sums[s.db_b],
-                ctx->d_query_col_sums[s.q_b],
-                s.shift, count, M, K);
+        // Accumulate db0 specs into d_intermediate
+        {
+            int threads = 256, blocks = (count + threads - 1) / threads;
+            word_accumulate_db0<<<blocks, threads>>>(
+                ctx->d_intermediate, ctx->d_gemm_out, M, N);
             CUDA_ASSERT(cudaGetLastError());
         }
 
-        // Modswitch u64 → Z_Q in-place
+        // GEMM 1: DB[1]^T × Q_packed → gemm_out  (M × 8N, reuse buffer)
         {
-            int threads = 256;
-            int blocks = (count + threads - 1) / threads;
-            word_modswitch_u64_inplace<<<blocks, threads>>>(
-                ctx->d_intermediate, count, ctx->modulus, ctx->mod0, ctx->mod1, ctx->inv_n);
+            auto status = run_u8tc_gemm(ctx->is_sm80, M, 8*N, K,
+                ctx->d_db_bytes[1], (int)ctx->db_rows_padded,
+                ctx->d_query_bytes_packed, (int)K,
+                ctx->d_gemm_out, (int)M);
+            if (status != cutlass::Status::kSuccess) { fprintf(stderr, "CUTLASS TC GEMM 1 failed\n"); abort(); }
+        }
+
+        // Accumulate db1 specs + modswitch
+        {
+            int threads = 256, blocks = (count + threads - 1) / threads;
+            word_accumulate_db1_and_modswitch<<<blocks, threads>>>(
+                ctx->d_intermediate, ctx->d_gemm_out, M, N,
+                ctx->modulus, ctx->inv_n);
             CUDA_ASSERT(cudaGetLastError());
         }
 
@@ -1387,68 +1360,45 @@ void ypir_word_online_compute_matmul_only(
     // ── Step 1: GEMM (full batch, default stream) ──
 
     if (ctx->has_tensor_cores) {
-        // Upload queries and decompose to centered bytes
+        // Upload queries and decompose to packed uint8 bytes
         size_t q_elems = N * K;
         uint64_t* d_query_raw;
         CUDA_ALLOC_AND_COPY(d_query_raw, queries, q_elems * sizeof(uint64_t));
         {
             int threads = 256;
             int blocks = (q_elems + threads - 1) / threads;
-            word_decompose_u64_bytes<<<blocks, threads>>>(
-                ctx->d_query_bytes[0], ctx->d_query_bytes[1],
-                ctx->d_query_bytes[2], ctx->d_query_bytes[3],
-                ctx->d_query_bytes[4], ctx->d_query_bytes[5],
-                ctx->d_query_bytes[6], ctx->d_query_bytes[7],
-                d_query_raw, q_elems);
+            word_decompose_u64_bytes_packed<<<blocks, threads>>>(
+                ctx->d_query_bytes_packed, d_query_raw, K, N);
             CUDA_ASSERT(cudaGetLastError());
         }
         CUDA_ASSERT(cudaFree(d_query_raw));
 
-        // Compute column sums of centered query bytes (for bias correction)
-        for (int i = 0; i < 8; i++) {
-            int t = 256, b = (N + t - 1) / t;
-            word_compute_col_sums_i8<<<b, t>>>(ctx->d_query_col_sums[i],
-                                               ctx->d_query_bytes[i], N, K);
-            CUDA_ASSERT(cudaGetLastError());
-        }
-
-        // Zero uint64 accumulator (reuse d_intermediate)
         size_t count = M * N;
-        CUDA_ASSERT(cudaMemset(ctx->d_intermediate, 0, count * sizeof(uint64_t)));
 
-        // 15 cuBLAS GEMMs with bias correction + uint64 accumulation
-        int32_t alpha_one = 1, beta_zero = 0;
-        for (int g = 0; g < 15; g++) {
-            const WordGemmSpec& s = WORD_ONLINE_SPECS[g];
-            CUBLAS_CHECK(cublasGemmEx(ctx->cublas_handle,
-                CUBLAS_OP_T, CUBLAS_OP_N,
-                (int)M, (int)N, (int)K,
-                &alpha_one,
-                ctx->d_db_bytes[s.db_b],    CUDA_R_8I, (int)ctx->db_rows_padded,
-                ctx->d_query_bytes[s.q_b],  CUDA_R_8I, (int)K,
-                &beta_zero,
-                ctx->d_temp,                CUDA_R_32I, (int)M,
-                CUBLAS_COMPUTE_32I,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-
-            int threads = 256;
-            int blocks = (count + threads - 1) / threads;
-            word_accumulate_shifted_u64<<<blocks, threads>>>(
-                ctx->d_intermediate, ctx->d_temp,
-                ctx->d_db_row_sums[s.db_b],
-                ctx->d_query_col_sums[s.q_b],
-                s.shift, count, M, K);
-            CUDA_ASSERT(cudaGetLastError());
-        }
-
-        // Modswitch u64 → Z_Q in-place
+        // GEMM 0: DB[0]^T × Q_packed → gemm_out
         {
-            int threads = 256;
-            int blocks = (count + threads - 1) / threads;
-            word_modswitch_u64_inplace<<<blocks, threads>>>(
-                ctx->d_intermediate, count, ctx->modulus, ctx->mod0, ctx->mod1, ctx->inv_n);
-            CUDA_ASSERT(cudaGetLastError());
+            auto status = run_u8tc_gemm(ctx->is_sm80, M, 8*N, K,
+                ctx->d_db_bytes[0], (int)ctx->db_rows_padded,
+                ctx->d_query_bytes_packed, (int)K,
+                ctx->d_gemm_out, (int)M);
+            if (status != cutlass::Status::kSuccess) { fprintf(stderr, "CUTLASS TC GEMM 0 failed\n"); abort(); }
         }
+        { int threads = 256, blocks = (count + threads - 1) / threads;
+          word_accumulate_db0<<<blocks, threads>>>(ctx->d_intermediate, ctx->d_gemm_out, M, N);
+          CUDA_ASSERT(cudaGetLastError()); }
+
+        // GEMM 1: DB[1]^T × Q_packed → gemm_out
+        {
+            auto status = run_u8tc_gemm(ctx->is_sm80, M, 8*N, K,
+                ctx->d_db_bytes[1], (int)ctx->db_rows_padded,
+                ctx->d_query_bytes_packed, (int)K,
+                ctx->d_gemm_out, (int)M);
+            if (status != cutlass::Status::kSuccess) { fprintf(stderr, "CUTLASS TC GEMM 1 failed\n"); abort(); }
+        }
+        { int threads = 256, blocks = (count + threads - 1) / threads;
+          word_accumulate_db1_and_modswitch<<<blocks, threads>>>(
+              ctx->d_intermediate, ctx->d_gemm_out, M, N, ctx->modulus, ctx->inv_n);
+          CUDA_ASSERT(cudaGetLastError()); }
 
     } else {
         // Upload queries
@@ -1535,61 +1485,38 @@ void ypir_word_online_compute_batch_inspir(
         {
             int threads = 256;
             int blocks = (q_elems + threads - 1) / threads;
-            word_decompose_u64_bytes<<<blocks, threads>>>(
-                ctx->d_query_bytes[0], ctx->d_query_bytes[1],
-                ctx->d_query_bytes[2], ctx->d_query_bytes[3],
-                ctx->d_query_bytes[4], ctx->d_query_bytes[5],
-                ctx->d_query_bytes[6], ctx->d_query_bytes[7],
-                d_query_raw, q_elems);
+            word_decompose_u64_bytes_packed<<<blocks, threads>>>(
+                ctx->d_query_bytes_packed, d_query_raw, K, N);
             CUDA_ASSERT(cudaGetLastError());
         }
         CUDA_ASSERT(cudaFree(d_query_raw));
 
-        // Compute column sums of centered query bytes (for bias correction)
-        for (int i = 0; i < 8; i++) {
-            int t = 256, b = (N + t - 1) / t;
-            word_compute_col_sums_i8<<<b, t>>>(ctx->d_query_col_sums[i],
-                                               ctx->d_query_bytes[i], N, K);
-            CUDA_ASSERT(cudaGetLastError());
-        }
-
-        // Zero uint64 accumulator (reuse d_intermediate)
         size_t count = M * N;
-        CUDA_ASSERT(cudaMemset(ctx->d_intermediate, 0, count * sizeof(uint64_t)));
 
-        // 15 cuBLAS GEMMs with bias correction + uint64 accumulation
-        int32_t alpha_one = 1, beta_zero = 0;
-        for (int g = 0; g < 15; g++) {
-            const WordGemmSpec& s = WORD_ONLINE_SPECS[g];
-            CUBLAS_CHECK(cublasGemmEx(ctx->cublas_handle,
-                CUBLAS_OP_T, CUBLAS_OP_N,
-                (int)M, (int)N, (int)K,
-                &alpha_one,
-                ctx->d_db_bytes[s.db_b],    CUDA_R_8I, (int)ctx->db_rows_padded,
-                ctx->d_query_bytes[s.q_b],  CUDA_R_8I, (int)K,
-                &beta_zero,
-                ctx->d_temp,                CUDA_R_32I, (int)M,
-                CUBLAS_COMPUTE_32I,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-
-            int threads = 256;
-            int blocks = (count + threads - 1) / threads;
-            word_accumulate_shifted_u64<<<blocks, threads>>>(
-                ctx->d_intermediate, ctx->d_temp,
-                ctx->d_db_row_sums[s.db_b],
-                ctx->d_query_col_sums[s.q_b],
-                s.shift, count, M, K);
-            CUDA_ASSERT(cudaGetLastError());
-        }
-
-        // Modswitch u64 → Z_Q in-place (InspiRING: inv_n=1, no scaling)
+        // GEMM 0: DB[0]^T × Q_packed → gemm_out
         {
-            int threads = 256;
-            int blocks = (count + threads - 1) / threads;
-            word_modswitch_u64_inplace<<<blocks, threads>>>(
-                ctx->d_intermediate, count, ctx->modulus, ctx->mod0, ctx->mod1, ctx->inv_n);
-            CUDA_ASSERT(cudaGetLastError());
+            auto status = run_u8tc_gemm(ctx->is_sm80, M, 8*N, K,
+                ctx->d_db_bytes[0], (int)ctx->db_rows_padded,
+                ctx->d_query_bytes_packed, (int)K,
+                ctx->d_gemm_out, (int)M);
+            if (status != cutlass::Status::kSuccess) { fprintf(stderr, "CUTLASS TC GEMM 0 failed\n"); abort(); }
         }
+        { int threads = 256, blocks = (count + threads - 1) / threads;
+          word_accumulate_db0<<<blocks, threads>>>(ctx->d_intermediate, ctx->d_gemm_out, M, N);
+          CUDA_ASSERT(cudaGetLastError()); }
+
+        // GEMM 1: DB[1]^T × Q_packed → gemm_out
+        {
+            auto status = run_u8tc_gemm(ctx->is_sm80, M, 8*N, K,
+                ctx->d_db_bytes[1], (int)ctx->db_rows_padded,
+                ctx->d_query_bytes_packed, (int)K,
+                ctx->d_gemm_out, (int)M);
+            if (status != cutlass::Status::kSuccess) { fprintf(stderr, "CUTLASS TC GEMM 1 failed\n"); abort(); }
+        }
+        { int threads = 256, blocks = (count + threads - 1) / threads;
+          word_accumulate_db1_and_modswitch<<<blocks, threads>>>(
+              ctx->d_intermediate, ctx->d_gemm_out, M, N, ctx->modulus, ctx->inv_n);
+          CUDA_ASSERT(cudaGetLastError()); }
 
     } else {
         size_t q_elems = N * K;
@@ -1724,13 +1651,9 @@ void ypir_word_online_free(void* context)
 
     for (int i = 0; i < 2; i++) {
         if (ctx->d_db_bytes[i]) cudaFree(ctx->d_db_bytes[i]);
-        if (ctx->d_db_row_sums[i]) cudaFree(ctx->d_db_row_sums[i]);
     }
-    for (int i = 0; i < 8; i++) {
-        if (ctx->d_query_bytes[i]) cudaFree(ctx->d_query_bytes[i]);
-        if (ctx->d_query_col_sums[i]) cudaFree(ctx->d_query_col_sums[i]);
-    }
-    if (ctx->d_temp) cudaFree(ctx->d_temp);
+    if (ctx->d_query_bytes_packed) cudaFree(ctx->d_query_bytes_packed);
+    if (ctx->d_gemm_out) cudaFree(ctx->d_gemm_out);
     if (ctx->d_db_u16) cudaFree(ctx->d_db_u16);
     if (ctx->d_query_buf) cudaFree(ctx->d_query_buf);
     if (ctx->d_result_u64) cudaFree(ctx->d_result_u64);
@@ -1769,8 +1692,6 @@ void ypir_word_online_free(void* context)
         }
         delete[] ctx->streams;
     }
-
-    if (ctx->cublas_handle) cublasDestroy(ctx->cublas_handle);
 
     cudaFree(ctx->ntt_params.moduli);
     cudaFree(ctx->ntt_params.barrett_cr);

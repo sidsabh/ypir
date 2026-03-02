@@ -6,20 +6,12 @@
 
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm.h"
-#include <cublas_v2.h>
-
-#define CUBLAS_CHECK(call) do { \
-    cublasStatus_t status_ = (call); \
-    if (status_ != CUBLAS_STATUS_SUCCESS) { \
-        fprintf(stderr, "cuBLAS error at %s:%d: %d\n", __FILE__, __LINE__, (int)status_); \
-    } \
-} while(0)
 
 static constexpr int COMPRESSION = 4;
 
 typedef uint32_t Elem;
 
-// CUTLASS GEMM: uint8 DB × uint32 query → uint32 output (mod 2^32 accumulation)
+// CUTLASS SIMT GEMM: uint8 DB × uint32 query → uint32 output (mod 2^32 accumulation)
 using CutlassGemm = cutlass::gemm::device::Gemm<
     uint8_t,                                // ElementA (DB, unpacked)
     cutlass::layout::RowMajor,              // LayoutA
@@ -37,6 +29,66 @@ using CutlassGemm = cutlass::gemm::device::Gemm<
     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>,
     2                                        // Stages
 >;
+
+// CUTLASS uint8 TC GEMM: uint8 × uint8 → int32 (tensor cores)
+// Used for 1-wide-GEMM approach: pack 4 query byte slices into K × (4*N),
+// single GEMM reads DB once.
+
+// SM80+ (Ampere): wider instruction shape
+using CutlassGemmU8TC_Sm80 = cutlass::gemm::device::Gemm<
+    uint8_t, cutlass::layout::RowMajor,
+    uint8_t, cutlass::layout::ColumnMajor,
+    int32_t, cutlass::layout::ColumnMajor,
+    int32_t,
+    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<128, 256, 64>,
+    cutlass::gemm::GemmShape<64, 64, 64>,
+    cutlass::gemm::GemmShape<16, 8, 32>,
+    cutlass::epilogue::thread::LinearCombination<int32_t, 4, int32_t, int32_t>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>, 3
+>;
+
+// SM75 (Turing): u8 IMMA with 8×8×16 instruction shape
+using CutlassGemmU8TC_Sm75 = cutlass::gemm::device::Gemm<
+    uint8_t, cutlass::layout::RowMajor,
+    uint8_t, cutlass::layout::ColumnMajor,
+    int32_t, cutlass::layout::ColumnMajor,
+    int32_t,
+    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm75,
+    cutlass::gemm::GemmShape<128, 256, 64>,
+    cutlass::gemm::GemmShape<64, 64, 64>,
+    cutlass::gemm::GemmShape<8, 8, 16>,
+    cutlass::epilogue::thread::LinearCombination<int32_t, 4, int32_t, int32_t>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>, 3
+>;
+
+// Helper: run the correct TC GEMM based on SM version
+static cutlass::Status run_u8tc_gemm(bool is_sm80,
+    int M, int wide_N, int K,
+    const uint8_t* A, int lda,
+    const uint8_t* B, int ldb,
+    int32_t* C, int ldc)
+{
+    int32_t alpha = 1, beta = 0;
+    cutlass::gemm::GemmCoord problem_size(M, wide_N, K);
+    if (is_sm80) {
+        CutlassGemmU8TC_Sm80::Arguments args{
+            problem_size, {A, lda}, {B, ldb}, {C, ldc}, {C, ldc}, {alpha, beta}, 1
+        };
+        CutlassGemmU8TC_Sm80 gemm_op;
+        auto s = gemm_op.initialize(args, nullptr);
+        if (s != cutlass::Status::kSuccess) return s;
+        return gemm_op();
+    } else {
+        CutlassGemmU8TC_Sm75::Arguments args{
+            problem_size, {A, lda}, {B, ldb}, {C, ldc}, {C, ldc}, {alpha, beta}, 1
+        };
+        CutlassGemmU8TC_Sm75 gemm_op;
+        auto s = gemm_op.initialize(args, nullptr);
+        if (s != cutlass::Status::kSuccess) return s;
+        return gemm_op();
+    }
+}
 
 // GPU context for online computation
 struct OnlineContext {
@@ -106,10 +158,11 @@ struct OnlineContext {
     // GEMM workspace (pre-allocated, CUTLASS SIMT fallback only)
     void* d_gemm_workspace = nullptr;
 
-    // Tensor core resources (SM >= 72)
+    // Tensor core resources (SM >= 75, CUTLASS uint8)
     bool has_tensor_cores = false;
-    cublasHandle_t cublas_handle = nullptr;
-    int8_t* d_query_bytes[4] = {nullptr, nullptr, nullptr, nullptr};
+    bool is_sm80 = false;  // SM80 uses wider instruction shape
+    uint8_t* d_query_bytes_packed = nullptr;  // K × (4*max_N) contiguous
+    int32_t* d_gemm_out = nullptr;            // M × (4*max_N) int32
 
     // Async transfer resources
     cudaStream_t transfer_stream = nullptr;
@@ -119,22 +172,42 @@ struct OnlineContext {
 };
 
 
-// Decompose uint32 query values into 4 int8 byte slices for tensor core GEMM
-// Reinterpret as signed int8 — the 4x alpha/beta folding into int32 wraps mod 2^32,
-// giving the same result as unsigned.
-__global__ void decompose_query_bytes_kernel(
-    int8_t* __restrict__ q0, int8_t* __restrict__ q1,
-    int8_t* __restrict__ q2, int8_t* __restrict__ q3,
-    const uint32_t* __restrict__ query, size_t count)
+// Decompose uint32 query into packed uint8 layout: K × (4*N) contiguous
+// Byte slice i occupies columns [i*N, (i+1)*N) in col-major with stride K
+__global__ void decompose_query_bytes_packed_kernel(
+    uint8_t* __restrict__ out,  // K * 4 * N contiguous
+    const uint32_t* __restrict__ query,  // K * N col-major
+    size_t K, size_t N)
 {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < count) {
-        uint32_t v = query[idx];
-        q0[idx] = (int8_t)(v & 0xFF);
-        q1[idx] = (int8_t)((v >> 8) & 0xFF);
-        q2[idx] = (int8_t)((v >> 16) & 0xFF);
-        q3[idx] = (int8_t)((v >> 24) & 0xFF);
+    if (idx >= K * N) return;
+    uint32_t v = query[idx];
+    size_t stride = K * N;
+    out[idx + 0 * stride] = (uint8_t)(v & 0xFF);
+    out[idx + 1 * stride] = (uint8_t)((v >> 8) & 0xFF);
+    out[idx + 2 * stride] = (uint8_t)((v >> 16) & 0xFF);
+    out[idx + 3 * stride] = (uint8_t)((v >> 24) & 0xFF);
+}
+
+// Accumulate 1 wide GEMM output (4 query byte slices) into uint32 result
+// gemm_out is col-major M × (4*N), stride M
+__global__ void accumulate_query_bytes_kernel(
+    uint32_t* __restrict__ result,         // M × N col-major
+    const int32_t* __restrict__ gemm_out,  // M × (4*N) col-major
+    size_t M, size_t N)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * N) return;
+    size_t m = idx % M;
+    size_t n = idx / M;
+
+    uint32_t acc = 0;
+    #pragma unroll
+    for (int q_b = 0; q_b < 4; q_b++) {
+        uint32_t val = (uint32_t)gemm_out[m + (q_b * N + n) * M];
+        acc += val << (8 * q_b);
     }
+    result[idx] = acc;
 }
 
 // Kernel to rescale intermediate results into per-batch overlay buffer
@@ -1023,7 +1096,7 @@ void* ypir_online_init(const Elem* db, size_t db_rows, size_t db_cols,
 
     CUDA_ASSERT(cudaDeviceSetCacheConfig(cudaFuncCachePreferL1));
 
-    // Detect tensor cores (SM >= 72: Turing, Ampere, Hopper, ...)
+    // Detect tensor cores (SM >= 80: Ampere+, CUTLASS uint8 TC)
     {
         int device;
         CUDA_ASSERT(cudaGetDevice(&device));
@@ -1031,15 +1104,18 @@ void* ypir_online_init(const Elem* db, size_t db_rows, size_t db_cols,
         CUDA_ASSERT(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
         CUDA_ASSERT(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
         int sm = major * 10 + minor;
-        ctx->has_tensor_cores = (sm >= 72);
+        ctx->has_tensor_cores = (sm >= 75);
+        ctx->is_sm80 = (sm >= 80);
 
         if (ctx->has_tensor_cores) {
-            CUBLAS_CHECK(cublasCreate(&ctx->cublas_handle));
-            size_t byte_query_size = db_cols * max_batch_size * sizeof(int8_t);
-            for (int i = 0; i < 4; i++) {
-                CUDA_ASSERT(cudaMalloc(&ctx->d_query_bytes[i], byte_query_size));
-            }
-            printf("GPU SM %d.%d: tensor cores enabled for Step 1 (4x cuBLAS int8 GEMM)\n", major, minor);
+            // Packed query bytes: K × (4*max_N) contiguous
+            CUDA_ASSERT(cudaMalloc(&ctx->d_query_bytes_packed,
+                db_cols * 4 * max_batch_size * sizeof(uint8_t)));
+            // GEMM output: M × (4*max_N) int32
+            CUDA_ASSERT(cudaMalloc(&ctx->d_gemm_out,
+                db_rows * 4 * max_batch_size * sizeof(int32_t)));
+            printf("GPU SM %d.%d: tensor cores enabled for Step 1 (CUTLASS uint8 TC %s, 1 wide GEMM)\n",
+                   major, minor, ctx->is_sm80 ? "Sm80" : "Sm75");
         } else {
             printf("GPU SM %d.%d: using CUTLASS SIMT for Step 1\n", major, minor);
         }
@@ -1308,39 +1384,38 @@ void ypir_online_compute_full_batch(
     // Step 1: Matrix multiply DB × query → result
     t.tic();
     if (ctx->has_tensor_cores) {
-        // Decompose uint32 query into 4 uint8 byte slices
+        // Decompose uint32 query into packed uint8: K × (4*N)
         size_t total_elems = ctx->db_cols * batch_size;
         int dec_threads = 256;
-        int dec_blocks = (total_elems + dec_threads - 1) / dec_threads;
-        decompose_query_bytes_kernel<<<dec_blocks, dec_threads>>>(
-            ctx->d_query_bytes[0], ctx->d_query_bytes[1],
-            ctx->d_query_bytes[2], ctx->d_query_bytes[3],
-            ctx->d_query, total_elems);
+        int dec_blocks = ((int)total_elems + dec_threads - 1) / dec_threads;
+        decompose_query_bytes_packed_kernel<<<dec_blocks, dec_threads>>>(
+            ctx->d_query_bytes_packed, ctx->d_query, ctx->db_cols, batch_size);
         CUDA_ASSERT(cudaGetLastError());
 
-        // 4 cuBLAS int8 GEMMs with alpha/beta folding (tensor cores)
-        // D = sum_{g=0..3} (256^g) * DB_i8 * q_byte_g
-        // Signed int8 reinterpretation: wraps mod 2^32 identically to unsigned.
-        int32_t alphas[4] = {1, 256, 65536, 16777216};
-        int32_t betas[4] = {0, 1, 1, 1};
+        // 1 CUTLASS uint8 TC GEMM: M×K × K×(4*N) → M×(4*N)
         int M = (int)ctx->db_rows;
         int N = (int)batch_size;
         int K = (int)ctx->db_cols;
+        int wide_N = 4 * N;
 
-        for (int g = 0; g < 4; g++) {
-            CUBLAS_CHECK(cublasGemmEx(ctx->cublas_handle,
-                CUBLAS_OP_T, CUBLAS_OP_N,
-                M, N, K,
-                &alphas[g],
-                ctx->d_db,            CUDA_R_8I, K,
-                ctx->d_query_bytes[g], CUDA_R_8I, K,
-                &betas[g],
-                ctx->d_result,        CUDA_R_32I, M,
-                CUBLAS_COMPUTE_32I,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        cutlass::Status status = run_u8tc_gemm(ctx->is_sm80,
+            M, wide_N, K,
+            ctx->d_db, K,
+            ctx->d_query_bytes_packed, K,
+            ctx->d_gemm_out, M);
+        if (status != cutlass::Status::kSuccess) {
+            fprintf(stderr, "CUTLASS TC GEMM failed: %s\n", cutlassGetStatusString(status));
         }
+
+        // Accumulate 4 byte products into uint32 result
+        size_t out_elems = (size_t)M * N;
+        int acc_threads = 256;
+        int acc_blocks = ((int)out_elems + acc_threads - 1) / acc_threads;
+        accumulate_query_bytes_kernel<<<acc_blocks, acc_threads>>>(
+            ctx->d_result, ctx->d_gemm_out, M, N);
+        CUDA_ASSERT(cudaGetLastError());
     } else {
-        // CUTLASS SIMT GEMM (fallback for SM < 72)
+        // CUTLASS SIMT GEMM (fallback for SM < 75)
         cutlass::gemm::GemmCoord problem_size(ctx->db_rows, batch_size, ctx->db_cols);
         uint32_t alpha = 1, beta = 0;
         CutlassGemm::Arguments args{
@@ -1559,10 +1634,8 @@ void ypir_online_free(void* context)
 
     // Free tensor core resources
     if (ctx->has_tensor_cores) {
-        CUBLAS_CHECK(cublasDestroy(ctx->cublas_handle));
-        for (int i = 0; i < 4; i++) {
-            CUDA_ASSERT(cudaFree(ctx->d_query_bytes[i]));
-        }
+        CUDA_ASSERT(cudaFree(ctx->d_query_bytes_packed));
+        CUDA_ASSERT(cudaFree(ctx->d_gemm_out));
     }
 
     CUDA_ASSERT(cudaStreamDestroy(ctx->transfer_stream));

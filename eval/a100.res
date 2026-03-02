@@ -177,6 +177,54 @@ HBM BW (theoretical): ~1555.2 GB/s
     2048        287.83          7115           15280.2              85.6
 ------------------------------------------------------------------------
 
+=== CUTLASS uint8 TC: 2x wide GEMM (uint16 DB x uint64 query) ===
+DB: 32768 x 32768 uint16 (2.0 GiB)
+2 GEMMs: uint8 × uint8 → int32, each M×K × K×(8*batch)
+DB read exactly 2x (1x per byte slice)
+GPU memory: 39.5 GiB total, 39.1 GiB free
+GPU: NVIDIA A100-PCIE-40GB
+HBM BW (theoretical): ~1555.2 GB/s
+------------------------------------------------------------------------
+   Batch     Time (ms)           QPS   Eff Tput (GB/s)      HW BW (GB/s)
+------------------------------------------------------------------------
+       1          3.01           332             714.0             715.1
+       2          2.61           766            1644.5             824.9
+       4          2.18          1833            3936.7             990.4
+       8          2.18          3666            7873.3             996.7
+      16          2.22          7215           15495.0             993.0
+      32          2.73         11725           25179.7             826.8
+      64          4.82         13280           28518.1             490.9
+     128         10.16         12594           27044.8             254.2
+     256         19.89         12870           27637.1             151.8
+     512         41.32         12392           26612.5              94.2
+    1024         87.82         11660           25040.1              64.2
+    2048        188.93         10840           23279.0              48.3
+------------------------------------------------------------------------
+
+=== CUTLASS uint8 TC: 1x wide GEMM (uint8 DB x uint32 query) ===
+DB: 32768 x 32768 uint8 (1.0 GiB)
+1 GEMM: uint8 × uint8 → int32, M×K × K×(4*batch)
+DB read exactly 1x
+GPU memory: 39.5 GiB total, 39.1 GiB free
+GPU: NVIDIA A100-PCIE-40GB
+HBM BW (theoretical): ~1555.2 GB/s
+------------------------------------------------------------------------
+   Batch     Time (ms)           QPS   Eff Tput (GB/s)      HW BW (GB/s)
+------------------------------------------------------------------------
+       1          1.45           691             742.0             742.6
+       2          1.45          1380            1481.2             741.7
+       4          1.41          2842            3051.3             765.1
+       8          1.22          6548            7030.3             883.9
+      16          1.23         13050           14012.5             886.0
+      32          1.24         25824           27728.6             886.8
+      64          1.61         39662           42587.2             696.6
+     128          2.69         47534           51039.2             436.1
+     256          4.68         54715           58750.2             272.5
+     512          9.69         52864           56761.9             152.4
+    1024         20.33         50359           54072.6              92.4
+    2048         42.77         47884           51415.3              62.8
+------------------------------------------------------------------------
+
 
 RUST_LOG=debug cargo run --features toeplitz --release -- 4294967296 8 64 0
 # tensor cores
@@ -361,6 +409,195 @@ Result:
     "sqrtNBytes": 0,
     "allServerTimesMs": [
       321
+    ],
+    "stdDevServerTimeMs": 0.0
+  }
+}
+
+
+# first try corrected TC code
+# word cdks
+Hint Prep. Throughput 4.74 GB/sec
+Throughput: 918.37 GB/sec
+Word Step1(TC) 180.386 ms, Step2 (149 streams, 1 chunks) 197.356 ms
+Measurement completed. See the README for details on what the following fields mean.
+Result:
+{
+  "offline": {
+    "uploadBytes": 0,
+    "downloadBytes": 0,
+    "serverTimeMs": 64978,
+    "clientTimeMs": 0,
+    "simplepirPrepTimeMs": 1186,
+    "simplepirHintBytes": 0,
+    "doublepirHintBytes": 0
+  },
+  "online": {
+    "uploadBytes": 1521664,
+    "downloadBytes": 9437184,
+    "simplepirQueryBytes": 0,
+    "doublepirQueryBytes": 0,
+    "simplepirRespBytes": 0,
+    "doublepirRespBytes": 0,
+    "serverTimeMs": 392,
+    "clientQueryGenTimeMs": 1978,
+    "clientDecodeTimeMs": 6,
+    "firstPassTimeMs": 387,
+    "secondPassTimeMs": 0,
+    "ringPackingTimeMs": 0,
+    "sqrtNBytes": 0,
+    "allServerTimesMs": [
+      392
+    ],
+    "stdDevServerTimeMs": 0.0
+  }
+}
+# word inspiring
+Word InspiRING Step1(TC) 177.948 ms, Step2 (256 streams, 1 chunks) 82.084 ms
+Hint Prep. Throughput 4.72 GB/sec
+Throughput: 1343.28 GB/sec
+Measurement completed. See the README for details on what the following fields mean.
+Result:
+{
+  "offline": {
+    "uploadBytes": 0,
+    "downloadBytes": 0,
+    "serverTimeMs": 176450,
+    "clientTimeMs": 0,
+    "simplepirPrepTimeMs": 1192,
+    "simplepirHintBytes": 0,
+    "doublepirHintBytes": 0
+  },
+  "online": {
+    "uploadBytes": 1134592,
+    "downloadBytes": 9437184,
+    "simplepirQueryBytes": 0,
+    "doublepirQueryBytes": 0,
+    "simplepirRespBytes": 0,
+    "doublepirRespBytes": 0,
+    "serverTimeMs": 268,
+    "clientQueryGenTimeMs": 1902,
+    "clientDecodeTimeMs": 6,
+    "firstPassTimeMs": 262,
+    "secondPassTimeMs": 0,
+    "ringPackingTimeMs": 0,
+    "sqrtNBytes": 0,
+    "allServerTimesMs": [
+      268
+    ],
+    "stdDevServerTimeMs": 0.0
+  }
+}
+
+
+# new corrected TC code
+# doublepir
+Hint Prep. Throughput 25.00 GB/sec
+Throughput: 1454.55 GB/sec
+Step1 10.932 ms, Steps2-5 (parallel, 256 streams) 149.678 ms
+Measurement completed. See the README for details on what the following fields mean.
+Result:
+{
+  "offline": {
+    "uploadBytes": 0,
+    "downloadBytes": 0,
+    "serverTimeMs": 16878,
+    "clientTimeMs": 0,
+    "simplepirPrepTimeMs": 160,
+    "simplepirHintBytes": 234881024,
+    "doublepirHintBytes": 14680064
+  },
+  "online": {
+    "uploadBytes": 1259520,
+    "downloadBytes": 786432,
+    "simplepirQueryBytes": 262144,
+    "doublepirQueryBytes": 458752,
+    "simplepirRespBytes": 229376,
+    "doublepirRespBytes": 12288,
+    "serverTimeMs": 176,
+    "clientQueryGenTimeMs": 1045,
+    "clientDecodeTimeMs": 0,
+    "firstPassTimeMs": 0,
+    "secondPassTimeMs": 0,
+    "ringPackingTimeMs": 0,
+    "sqrtNBytes": 65536,
+    "allServerTimesMs": [
+      176
+    ],
+    "stdDevServerTimeMs": 0.0
+  }
+}
+
+# ypir-word cdks
+RUST_LOG=debug cargo run --release --features cuda -- 65536 737280 1 0 --word
+Word Step1(TC) 27.822 ms, Step2 (71 streams, 1 chunks) 392.933 ms
+Hint Prep. Throughput 8.01 GB/sec
+Throughput: 831.41 GB/sec
+Measurement completed. See the README for details on what the following fields mean.
+Result:
+{
+  "offline": {
+    "uploadBytes": 0,
+    "downloadBytes": 0,
+    "serverTimeMs": 125307,
+    "clientTimeMs": 0,
+    "simplepirPrepTimeMs": 702,
+    "simplepirHintBytes": 0,
+    "doublepirHintBytes": 0
+  },
+  "online": {
+    "uploadBytes": 997376,
+    "downloadBytes": 18874368,
+    "simplepirQueryBytes": 0,
+    "doublepirQueryBytes": 0,
+    "simplepirRespBytes": 0,
+    "doublepirRespBytes": 0,
+    "serverTimeMs": 433,
+    "clientQueryGenTimeMs": 1052,
+    "clientDecodeTimeMs": 12,
+    "firstPassTimeMs": 431,
+    "secondPassTimeMs": 0,
+    "ringPackingTimeMs": 0,
+    "sqrtNBytes": 0,
+    "allServerTimesMs": [
+      433
+    ],
+    "stdDevServerTimeMs": 0.0
+  }
+}
+# ypir-word inspiring
+RUST_LOG=debug cargo run --release --features cuda -- 65536 737280 1 0 --word --inspiring
+Hint Prep. Throughput 8.01 GB/sec
+Throughput: 1782.18 GB/sec
+Word InspiRING Step1(TC) 25.604 ms, Step2 (256 streams, 1 chunks) 169.113 ms
+Measurement completed. See the README for details on what the following fields mean.
+Result:
+{
+  "offline": {
+    "uploadBytes": 0,
+    "downloadBytes": 0,
+    "serverTimeMs": 339356,
+    "clientTimeMs": 0,
+    "simplepirPrepTimeMs": 702,
+    "simplepirHintBytes": 0,
+    "doublepirHintBytes": 0
+  },
+  "online": {
+    "uploadBytes": 610304,
+    "downloadBytes": 18874368,
+    "simplepirQueryBytes": 0,
+    "doublepirQueryBytes": 0,
+    "simplepirRespBytes": 0,
+    "doublepirRespBytes": 0,
+    "serverTimeMs": 202,
+    "clientQueryGenTimeMs": 1003,
+    "clientDecodeTimeMs": 12,
+    "firstPassTimeMs": 199,
+    "secondPassTimeMs": 0,
+    "ringPackingTimeMs": 0,
+    "sqrtNBytes": 0,
+    "allServerTimesMs": [
+      202
     ],
     "stdDevServerTimeMs": 0.0
   }

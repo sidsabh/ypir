@@ -1,17 +1,9 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>
-#include <cublas_v2.h>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm.h"
-
-#define CUBLAS_CHECK(call) do { \
-    cublasStatus_t status_ = (call); \
-    if (status_ != CUBLAS_STATUS_SUCCESS) { \
-        fprintf(stderr, "cuBLAS error at %s:%d: %d\n", __FILE__, __LINE__, (int)status_); \
-    } \
-} while(0)
 
 #define CUDA_CHECK(call) do { \
     cudaError_t err_ = (call); \
@@ -40,6 +32,64 @@ using CutlassGemmSimt = cutlass::gemm::device::Gemm<
     2                                        // Stages
 >;
 
+// CUTLASS uint8 TC GEMM: uint8 × uint8 → int32 (tensor cores)
+
+// SM80+ (Ampere): wider instruction shape
+using CutlassGemmU8TC_Sm80 = cutlass::gemm::device::Gemm<
+    uint8_t, cutlass::layout::RowMajor,
+    uint8_t, cutlass::layout::ColumnMajor,
+    int32_t, cutlass::layout::ColumnMajor,
+    int32_t,
+    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<128, 256, 64>,
+    cutlass::gemm::GemmShape<64, 64, 64>,
+    cutlass::gemm::GemmShape<16, 8, 32>,
+    cutlass::epilogue::thread::LinearCombination<int32_t, 4, int32_t, int32_t>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>, 3
+>;
+
+// SM75 (Turing): u8 IMMA with 8×8×16 instruction shape
+using CutlassGemmU8TC_Sm75 = cutlass::gemm::device::Gemm<
+    uint8_t, cutlass::layout::RowMajor,
+    uint8_t, cutlass::layout::ColumnMajor,
+    int32_t, cutlass::layout::ColumnMajor,
+    int32_t,
+    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm75,
+    cutlass::gemm::GemmShape<128, 256, 64>,
+    cutlass::gemm::GemmShape<64, 64, 64>,
+    cutlass::gemm::GemmShape<8, 8, 16>,
+    cutlass::epilogue::thread::LinearCombination<int32_t, 4, int32_t, int32_t>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>, 3
+>;
+
+// Helper: run the correct TC GEMM based on SM version
+static cutlass::Status run_u8tc_gemm(bool is_sm80,
+    int M, int wide_N, int K,
+    const uint8_t* A, int lda,
+    const uint8_t* B, int ldb,
+    int32_t* C, int ldc)
+{
+    int32_t alpha = 1, beta = 0;
+    cutlass::gemm::GemmCoord problem_size(M, wide_N, K);
+    if (is_sm80) {
+        CutlassGemmU8TC_Sm80::Arguments args{
+            problem_size, {A, lda}, {B, ldb}, {C, ldc}, {C, ldc}, {alpha, beta}, 1
+        };
+        CutlassGemmU8TC_Sm80 gemm_op;
+        auto s = gemm_op.initialize(args, nullptr);
+        if (s != cutlass::Status::kSuccess) return s;
+        return gemm_op();
+    } else {
+        CutlassGemmU8TC_Sm75::Arguments args{
+            problem_size, {A, lda}, {B, ldb}, {C, ldc}, {C, ldc}, {alpha, beta}, 1
+        };
+        CutlassGemmU8TC_Sm75 gemm_op;
+        auto s = gemm_op.initialize(args, nullptr);
+        if (s != cutlass::Status::kSuccess) return s;
+        return gemm_op();
+    }
+}
+
 extern "C" {
 
 // Toeplitz builder for negacyclic polynomial multiplication
@@ -65,10 +115,10 @@ __global__ void build_toeplitz_matrix_negacyclic_u32(
 }
 
 // Fused transpose + byte-decompose (tensor core path):
-// Reads A in n×l1 col-major, writes 4 int8 byte slices in l1×n col-major (= A^T layout)
-__global__ void transpose_and_decompose(
-    int8_t* __restrict__ b0, int8_t* __restrict__ b1,
-    int8_t* __restrict__ b2, int8_t* __restrict__ b3,
+// Reads A in n×l1 col-major, writes 4 packed uint8 byte slices contiguously
+// in l1×(4*n) col-major (= A^T layout with 4 byte slices stacked along columns)
+__global__ void transpose_and_decompose_packed(
+    uint8_t* __restrict__ out,   // l1 × (4*n) col-major
     const uint32_t* __restrict__ A,
     uint32_t n, uint32_t l1)
 {
@@ -82,10 +132,11 @@ __global__ void transpose_and_decompose(
 
     uint32_t v = A[j + i * n];  // read from n×l1 col-major
 
-    b0[idx] = (int8_t)(v & 0xFF);
-    b1[idx] = (int8_t)((v >> 8) & 0xFF);
-    b2[idx] = (int8_t)((v >> 16) & 0xFF);
-    b3[idx] = (int8_t)((v >> 24) & 0xFF);
+    size_t stride = (size_t)l1 * n;  // elements per byte slice
+    out[idx + 0 * stride] = (uint8_t)(v & 0xFF);
+    out[idx + 1 * stride] = (uint8_t)((v >> 8) & 0xFF);
+    out[idx + 2 * stride] = (uint8_t)((v >> 16) & 0xFF);
+    out[idx + 3 * stride] = (uint8_t)((v >> 24) & 0xFF);
 }
 
 // Plain transpose (SIMT path):
@@ -105,6 +156,27 @@ __global__ void transpose_u32(
     dst[idx] = src[j + i * n];
 }
 
+// Accumulate 1 wide GEMM output (4 byte slices of A^T) into uint32 result
+// gemm_out is col-major M × (4*N), stride M
+__global__ void accumulate_toeplitz_bytes_kernel(
+    uint32_t* __restrict__ result,         // M × N col-major
+    const int32_t* __restrict__ gemm_out,  // M × (4*N) col-major
+    size_t M, size_t N)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * N) return;
+    size_t m = idx % M;
+    size_t n = idx / M;
+
+    uint32_t acc = 0;
+    #pragma unroll
+    for (int b = 0; b < 4; b++) {
+        uint32_t val = (uint32_t)gemm_out[m + (b * N + n) * M];
+        acc += val << (8 * b);
+    }
+    result[idx] = acc;
+}
+
 // Widen int32/uint32 to uint64 (no transpose — layout already correct)
 __global__ void widen_to_u64(
     const uint32_t* __restrict__ src,
@@ -120,10 +192,11 @@ __global__ void widen_to_u64(
 
 struct ToeplitzContext
 {
-    // Tensor core path (cuBLAS int8)
+    // Tensor core path (CUTLASS uint8 TC, SM75+)
     bool has_tensor_cores;
-    cublasHandle_t cublas_handle;
-    int8_t* d_A_bytes[4];   // l1×n byte slices of A^T, col-major
+    bool is_sm80;
+    uint8_t* d_A_bytes_packed;  // l1 × (4*n) packed uint8 byte slices of A^T, col-major
+    int32_t* d_gemm_out;        // l2 × (4*n) GEMM output, col-major
 
     // SIMT path (CUTLASS uint8×uint32)
     uint32_t* d_A_T;        // l1×n col-major uint32 (A transposed)
@@ -144,14 +217,12 @@ void free_toeplitz_context(void* context)
     ToeplitzContext* ctx = (ToeplitzContext*)context;
     if (!ctx) return;
 
-    for (int i = 0; i < 4; i++) {
-        if (ctx->d_A_bytes[i]) cudaFree(ctx->d_A_bytes[i]);
-    }
-    if (ctx->d_A_T)            cudaFree(ctx->d_A_T);
+    if (ctx->d_A_bytes_packed) cudaFree(ctx->d_A_bytes_packed);
+    if (ctx->d_gemm_out)      cudaFree(ctx->d_gemm_out);
+    if (ctx->d_A_T)           cudaFree(ctx->d_A_T);
     if (ctx->d_gemm_workspace) cudaFree(ctx->d_gemm_workspace);
-    if (ctx->d_D)              cudaFree(ctx->d_D);
-    if (ctx->d_result)         cudaFree(ctx->d_result);
-    if (ctx->cublas_handle)    cublasDestroy(ctx->cublas_handle);
+    if (ctx->d_D)             cudaFree(ctx->d_D);
+    if (ctx->d_result)        cudaFree(ctx->d_result);
 
     delete ctx;
 }
@@ -192,16 +263,17 @@ void* init_toeplitz_context(
     ctx->l1 = db_rows;
     ctx->l2 = db_cols;
     ctx->has_tensor_cores = false;
-    ctx->cublas_handle = nullptr;
+    ctx->is_sm80 = false;
+    ctx->d_A_bytes_packed = nullptr;
+    ctx->d_gemm_out = nullptr;
     ctx->d_A_T = nullptr;
     ctx->d_gemm_workspace = nullptr;
     ctx->d_D = nullptr;
     ctx->d_result = nullptr;
-    for (int i = 0; i < 4; i++) ctx->d_A_bytes[i] = nullptr;
 
     size_t A_elems = (size_t)n * db_rows;  // = l1 * n
 
-    // ---- Detect tensor cores (SM >= 72) ----
+    // ---- Detect tensor cores (SM >= 80 for CUTLASS uint8 TC) ----
     {
         int device;
         CUDA_CHECK(cudaGetDevice(&device));
@@ -209,10 +281,12 @@ void* init_toeplitz_context(
         CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
         CUDA_CHECK(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
         int sm = major * 10 + minor;
-        ctx->has_tensor_cores = (sm >= 72);
+        ctx->has_tensor_cores = (sm >= 75);
+        ctx->is_sm80 = (sm >= 80);
 
         if (ctx->has_tensor_cores) {
-            printf("Toeplitz GEMM (tensor core): n=%u, l1=%u, l2=%u  =>  M=%u, K=%u, N=%u\n",
+            printf("Toeplitz GEMM (CUTLASS uint8 TC %s): n=%u, l1=%u, l2=%u  =>  M=%u, K=%u, N=%u\n",
+                   ctx->is_sm80 ? "Sm80" : "Sm75",
                    n, db_rows, db_cols, db_cols, db_rows, n);
         } else {
             printf("Toeplitz GEMM (CUTLASS SIMT): n=%u, l1=%u, l2=%u  =>  M=%u, K=%u, N=%u\n",
@@ -251,25 +325,29 @@ void* init_toeplitz_context(
 
     // ---- Path-specific: transpose + prepare A ----
     if (ctx->has_tensor_cores) {
-        // Fused transpose + decompose into 4 int8 byte slices (l1×n col-major)
-        for (int i = 0; i < 4; i++) {
-            if (cudaMalloc(&ctx->d_A_bytes[i], A_elems) != cudaSuccess) {
-                printf("ERROR: Failed to allocate byte slice %d.\n", i);
-                cudaFree(d_A_tmp);
-                free_toeplitz_context(ctx);
-                return nullptr;
-            }
+        // Fused transpose + decompose into packed uint8: l1 × (4*n) col-major
+        size_t packed_size = A_elems * 4;  // 4 byte slices
+        if (cudaMalloc(&ctx->d_A_bytes_packed, packed_size) != cudaSuccess) {
+            printf("ERROR: Failed to allocate packed byte slices.\n");
+            cudaFree(d_A_tmp);
+            free_toeplitz_context(ctx);
+            return nullptr;
+        }
+
+        // Allocate GEMM output: l2 × (4*n) int32
+        size_t gemm_out_size = (size_t)db_cols * 4 * n * sizeof(int32_t);
+        if (cudaMalloc(&ctx->d_gemm_out, gemm_out_size) != cudaSuccess) {
+            printf("ERROR: Failed to allocate GEMM output.\n");
+            cudaFree(d_A_tmp);
+            free_toeplitz_context(ctx);
+            return nullptr;
         }
 
         int threads = 256;
         int blocks = (A_elems + threads - 1) / threads;
-        transpose_and_decompose<<<blocks, threads>>>(
-            ctx->d_A_bytes[0], ctx->d_A_bytes[1],
-            ctx->d_A_bytes[2], ctx->d_A_bytes[3],
-            d_A_tmp, n, db_rows);
+        transpose_and_decompose_packed<<<blocks, threads>>>(
+            ctx->d_A_bytes_packed, d_A_tmp, n, db_rows);
         CUDA_CHECK(cudaGetLastError());
-
-        CUBLAS_CHECK(cublasCreate(&ctx->cublas_handle));
     } else {
         // Plain transpose to l1×n col-major uint32
         if (cudaMalloc(&ctx->d_A_T, A_elems * sizeof(uint32_t)) != cudaSuccess) {
@@ -336,28 +414,32 @@ int compute_hint_0_toeplitz(void* context, uint64_t* hint_0)
     if (!ctx) return -1;
 
     if (ctx->has_tensor_cores) {
-        // ---- Tensor core path: 4× cuBLAS int8 GEMM with alpha/beta folding ----
-        // D^T(l2×l1) × A^T_byte_g(l1×n) → C(l2×n)
-        // M=l2, N=n, K=l1
-
-        int32_t alphas[4] = {1, 256, 65536, 16777216};
-        int32_t betas[4]  = {0, 1, 1, 1};
+        // ---- CUTLASS uint8 TC: 1 wide GEMM ----
+        // D^T(l2×l1, uint8 RowMajor) × A^T_packed(l1×(4*n), uint8 ColMajor)
+        //   → gemm_out(l2×(4*n), int32 ColMajor)
+        // Then accumulate 4 byte products into uint32 result
         int M = (int)ctx->l2;
         int N = (int)ctx->n;
         int K = (int)ctx->l1;
+        int wide_N = 4 * N;
 
-        for (int g = 0; g < 4; g++) {
-            CUBLAS_CHECK(cublasGemmEx(ctx->cublas_handle,
-                CUBLAS_OP_T, CUBLAS_OP_N,
-                M, N, K,
-                &alphas[g],
-                ctx->d_D,          CUDA_R_8I, K,   // D: l1×l2 col-major, OP_T → l2×l1
-                ctx->d_A_bytes[g], CUDA_R_8I, K,   // A^T: l1×n col-major, OP_N → l1×n
-                &betas[g],
-                (int32_t*)ctx->d_result, CUDA_R_32I, M,
-                CUBLAS_COMPUTE_32I,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        cutlass::Status status = run_u8tc_gemm(ctx->is_sm80,
+            M, wide_N, K,
+            ctx->d_D, K,
+            ctx->d_A_bytes_packed, K,
+            ctx->d_gemm_out, M);
+        if (status != cutlass::Status::kSuccess) {
+            fprintf(stderr, "CUTLASS TC GEMM failed: %s\n", cutlassGetStatusString(status));
+            return -1;
         }
+
+        // Accumulate 4 byte products → uint32
+        size_t total_result = (size_t)M * N;
+        int acc_threads = 256;
+        int acc_blocks = (total_result + acc_threads - 1) / acc_threads;
+        accumulate_toeplitz_bytes_kernel<<<acc_blocks, acc_threads>>>(
+            ctx->d_result, ctx->d_gemm_out, M, N);
+        CUDA_CHECK(cudaGetLastError());
     } else {
         // ---- CUTLASS SIMT fallback: single uint8×uint32 → uint32 GEMM ----
         // D^T(l2×l1, uint8 RowMajor) × A^T(l1×n, uint32 ColMajor) → C(l2×n, uint32 ColMajor)

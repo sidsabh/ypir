@@ -13,9 +13,11 @@
  *   db32_crt_i64 — CRT: two (int32 DB × int32 queries → int64 accum), matches actual CUTLASS kernel
  *   db8_q32_tc   — Tensor core: 4x int8 GEMM with alpha/beta folding (DoublePIR Step 1, cuBLAS)
  *   db16_q64_tc  — Tensor core: 15x int8 GEMM (uint16 DB x uint64 query, SimplePIR offline)
+ *   db8_q32_tc_cutlass  — CUTLASS uint8 TC: 1x wide GEMM (uint8 DB x uint32 query, SM80+)
+ *   db16_q64_tc_cutlass — CUTLASS uint8 TC: 2x wide GEMM (uint16 DB x uint64 query, SM80+)
  *
  * Usage:
- *   ./pir_bench [--mode db32_q32|db32_q64|db16_q32|db16_q64|db16_crt|db8_q32|db32_crt_i64|db8_q32_tc|db16_q64_tc|all]
+ *   ./pir_bench [--mode db32_q32|...|db16_q64_tc_cutlass|all]
  *               [--batches 1,2,4,...] [--log_dim N] [--warmup N] [--iters N]
  *
  * Requires CUTLASS headers (clone https://github.com/NVIDIA/cutlass)
@@ -131,6 +133,124 @@ __global__ void decompose_i64_bytes_kernel(
         b6[idx] = (int8_t)((v >> 48) & 0xFF);
         b7[idx] = (int8_t)((v >> 56) & 0xFF);
     }
+}
+
+// ---------- Kernels for CUTLASS uint8 TC path ----------
+
+// Decompose uint16 DB into 2 uint8 byte slices
+__global__ void decompose_u16_bytes_kernel(
+    uint8_t* __restrict__ b0,
+    uint8_t* __restrict__ b1,
+    const uint16_t* __restrict__ data,
+    size_t count)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count) {
+        uint16_t v = data[idx];
+        b0[idx] = (uint8_t)(v & 0xFF);
+        b1[idx] = (uint8_t)((v >> 8) & 0xFF);
+    }
+}
+
+// Decompose uint64 queries into packed uint8 layout: K × (8*N) contiguous
+// Byte slice i occupies columns [i*N, (i+1)*N) in col-major with stride K
+__global__ void decompose_u64_bytes_packed_kernel(
+    uint8_t* __restrict__ out,  // K * 8 * N contiguous
+    const uint64_t* __restrict__ data,  // K * N col-major
+    size_t K, size_t N)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= K * N) return;
+    uint64_t v = data[idx];
+    size_t stride = K * N;
+    out[idx + 0 * stride] = (uint8_t)(v & 0xFF);
+    out[idx + 1 * stride] = (uint8_t)((v >> 8) & 0xFF);
+    out[idx + 2 * stride] = (uint8_t)((v >> 16) & 0xFF);
+    out[idx + 3 * stride] = (uint8_t)((v >> 24) & 0xFF);
+    out[idx + 4 * stride] = (uint8_t)((v >> 32) & 0xFF);
+    out[idx + 5 * stride] = (uint8_t)((v >> 40) & 0xFF);
+    out[idx + 6 * stride] = (uint8_t)((v >> 48) & 0xFF);
+    out[idx + 7 * stride] = (uint8_t)((v >> 56) & 0xFF);
+}
+
+// Accumulate GEMM 0 (db_b=0): 8 byte products → uint64
+// gemm_out is col-major M × (8*N), stride M
+__global__ void accumulate_db0_kernel(
+    uint64_t* __restrict__ accum,          // M × N col-major
+    const int32_t* __restrict__ gemm_out,  // M × (8*N) col-major
+    size_t M, size_t N)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * N) return;
+    size_t m = idx % M;
+    size_t n = idx / M;
+
+    uint64_t acc = 0;
+    #pragma unroll
+    for (int q_b = 0; q_b < 8; q_b++) {
+        uint64_t val = (uint64_t)(uint32_t)gemm_out[m + (q_b * N + n) * M];
+        acc += val << (8 * q_b);
+    }
+    accum[idx] = acc;
+}
+
+// Accumulate GEMM 1 (db_b=1): 7 byte products → add to uint64
+// Skip q_b=7 (power 8 → 0 mod 2^64)
+__global__ void accumulate_db1_kernel(
+    uint64_t* __restrict__ accum,          // M × N col-major (read-modify-write)
+    const int32_t* __restrict__ gemm_out,  // M × (8*N) col-major
+    size_t M, size_t N)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * N) return;
+    size_t m = idx % M;
+    size_t n = idx / M;
+
+    uint64_t acc = 0;
+    #pragma unroll
+    for (int q_b = 0; q_b < 7; q_b++) {
+        uint64_t val = (uint64_t)(uint32_t)gemm_out[m + (q_b * N + n) * M];
+        acc += val << (8 * (q_b + 1));
+    }
+    accum[idx] += acc;
+}
+
+// Decompose uint32 queries into packed uint8 layout: K × (4*N) contiguous
+// Byte slice i occupies columns [i*N, (i+1)*N) in col-major with stride K
+__global__ void decompose_u32_bytes_packed_kernel(
+    uint8_t* __restrict__ out,  // K * 4 * N contiguous
+    const uint32_t* __restrict__ data,  // K * N col-major
+    size_t K, size_t N)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= K * N) return;
+    uint32_t v = data[idx];
+    size_t stride = K * N;
+    out[idx + 0 * stride] = (uint8_t)(v & 0xFF);
+    out[idx + 1 * stride] = (uint8_t)((v >> 8) & 0xFF);
+    out[idx + 2 * stride] = (uint8_t)((v >> 16) & 0xFF);
+    out[idx + 3 * stride] = (uint8_t)((v >> 24) & 0xFF);
+}
+
+// Accumulate 1 GEMM (uint8 DB × 4 query bytes) → uint32
+// gemm_out is col-major M × (4*N), stride M
+__global__ void accumulate_db8_q32_kernel(
+    uint32_t* __restrict__ accum,          // M × N col-major
+    const int32_t* __restrict__ gemm_out,  // M × (4*N) col-major
+    size_t M, size_t N)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * N) return;
+    size_t m = idx % M;
+    size_t n = idx / M;
+
+    uint32_t acc = 0;
+    #pragma unroll
+    for (int q_b = 0; q_b < 4; q_b++) {
+        uint32_t val = (uint32_t)gemm_out[m + (q_b * N + n) * M];
+        acc += val << (8 * q_b);
+    }
+    accum[idx] = acc;
 }
 
 // ---------- Benchmark kernel ----------
@@ -1083,6 +1203,412 @@ void run_db16_q64_tensor(uint64_t M, uint64_t K, const std::vector<int>& batch_s
     std::cout << "HW BW   = (15*db_slices + 15*q_slices + output_accesses) / time" << std::endl;
 }
 
+// ---------- CUTLASS uint8 Tensor Core: 1x wide GEMM (uint8 DB x uint32 query) ----------
+//
+// DB is already uint8 (1 byte), query decomposes into 4 bytes.
+// Pack 4 query byte slices into K × (4*N), do 1 GEMM.
+// DB read exactly once.
+
+using CutlassGemmU8TC = cutlass::gemm::device::Gemm<
+    uint8_t, cutlass::layout::RowMajor,     // A (DB, row-major)
+    uint8_t, cutlass::layout::ColumnMajor,   // B (packed query bytes, col-major)
+    int32_t, cutlass::layout::ColumnMajor,   // C/D (output, col-major)
+    int32_t,
+    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<128, 256, 64>,
+    cutlass::gemm::GemmShape<64, 64, 64>,
+    cutlass::gemm::GemmShape<16, 8, 32>,
+    cutlass::epilogue::thread::LinearCombination<int32_t, 4, int32_t, int32_t>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>, 3
+>;
+
+void run_db8_q32_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& batch_sizes,
+                             int warmup, int iters) {
+    const double GiB = 1024.0 * 1024.0 * 1024.0;
+    std::cout << "\n=== CUTLASS uint8 TC: 1x wide GEMM (uint8 DB x uint32 query) ===" << std::endl;
+    std::cout << "DB: " << M << " x " << K << " uint8 ("
+              << std::fixed << std::setprecision(1)
+              << (double(M) * K) / GiB << " GiB)" << std::endl;
+    std::cout << "1 GEMM: uint8 × uint8 → int32, M×K × K×(4*batch)" << std::endl;
+    std::cout << "DB read exactly 1x" << std::endl;
+
+    size_t free_mem, total_mem;
+    CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
+    std::cout << "GPU memory: " << std::fixed << std::setprecision(1)
+              << total_mem / GiB << " GiB total, "
+              << free_mem / GiB << " GiB free" << std::endl;
+
+    cudaDeviceProp props;
+    CUDA_CHECK(cudaGetDeviceProperties(&props, 0));
+    std::cout << "GPU: " << props.name << std::endl;
+    std::cout << "HBM BW (theoretical): ~"
+              << (2.0 * props.memoryClockRate * (props.memoryBusWidth / 8.0) / 1.0e6)
+              << " GB/s" << std::endl;
+
+    if (props.major < 8) {
+        std::cout << "SKIPPED: CUTLASS uint8 tensor cores require SM80+ (Ampere or later)" << std::endl;
+        return;
+    }
+
+    std::cout << std::string(72, '-') << std::endl;
+    std::cout << std::setw(8) << "Batch"
+              << std::setw(14) << "Time (ms)"
+              << std::setw(14) << "QPS"
+              << std::setw(18) << "Eff Tput (GB/s)"
+              << std::setw(18) << "HW BW (GB/s)"
+              << std::endl;
+    std::cout << std::string(72, '-') << std::endl;
+
+    // Allocate DB (already uint8, row-major M×K)
+    uint8_t* d_db;
+    CUDA_CHECK(cudaMalloc(&d_db, M * K));
+    {
+        std::vector<uint8_t> h_db(M * K);
+        srand(42);
+        for (size_t i = 0; i < h_db.size(); i++)
+            h_db[i] = (uint8_t)(rand() & 0xFF);
+        CUDA_CHECK(cudaMemcpy(d_db, h_db.data(), M * K, cudaMemcpyHostToDevice));
+    }
+
+    for (int N : batch_sizes) {
+        size_t query_elems = K * (size_t)N;
+        size_t output_elems = M * (size_t)N;
+        size_t wide_N = 4 * (size_t)N;  // packed query width
+
+        // Allocate and decompose query (uint32) into packed uint8: K × (4*N)
+        uint8_t* d_query_packed;
+        CUDA_CHECK(cudaMalloc(&d_query_packed, K * wide_N));
+        {
+            uint32_t* d_query_raw;
+            CUDA_CHECK(cudaMalloc(&d_query_raw, query_elems * sizeof(uint32_t)));
+            std::vector<uint32_t> h_query(query_elems);
+            for (size_t i = 0; i < h_query.size(); i++)
+                h_query[i] = (uint32_t)rand();
+            CUDA_CHECK(cudaMemcpy(d_query_raw, h_query.data(),
+                                  query_elems * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+            int threads = 256;
+            int blocks = ((int)query_elems + threads - 1) / threads;
+            decompose_u32_bytes_packed_kernel<<<blocks, threads>>>(
+                d_query_packed, d_query_raw, K, N);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaFree(d_query_raw));
+        }
+
+        // GEMM output: M × (4*N) int32
+        int32_t* d_gemm_out;
+        CUDA_CHECK(cudaMalloc(&d_gemm_out, M * wide_N * sizeof(int32_t)));
+
+        // Accumulator: M × N uint32
+        uint32_t* d_accum;
+        CUDA_CHECK(cudaMalloc(&d_accum, output_elems * sizeof(uint32_t)));
+
+        int32_t alpha = 1, beta = 0;
+
+        // GEMM: M × (4*N) × K
+        cutlass::gemm::GemmCoord problem_size(M, (int)wide_N, K);
+
+        CutlassGemmU8TC::Arguments args{
+            problem_size,
+            {d_db, (int)K},              // A: M×K row-major, stride=K
+            {d_query_packed, (int)K},    // B: K×(4N) col-major, stride=K
+            {d_gemm_out, (int)M},        // C (unused, beta=0)
+            {d_gemm_out, (int)M},        // D: M×(4N) col-major, stride=M
+            {alpha, beta},
+            1
+        };
+
+        CutlassGemmU8TC gemm_op;
+        cutlass::Status s = gemm_op.can_implement(args);
+        if (s != cutlass::Status::kSuccess) {
+            std::cerr << "Cannot implement CUTLASS u8 TC GEMM for batch=" << N
+                      << ": " << cutlassGetStatusString(s) << std::endl;
+            CUDA_CHECK(cudaFree(d_query_packed));
+            CUDA_CHECK(cudaFree(d_gemm_out));
+            CUDA_CHECK(cudaFree(d_accum));
+            continue;
+        }
+
+        size_t ws = CutlassGemmU8TC::get_workspace_size(args);
+        cutlass::device_memory::allocation<uint8_t> workspace(ws);
+        CUTLASS_CHECK(gemm_op.initialize(args, workspace.get()));
+
+        int acc_threads = 256;
+        int acc_blocks = ((int)output_elems + acc_threads - 1) / acc_threads;
+
+        // Warmup
+        for (int w = 0; w < warmup; w++) {
+            CUTLASS_CHECK(gemm_op());
+            accumulate_db8_q32_kernel<<<acc_blocks, acc_threads>>>(d_accum, d_gemm_out, M, N);
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // Timed
+        cudaEvent_t start, stop;
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+
+        CUDA_CHECK(cudaEventRecord(start));
+        for (int i = 0; i < iters; i++) {
+            CUTLASS_CHECK(gemm_op());
+            accumulate_db8_q32_kernel<<<acc_blocks, acc_threads>>>(d_accum, d_gemm_out, M, N);
+        }
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+
+        float elapsed_ms = 0;
+        CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+        double avg_ms = elapsed_ms / iters;
+
+        double db_bytes = double(M) * K;  // uint8
+        double queries_per_sec = N / (avg_ms / 1000.0);
+        double eff_tput_gbs = (db_bytes * N) / (avg_ms / 1000.0) / 1.0e9;
+
+        // HW BW: 1 DB read + 1 packed query read (K*4N) + 1 GEMM output write (M*4N*4)
+        //       + accum write (M*N*4)
+        double hw_bw_gbs = (
+            double(M) * K +                              // DB read
+            double(K) * wide_N +                         // packed query read
+            double(M) * wide_N * sizeof(int32_t) +       // GEMM output write
+            double(M) * N * sizeof(uint32_t)              // accum write
+        ) / (avg_ms / 1000.0) / 1.0e9;
+
+        std::cout << std::setw(8) << N
+                  << std::setw(14) << std::fixed << std::setprecision(2) << avg_ms
+                  << std::setw(14) << std::fixed << std::setprecision(0) << queries_per_sec
+                  << std::setw(18) << std::fixed << std::setprecision(1) << eff_tput_gbs
+                  << std::setw(18) << std::fixed << std::setprecision(1) << hw_bw_gbs
+                  << std::endl;
+
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+
+        CUDA_CHECK(cudaFree(d_query_packed));
+        CUDA_CHECK(cudaFree(d_gemm_out));
+        CUDA_CHECK(cudaFree(d_accum));
+    }
+
+    CUDA_CHECK(cudaFree(d_db));
+    std::cout << std::string(72, '-') << std::endl;
+    std::cout << "Eff Tput = (DB_uint8_size * batch) / time  [amortized]" << std::endl;
+    std::cout << "HW BW   = (db + packed_query + gemm_out + accum) / time" << std::endl;
+}
+
+// ---------- CUTLASS uint8 Tensor Core: 2x wide GEMM (uint16 DB x uint64 query) ----------
+//
+// The new approach: decompose DB into 2 uint8 byte slices, pack query 8 byte
+// slices contiguously into K × (8*N) matrix, then do 2 GEMMs (one per DB byte).
+// Each GEMM: M×K (uint8) × K×(8*N) (uint8) → M×(8*N) (int32)
+// DB is read exactly 2 times (vs 15 in the old approach).
+// Reuses CutlassGemmU8TC defined above.
+
+void run_db16_q64_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& batch_sizes,
+                              int warmup, int iters) {
+    const double GiB = 1024.0 * 1024.0 * 1024.0;
+    std::cout << "\n=== CUTLASS uint8 TC: 2x wide GEMM (uint16 DB x uint64 query) ===" << std::endl;
+    std::cout << "DB: " << M << " x " << K << " uint16 ("
+              << std::fixed << std::setprecision(1)
+              << (double(M) * K * 2) / GiB << " GiB)" << std::endl;
+    std::cout << "2 GEMMs: uint8 × uint8 → int32, each M×K × K×(8*batch)" << std::endl;
+    std::cout << "DB read exactly 2x (1x per byte slice)" << std::endl;
+
+    size_t free_mem, total_mem;
+    CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
+    std::cout << "GPU memory: " << std::fixed << std::setprecision(1)
+              << total_mem / GiB << " GiB total, "
+              << free_mem / GiB << " GiB free" << std::endl;
+
+    cudaDeviceProp props;
+    CUDA_CHECK(cudaGetDeviceProperties(&props, 0));
+    std::cout << "GPU: " << props.name << std::endl;
+    std::cout << "HBM BW (theoretical): ~"
+              << (2.0 * props.memoryClockRate * (props.memoryBusWidth / 8.0) / 1.0e6)
+              << " GB/s" << std::endl;
+
+    if (props.major < 8) {
+        std::cout << "SKIPPED: CUTLASS uint8 tensor cores require SM80+ (Ampere or later)" << std::endl;
+        return;
+    }
+
+    std::cout << std::string(72, '-') << std::endl;
+    std::cout << std::setw(8) << "Batch"
+              << std::setw(14) << "Time (ms)"
+              << std::setw(14) << "QPS"
+              << std::setw(18) << "Eff Tput (GB/s)"
+              << std::setw(18) << "HW BW (GB/s)"
+              << std::endl;
+    std::cout << std::string(72, '-') << std::endl;
+
+    // Allocate and decompose DB (uint16) into 2 uint8 byte slices
+    size_t db_elems = M * K;
+    uint8_t* d_db_bytes[2];
+    {
+        uint16_t* d_db_raw;
+        CUDA_CHECK(cudaMalloc(&d_db_raw, db_elems * sizeof(uint16_t)));
+        std::vector<uint16_t> h_db(db_elems);
+        srand(42);
+        for (size_t i = 0; i < h_db.size(); i++)
+            h_db[i] = (uint16_t)(rand() & 0xFFFF);
+        CUDA_CHECK(cudaMemcpy(d_db_raw, h_db.data(), db_elems * sizeof(uint16_t), cudaMemcpyHostToDevice));
+
+        for (int i = 0; i < 2; i++)
+            CUDA_CHECK(cudaMalloc(&d_db_bytes[i], db_elems));
+
+        int threads = 256;
+        int blocks = ((int)db_elems + threads - 1) / threads;
+        decompose_u16_bytes_kernel<<<blocks, threads>>>(d_db_bytes[0], d_db_bytes[1], d_db_raw, db_elems);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaFree(d_db_raw));
+    }
+
+    for (int N : batch_sizes) {
+        size_t query_elems = K * (size_t)N;
+        size_t output_elems = M * (size_t)N;
+        size_t wide_N = 8 * (size_t)N;  // packed query width
+
+        // Allocate and decompose query (uint64) into packed uint8: K × (8*N)
+        uint8_t* d_query_packed;
+        CUDA_CHECK(cudaMalloc(&d_query_packed, K * wide_N));
+        {
+            uint64_t* d_query_raw;
+            CUDA_CHECK(cudaMalloc(&d_query_raw, query_elems * sizeof(uint64_t)));
+            std::vector<uint64_t> h_query(query_elems);
+            for (size_t i = 0; i < h_query.size(); i++)
+                h_query[i] = ((uint64_t)rand() << 32) | (uint64_t)rand();
+            CUDA_CHECK(cudaMemcpy(d_query_raw, h_query.data(),
+                                  query_elems * sizeof(uint64_t), cudaMemcpyHostToDevice));
+
+            int threads = 256;
+            int blocks = ((int)query_elems + threads - 1) / threads;
+            decompose_u64_bytes_packed_kernel<<<blocks, threads>>>(
+                d_query_packed, d_query_raw, K, N);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaFree(d_query_raw));
+        }
+
+        // GEMM output: M × (8*N) int32 — reused for both DB bytes
+        int32_t* d_gemm_out;
+        CUDA_CHECK(cudaMalloc(&d_gemm_out, M * wide_N * sizeof(int32_t)));
+
+        // Accumulator: M × N uint64
+        uint64_t* d_accum;
+        CUDA_CHECK(cudaMalloc(&d_accum, output_elems * sizeof(uint64_t)));
+
+        // Zero output for accumulate_db1
+        int32_t alpha = 1, beta = 0;
+
+        // Set up CUTLASS GEMM problem: M × (8*N) × K
+        cutlass::gemm::GemmCoord problem_size(M, (int)wide_N, K);
+
+        // DB byte 0 GEMM
+        CutlassGemmU8TC::Arguments args0{
+            problem_size,
+            {d_db_bytes[0], (int)K},       // A ref: M×K row-major, stride=K
+            {d_query_packed, (int)K},       // B ref: K×(8N) col-major, stride=K
+            {d_gemm_out, (int)M},           // C ref (unused, beta=0)
+            {d_gemm_out, (int)M},           // D ref: M×(8N) col-major, stride=M
+            {alpha, beta},
+            1
+        };
+
+        // DB byte 1 GEMM (same B, reuse d_gemm_out)
+        CutlassGemmU8TC::Arguments args1{
+            problem_size,
+            {d_db_bytes[1], (int)K},
+            {d_query_packed, (int)K},
+            {d_gemm_out, (int)M},
+            {d_gemm_out, (int)M},
+            {alpha, beta},
+            1
+        };
+
+        CutlassGemmU8TC gemm_op0, gemm_op1;
+
+        cutlass::Status s0 = gemm_op0.can_implement(args0);
+        cutlass::Status s1 = gemm_op1.can_implement(args1);
+        if (s0 != cutlass::Status::kSuccess || s1 != cutlass::Status::kSuccess) {
+            std::cerr << "Cannot implement CUTLASS u8 TC GEMM for batch=" << N
+                      << ": " << cutlassGetStatusString(s0) << " / "
+                      << cutlassGetStatusString(s1) << std::endl;
+            CUDA_CHECK(cudaFree(d_query_packed));
+            CUDA_CHECK(cudaFree(d_gemm_out));
+            CUDA_CHECK(cudaFree(d_accum));
+            continue;
+        }
+
+        size_t ws0 = CutlassGemmU8TC::get_workspace_size(args0);
+        size_t ws1 = CutlassGemmU8TC::get_workspace_size(args1);
+        cutlass::device_memory::allocation<uint8_t> workspace0(ws0), workspace1(ws1);
+        CUTLASS_CHECK(gemm_op0.initialize(args0, workspace0.get()));
+        CUTLASS_CHECK(gemm_op1.initialize(args1, workspace1.get()));
+
+        int acc_threads = 256;
+        int acc_blocks = ((int)output_elems + acc_threads - 1) / acc_threads;
+
+        // Warmup
+        for (int w = 0; w < warmup; w++) {
+            CUTLASS_CHECK(gemm_op0());
+            accumulate_db0_kernel<<<acc_blocks, acc_threads>>>(d_accum, d_gemm_out, M, N);
+            CUTLASS_CHECK(gemm_op1());
+            accumulate_db1_kernel<<<acc_blocks, acc_threads>>>(d_accum, d_gemm_out, M, N);
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // Timed
+        cudaEvent_t start, stop;
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+
+        CUDA_CHECK(cudaEventRecord(start));
+        for (int i = 0; i < iters; i++) {
+            CUTLASS_CHECK(gemm_op0());
+            accumulate_db0_kernel<<<acc_blocks, acc_threads>>>(d_accum, d_gemm_out, M, N);
+            CUTLASS_CHECK(gemm_op1());
+            accumulate_db1_kernel<<<acc_blocks, acc_threads>>>(d_accum, d_gemm_out, M, N);
+        }
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+
+        float elapsed_ms = 0;
+        CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+        double avg_ms = elapsed_ms / iters;
+
+        // Effective throughput: DB_uint16_size * batch / time
+        double db_bytes = double(M) * K * sizeof(uint16_t);
+        double queries_per_sec = N / (avg_ms / 1000.0);
+        double eff_tput_gbs = (db_bytes * N) / (avg_ms / 1000.0) / 1.0e9;
+
+        // HW BW: 2 DB byte reads (M*K each) + 2 packed query reads (K*8N each)
+        //       + 2 GEMM output writes (M*8N*4 each) + accum read/writes
+        double hw_bw_gbs = (
+            2.0 * double(M) * K +                          // 2 DB byte slices
+            2.0 * double(K) * wide_N +                     // packed query read 2x
+            2.0 * double(M) * wide_N * sizeof(int32_t) +   // GEMM output write 2x
+            3.0 * double(M) * N * sizeof(uint64_t)          // accum: 1 write + 1 read + 1 RMW
+        ) / (avg_ms / 1000.0) / 1.0e9;
+
+        std::cout << std::setw(8) << N
+                  << std::setw(14) << std::fixed << std::setprecision(2) << avg_ms
+                  << std::setw(14) << std::fixed << std::setprecision(0) << queries_per_sec
+                  << std::setw(18) << std::fixed << std::setprecision(1) << eff_tput_gbs
+                  << std::setw(18) << std::fixed << std::setprecision(1) << hw_bw_gbs
+                  << std::endl;
+
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+
+        CUDA_CHECK(cudaFree(d_query_packed));
+        CUDA_CHECK(cudaFree(d_gemm_out));
+        CUDA_CHECK(cudaFree(d_accum));
+    }
+
+    for (int i = 0; i < 2; i++)
+        CUDA_CHECK(cudaFree(d_db_bytes[i]));
+    std::cout << std::string(72, '-') << std::endl;
+    std::cout << "Eff Tput = (DB_uint16_size * batch) / time  [amortized]" << std::endl;
+    std::cout << "HW BW   = (2*db_bytes + 2*packed_query + 2*gemm_out + accum) / time" << std::endl;
+}
+
 // ---------- Argument parsing ----------
 
 std::vector<int> parse_batch_list(const std::string& s) {
@@ -1097,7 +1623,9 @@ std::vector<int> parse_batch_list(const std::string& s) {
 
 void print_usage(const char* prog) {
     std::cerr << "Usage: " << prog << " [options]" << std::endl;
-    std::cerr << "  --mode    MODE           One of: db32_q32, db32_q64, db16_q32, db16_q64, db16_crt, db8_q32, db32_crt_i64, db8_q32_tc, db16_q64_tc, all" << std::endl;
+    std::cerr << "  --mode    MODE           One of: db32_q32, db32_q64, db16_q32, db16_q64, db16_crt," << std::endl;
+    std::cerr << "                           db8_q32, db32_crt_i64, db8_q32_tc, db16_q64_tc," << std::endl;
+    std::cerr << "                           db8_q32_tc_cutlass, db16_q64_tc_cutlass, all" << std::endl;
     std::cerr << "                           (default: all)" << std::endl;
     std::cerr << "  --batches 1,2,4,...      Comma-separated batch sizes" << std::endl;
     std::cerr << "  --log_dim N              Log2 of matrix dimension (default: 15)" << std::endl;
@@ -1171,6 +1699,14 @@ int main(int argc, char** argv) {
     }
     if (mode == "db16_q64_tc" || mode == "all") {
         run_db16_q64_tensor(dim, dim, batches, warmup, iters);
+        any = true;
+    }
+    if (mode == "db8_q32_tc_cutlass" || mode == "all") {
+        run_db8_q32_tc_cutlass(dim, dim, batches, warmup, iters);
+        any = true;
+    }
+    if (mode == "db16_q64_tc_cutlass" || mode == "all") {
+        run_db16_q64_tc_cutlass(dim, dim, batches, warmup, iters);
         any = true;
     }
 
