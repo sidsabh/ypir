@@ -73,8 +73,8 @@ __global__ void word_decompose_u16_bytes(
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < count) {
         uint16_t v = data[idx];
-        b0[idx] = (int8_t)(v & 0xFF);
-        b1[idx] = (int8_t)((v >> 8) & 0xFF);
+        b0[idx] = (int8_t)((v & 0xFF) ^ 0x80);
+        b1[idx] = (int8_t)(((v >> 8) & 0xFF) ^ 0x80);
     }
 }
 
@@ -89,24 +89,69 @@ __global__ void word_decompose_u64_bytes(
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < count) {
         uint64_t v = data[idx];
-        b0[idx] = (int8_t)(v & 0xFF);
-        b1[idx] = (int8_t)((v >> 8) & 0xFF);
-        b2[idx] = (int8_t)((v >> 16) & 0xFF);
-        b3[idx] = (int8_t)((v >> 24) & 0xFF);
-        b4[idx] = (int8_t)((v >> 32) & 0xFF);
-        b5[idx] = (int8_t)((v >> 40) & 0xFF);
-        b6[idx] = (int8_t)((v >> 48) & 0xFF);
-        b7[idx] = (int8_t)((v >> 56) & 0xFF);
+        b0[idx] = (int8_t)((v & 0xFF) ^ 0x80);
+        b1[idx] = (int8_t)(((v >> 8) & 0xFF) ^ 0x80);
+        b2[idx] = (int8_t)(((v >> 16) & 0xFF) ^ 0x80);
+        b3[idx] = (int8_t)(((v >> 24) & 0xFF) ^ 0x80);
+        b4[idx] = (int8_t)(((v >> 32) & 0xFF) ^ 0x80);
+        b5[idx] = (int8_t)(((v >> 40) & 0xFF) ^ 0x80);
+        b6[idx] = (int8_t)(((v >> 48) & 0xFF) ^ 0x80);
+        b7[idx] = (int8_t)(((v >> 56) & 0xFF) ^ 0x80);
     }
 }
 
-// ---------- Combine + modswitch + CRT-pack ----------
+// ---------- Bias correction helpers ----------
 
-// Tensor core path: combine lo/hi int32 → u64, modswitch to Z_Q, multiply by inv_N
-__global__ void word_combine_modswitch_crt(
-    uint64_t* __restrict__ out,        // batch × db_cols (row-major, batch is outer)
-    const int32_t* __restrict__ lo,    // col-major M×N = db_cols × batch
-    const int32_t* __restrict__ hi,
+__global__ void word_compute_row_sums_i8(
+    int32_t* __restrict__ sums,
+    const int8_t* __restrict__ data,
+    size_t M, size_t K, size_t stride)
+{
+    size_t m = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (m >= M) return;
+    int32_t s = 0;
+    for (size_t k = 0; k < K; k++)
+        s += (int32_t)data[k + m * stride];
+    sums[m] = s;
+}
+
+__global__ void word_compute_col_sums_i8(
+    int32_t* __restrict__ sums,
+    const int8_t* __restrict__ data,
+    size_t N, size_t K)
+{
+    size_t n = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+    int32_t s = 0;
+    for (size_t k = 0; k < K; k++)
+        s += (int32_t)data[k + n * K];
+    sums[n] = s;
+}
+
+__global__ void word_accumulate_shifted_u64(
+    uint64_t* __restrict__ accum,
+    const int32_t* __restrict__ gemm_out,
+    const int32_t* __restrict__ row_sums,
+    const int32_t* __restrict__ col_sums,
+    uint64_t shift,
+    size_t MN, size_t M, size_t K)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= MN) return;
+    size_t m = idx % M;
+    size_t n = idx / M;
+    int64_t corrected = (int64_t)gemm_out[idx]
+                        + (int64_t)128 * (int64_t)row_sums[m]
+                        + (int64_t)128 * (int64_t)col_sums[n]
+                        + (int64_t)16384 * (int64_t)K;
+    accum[idx] += (uint64_t)corrected * shift;
+}
+
+// ---------- Modswitch + CRT-pack ----------
+
+// Tensor core path: modswitch u64 accumulator to Z_Q, multiply by inv_N (in-place)
+__global__ void word_modswitch_u64_inplace(
+    uint64_t* __restrict__ data,
     size_t count,
     uint64_t q, uint64_t mod0, uint64_t mod1,
     uint64_t inv_n)
@@ -114,15 +159,11 @@ __global__ void word_combine_modswitch_crt(
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
 
-    uint64_t val = (uint64_t)(uint32_t)lo[idx] | ((uint64_t)(uint32_t)hi[idx] << 32);
-
+    uint64_t val = data[idx];
     __uint128_t prod = (__uint128_t)val * q + (((__uint128_t)1) << 63);
     uint64_t val_q = (uint64_t)(prod >> 64);
-
-    // Multiply by inv_N mod Q: compensates for CDKS packing multiplying by N
     val_q = (uint64_t)((__uint128_t)val_q * inv_n % q);
-
-    out[idx] = val_q;
+    data[idx] = val_q;
 }
 
 // SIMT path: modswitch u64 to Z_Q (in-place on col-major output), multiply by inv_N
@@ -150,27 +191,25 @@ __global__ void word_modswitch_crt_inplace(
 struct WordGemmSpec {
     int db_b;
     int q_b;
-    int32_t alpha;
-    int32_t beta;
-    int out;
+    uint64_t shift;
 };
 
 static const WordGemmSpec WORD_ONLINE_SPECS[15] = {
-    {0, 0, 1,        0, 0},
-    {0, 1, 256,      1, 0},
-    {1, 0, 256,      1, 0},
-    {0, 2, 65536,    1, 0},
-    {1, 1, 65536,    1, 0},
-    {0, 3, 16777216, 1, 0},
-    {1, 2, 16777216, 1, 0},
-    {0, 4, 1,        0, 1},
-    {1, 3, 1,        1, 1},
-    {0, 5, 256,      1, 1},
-    {1, 4, 256,      1, 1},
-    {0, 6, 65536,    1, 1},
-    {1, 5, 65536,    1, 1},
-    {0, 7, 16777216, 1, 1},
-    {1, 6, 16777216, 1, 1},
+    {0, 0, 1ULL},
+    {0, 1, 1ULL << 8},
+    {1, 0, 1ULL << 8},
+    {0, 2, 1ULL << 16},
+    {1, 1, 1ULL << 16},
+    {0, 3, 1ULL << 24},
+    {1, 2, 1ULL << 24},
+    {0, 4, 1ULL << 32},
+    {1, 3, 1ULL << 32},
+    {0, 5, 1ULL << 40},
+    {1, 4, 1ULL << 40},
+    {0, 6, 1ULL << 48},
+    {1, 5, 1ULL << 48},
+    {0, 7, 1ULL << 56},
+    {1, 6, 1ULL << 56},
 };
 
 // ---------- Step 2: Pack LWEs and mod switch ----------
@@ -658,9 +697,11 @@ struct WordOnlineContext {
     cublasHandle_t cublas_handle;
 
     // Tensor core path
-    int8_t* d_db_bytes[2];         // DB decomposed, persistent
-    int8_t* d_query_bytes[8];      // Per-batch query byte slices
-    int32_t* d_partials[2];        // lo/hi accumulators
+    int8_t* d_db_bytes[2];         // DB decomposed (centered), persistent
+    int8_t* d_query_bytes[8];      // Per-batch query byte slices (centered)
+    int32_t* d_temp;               // Single temp buffer for cuBLAS output
+    int32_t* d_db_row_sums[2];     // Row sums of centered DB bytes, M int32 each
+    int32_t* d_query_col_sums[8];  // Col sums of centered query bytes, max_N int32 each
 
     // SIMT path
     uint16_t* d_db_u16;            // DB as-is, persistent
@@ -838,8 +879,9 @@ void* ypir_word_online_init(
     // Detect tensor cores
     ctx->has_tensor_cores = false;
     ctx->cublas_handle = nullptr;
-    for (int i = 0; i < 2; i++) { ctx->d_db_bytes[i] = nullptr; ctx->d_partials[i] = nullptr; }
-    for (int i = 0; i < 8; i++) ctx->d_query_bytes[i] = nullptr;
+    ctx->d_temp = nullptr;
+    for (int i = 0; i < 2; i++) { ctx->d_db_bytes[i] = nullptr; ctx->d_db_row_sums[i] = nullptr; }
+    for (int i = 0; i < 8; i++) { ctx->d_query_bytes[i] = nullptr; ctx->d_query_col_sums[i] = nullptr; }
     ctx->d_db_u16 = nullptr;
     ctx->d_query_buf = nullptr;
     ctx->d_result_u64 = nullptr;
@@ -914,13 +956,24 @@ void* ypir_word_online_init(
         }
         CUDA_ASSERT(cudaFree(d_db_raw));
 
-        // Pre-allocate query byte buffers and accumulators (full max_batch)
-        size_t q_elems = max_N * db_rows_padded;
-        for (int i = 0; i < 8; i++)
-            CUDA_ASSERT(cudaMalloc(&ctx->d_query_bytes[i], q_elems));
+        // Compute row sums of centered DB bytes (for bias correction)
+        for (int i = 0; i < 2; i++) {
+            CUDA_ASSERT(cudaMalloc(&ctx->d_db_row_sums[i], M * sizeof(int32_t)));
+            int t = 256, b = (M + t - 1) / t;
+            word_compute_row_sums_i8<<<b, t>>>(ctx->d_db_row_sums[i], ctx->d_db_bytes[i],
+                                               M, K, db_rows_padded);
+            CUDA_ASSERT(cudaGetLastError());
+        }
 
-        for (int i = 0; i < 2; i++)
-            CUDA_ASSERT(cudaMalloc(&ctx->d_partials[i], max_N * M * sizeof(int32_t)));
+        // Pre-allocate query byte buffers and col sum buffers (full max_batch)
+        size_t q_elems = max_N * db_rows_padded;
+        for (int i = 0; i < 8; i++) {
+            CUDA_ASSERT(cudaMalloc(&ctx->d_query_bytes[i], q_elems));
+            CUDA_ASSERT(cudaMalloc(&ctx->d_query_col_sums[i], max_N * sizeof(int32_t)));
+        }
+
+        // Single temp buffer for cuBLAS output (d_intermediate serves as uint64 accumulator)
+        CUDA_ASSERT(cudaMalloc(&ctx->d_temp, max_N * M * sizeof(int32_t)));
 
         CUBLAS_CHECK(cublasCreate(&ctx->cublas_handle));
         CUBLAS_CHECK(cublasSetMathMode(ctx->cublas_handle, CUBLAS_TENSOR_OP_MATH));
@@ -1137,7 +1190,7 @@ void ypir_word_online_compute_batch(
     t.tic();
 
     if (ctx->has_tensor_cores) {
-        // Upload queries and decompose to bytes
+        // Upload queries and decompose to centered bytes
         size_t q_elems = N * K;
         uint64_t* d_query_raw;
         CUDA_ALLOC_AND_COPY(d_query_raw, queries, q_elems * sizeof(uint64_t));
@@ -1154,29 +1207,49 @@ void ypir_word_online_compute_batch(
         }
         CUDA_ASSERT(cudaFree(d_query_raw));
 
-        // 15 cuBLAS GEMMs
+        // Compute column sums of centered query bytes (for bias correction)
+        for (int i = 0; i < 8; i++) {
+            int t = 256, b = (N + t - 1) / t;
+            word_compute_col_sums_i8<<<b, t>>>(ctx->d_query_col_sums[i],
+                                               ctx->d_query_bytes[i], N, K);
+            CUDA_ASSERT(cudaGetLastError());
+        }
+
+        // Zero uint64 accumulator (reuse d_intermediate)
+        size_t count = M * N;
+        CUDA_ASSERT(cudaMemset(ctx->d_intermediate, 0, count * sizeof(uint64_t)));
+
+        // 15 cuBLAS GEMMs with bias correction + uint64 accumulation
+        int32_t alpha_one = 1, beta_zero = 0;
         for (int g = 0; g < 15; g++) {
             const WordGemmSpec& s = WORD_ONLINE_SPECS[g];
             CUBLAS_CHECK(cublasGemmEx(ctx->cublas_handle,
                 CUBLAS_OP_T, CUBLAS_OP_N,
                 (int)M, (int)N, (int)K,
-                &s.alpha,
+                &alpha_one,
                 ctx->d_db_bytes[s.db_b],    CUDA_R_8I, (int)ctx->db_rows_padded,
                 ctx->d_query_bytes[s.q_b],  CUDA_R_8I, (int)K,
-                &s.beta,
-                ctx->d_partials[s.out],     CUDA_R_32I, (int)M,
+                &beta_zero,
+                ctx->d_temp,                CUDA_R_32I, (int)M,
                 CUBLAS_COMPUTE_32I,
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        }
 
-        // Combine + modswitch + multiply by inv_N
-        {
-            size_t count = M * N;
             int threads = 256;
             int blocks = (count + threads - 1) / threads;
-            word_combine_modswitch_crt<<<blocks, threads>>>(
-                ctx->d_intermediate, ctx->d_partials[0], ctx->d_partials[1],
-                count, ctx->modulus, ctx->mod0, ctx->mod1, ctx->inv_n);
+            word_accumulate_shifted_u64<<<blocks, threads>>>(
+                ctx->d_intermediate, ctx->d_temp,
+                ctx->d_db_row_sums[s.db_b],
+                ctx->d_query_col_sums[s.q_b],
+                s.shift, count, M, K);
+            CUDA_ASSERT(cudaGetLastError());
+        }
+
+        // Modswitch u64 → Z_Q in-place
+        {
+            int threads = 256;
+            int blocks = (count + threads - 1) / threads;
+            word_modswitch_u64_inplace<<<blocks, threads>>>(
+                ctx->d_intermediate, count, ctx->modulus, ctx->mod0, ctx->mod1, ctx->inv_n);
             CUDA_ASSERT(cudaGetLastError());
         }
 
@@ -1314,7 +1387,7 @@ void ypir_word_online_compute_matmul_only(
     // ── Step 1: GEMM (full batch, default stream) ──
 
     if (ctx->has_tensor_cores) {
-        // Upload queries and decompose to bytes
+        // Upload queries and decompose to centered bytes
         size_t q_elems = N * K;
         uint64_t* d_query_raw;
         CUDA_ALLOC_AND_COPY(d_query_raw, queries, q_elems * sizeof(uint64_t));
@@ -1331,29 +1404,49 @@ void ypir_word_online_compute_matmul_only(
         }
         CUDA_ASSERT(cudaFree(d_query_raw));
 
-        // 15 cuBLAS GEMMs
+        // Compute column sums of centered query bytes (for bias correction)
+        for (int i = 0; i < 8; i++) {
+            int t = 256, b = (N + t - 1) / t;
+            word_compute_col_sums_i8<<<b, t>>>(ctx->d_query_col_sums[i],
+                                               ctx->d_query_bytes[i], N, K);
+            CUDA_ASSERT(cudaGetLastError());
+        }
+
+        // Zero uint64 accumulator (reuse d_intermediate)
+        size_t count = M * N;
+        CUDA_ASSERT(cudaMemset(ctx->d_intermediate, 0, count * sizeof(uint64_t)));
+
+        // 15 cuBLAS GEMMs with bias correction + uint64 accumulation
+        int32_t alpha_one = 1, beta_zero = 0;
         for (int g = 0; g < 15; g++) {
             const WordGemmSpec& s = WORD_ONLINE_SPECS[g];
             CUBLAS_CHECK(cublasGemmEx(ctx->cublas_handle,
                 CUBLAS_OP_T, CUBLAS_OP_N,
                 (int)M, (int)N, (int)K,
-                &s.alpha,
+                &alpha_one,
                 ctx->d_db_bytes[s.db_b],    CUDA_R_8I, (int)ctx->db_rows_padded,
                 ctx->d_query_bytes[s.q_b],  CUDA_R_8I, (int)K,
-                &s.beta,
-                ctx->d_partials[s.out],     CUDA_R_32I, (int)M,
+                &beta_zero,
+                ctx->d_temp,                CUDA_R_32I, (int)M,
                 CUBLAS_COMPUTE_32I,
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        }
 
-        // Combine + modswitch + multiply by inv_N
-        {
-            size_t count = M * N;
             int threads = 256;
             int blocks = (count + threads - 1) / threads;
-            word_combine_modswitch_crt<<<blocks, threads>>>(
-                ctx->d_intermediate, ctx->d_partials[0], ctx->d_partials[1],
-                count, ctx->modulus, ctx->mod0, ctx->mod1, ctx->inv_n);
+            word_accumulate_shifted_u64<<<blocks, threads>>>(
+                ctx->d_intermediate, ctx->d_temp,
+                ctx->d_db_row_sums[s.db_b],
+                ctx->d_query_col_sums[s.q_b],
+                s.shift, count, M, K);
+            CUDA_ASSERT(cudaGetLastError());
+        }
+
+        // Modswitch u64 → Z_Q in-place
+        {
+            int threads = 256;
+            int blocks = (count + threads - 1) / threads;
+            word_modswitch_u64_inplace<<<blocks, threads>>>(
+                ctx->d_intermediate, count, ctx->modulus, ctx->mod0, ctx->mod1, ctx->inv_n);
             CUDA_ASSERT(cudaGetLastError());
         }
 
@@ -1452,27 +1545,49 @@ void ypir_word_online_compute_batch_inspir(
         }
         CUDA_ASSERT(cudaFree(d_query_raw));
 
+        // Compute column sums of centered query bytes (for bias correction)
+        for (int i = 0; i < 8; i++) {
+            int t = 256, b = (N + t - 1) / t;
+            word_compute_col_sums_i8<<<b, t>>>(ctx->d_query_col_sums[i],
+                                               ctx->d_query_bytes[i], N, K);
+            CUDA_ASSERT(cudaGetLastError());
+        }
+
+        // Zero uint64 accumulator (reuse d_intermediate)
+        size_t count = M * N;
+        CUDA_ASSERT(cudaMemset(ctx->d_intermediate, 0, count * sizeof(uint64_t)));
+
+        // 15 cuBLAS GEMMs with bias correction + uint64 accumulation
+        int32_t alpha_one = 1, beta_zero = 0;
         for (int g = 0; g < 15; g++) {
             const WordGemmSpec& s = WORD_ONLINE_SPECS[g];
             CUBLAS_CHECK(cublasGemmEx(ctx->cublas_handle,
                 CUBLAS_OP_T, CUBLAS_OP_N,
                 (int)M, (int)N, (int)K,
-                &s.alpha,
+                &alpha_one,
                 ctx->d_db_bytes[s.db_b],    CUDA_R_8I, (int)ctx->db_rows_padded,
                 ctx->d_query_bytes[s.q_b],  CUDA_R_8I, (int)K,
-                &s.beta,
-                ctx->d_partials[s.out],     CUDA_R_32I, (int)M,
+                &beta_zero,
+                ctx->d_temp,                CUDA_R_32I, (int)M,
                 CUBLAS_COMPUTE_32I,
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        }
 
-        {
-            size_t count = M * N;
             int threads = 256;
             int blocks = (count + threads - 1) / threads;
-            word_combine_modswitch_crt<<<blocks, threads>>>(
-                ctx->d_intermediate, ctx->d_partials[0], ctx->d_partials[1],
-                count, ctx->modulus, ctx->mod0, ctx->mod1, ctx->inv_n);
+            word_accumulate_shifted_u64<<<blocks, threads>>>(
+                ctx->d_intermediate, ctx->d_temp,
+                ctx->d_db_row_sums[s.db_b],
+                ctx->d_query_col_sums[s.q_b],
+                s.shift, count, M, K);
+            CUDA_ASSERT(cudaGetLastError());
+        }
+
+        // Modswitch u64 → Z_Q in-place (InspiRING: inv_n=1, no scaling)
+        {
+            int threads = 256;
+            int blocks = (count + threads - 1) / threads;
+            word_modswitch_u64_inplace<<<blocks, threads>>>(
+                ctx->d_intermediate, count, ctx->modulus, ctx->mod0, ctx->mod1, ctx->inv_n);
             CUDA_ASSERT(cudaGetLastError());
         }
 
@@ -1609,11 +1724,13 @@ void ypir_word_online_free(void* context)
 
     for (int i = 0; i < 2; i++) {
         if (ctx->d_db_bytes[i]) cudaFree(ctx->d_db_bytes[i]);
-        if (ctx->d_partials[i]) cudaFree(ctx->d_partials[i]);
+        if (ctx->d_db_row_sums[i]) cudaFree(ctx->d_db_row_sums[i]);
     }
     for (int i = 0; i < 8; i++) {
         if (ctx->d_query_bytes[i]) cudaFree(ctx->d_query_bytes[i]);
+        if (ctx->d_query_col_sums[i]) cudaFree(ctx->d_query_col_sums[i]);
     }
+    if (ctx->d_temp) cudaFree(ctx->d_temp);
     if (ctx->d_db_u16) cudaFree(ctx->d_db_u16);
     if (ctx->d_query_buf) cudaFree(ctx->d_query_buf);
     if (ctx->d_result_u64) cudaFree(ctx->d_result_u64);
