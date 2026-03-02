@@ -215,6 +215,51 @@ __global__ void accumulate_db1_kernel(
     accum[idx] += acc;
 }
 
+// Decompose uint16 DB into vertically stacked (2M)×K row-major uint8:
+// First M rows = low bytes, next M rows = high bytes
+__global__ void decompose_u16_stacked_kernel(
+    uint8_t* __restrict__ out,  // (2M)×K row-major
+    const uint16_t* __restrict__ data,  // M×K row-major
+    size_t count)  // M*K
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count) {
+        uint16_t v = data[idx];
+        out[idx] = (uint8_t)(v & 0xFF);
+        out[count + idx] = (uint8_t)((v >> 8) & 0xFF);
+    }
+}
+
+// Accumulate stacked GEMM output (2M)×(8N) → M×N uint64
+// gemm_out is col-major (2M)×(8N), stride 2M
+// Rows [0,M) = db_b0 products, rows [M,2M) = db_b1 products
+__global__ void accumulate_db16_q64_stacked_kernel(
+    uint64_t* __restrict__ accum,          // M × N col-major
+    const int32_t* __restrict__ gemm_out,  // (2M) × (8*N) col-major, stride 2M
+    size_t M, size_t N)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * N) return;
+    size_t m = idx % M;
+    size_t n = idx / M;
+    size_t stride = 2 * M;
+
+    uint64_t acc = 0;
+    // db_b0 contributions: 8 terms, shifts 0,8,16,...,56
+    #pragma unroll
+    for (int q_b = 0; q_b < 8; q_b++) {
+        uint64_t val = (uint64_t)(uint32_t)gemm_out[m + (q_b * N + n) * stride];
+        acc += val << (8 * q_b);
+    }
+    // db_b1 contributions: 7 terms, shifts 8,16,...,56 (skip q_b=7 → shift 64 ≡ 0)
+    #pragma unroll
+    for (int q_b = 0; q_b < 7; q_b++) {
+        uint64_t val = (uint64_t)(uint32_t)gemm_out[M + m + (q_b * N + n) * stride];
+        acc += val << (8 * (q_b + 1));
+    }
+    accum[idx] = acc;
+}
+
 // Decompose uint32 queries into packed uint8 layout: K × (4*N) contiguous
 // Byte slice i occupies columns [i*N, (i+1)*N) in col-major with stride K
 __global__ void decompose_u32_bytes_packed_kernel(
@@ -1584,12 +1629,12 @@ void run_db8_q32_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& batc
 void run_db16_q64_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& batch_sizes,
                               int warmup, int iters) {
     const double GiB = 1024.0 * 1024.0 * 1024.0;
-    std::cout << "\n=== CUTLASS uint8 TC: 2x wide GEMM (uint16 DB x uint64 query) ===" << std::endl;
+    std::cout << "\n=== CUTLASS uint8 TC: 1x stacked GEMM (uint16 DB x uint64 query) ===" << std::endl;
     std::cout << "DB: " << M << " x " << K << " uint16 ("
               << std::fixed << std::setprecision(1)
               << (double(M) * K * 2) / GiB << " GiB)" << std::endl;
-    std::cout << "2 GEMMs: uint8 × uint8 → int32, each M×K × K×(8*batch)" << std::endl;
-    std::cout << "DB read exactly 2x (1x per byte slice)" << std::endl;
+    std::cout << "1 GEMM: (2M)×K × K×(8*batch), DB bytes stacked vertically" << std::endl;
+    std::cout << "DB + query each read exactly 1x" << std::endl;
 
     size_t free_mem, total_mem;
     CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
@@ -1619,9 +1664,10 @@ void run_db16_q64_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& bat
               << std::endl;
     std::cout << std::string(80, '-') << std::endl;
 
-    // Allocate and decompose DB (uint16) into 2 uint8 byte slices
+    // Decompose DB (uint16) into stacked (2M)×K uint8: [low_bytes; high_bytes]
     size_t db_elems = M * K;
-    uint8_t* d_db_bytes[2];
+    uint8_t* d_db_stacked;
+    CUDA_CHECK(cudaMalloc(&d_db_stacked, 2 * db_elems));
     {
         uint16_t* d_db_raw;
         CUDA_CHECK(cudaMalloc(&d_db_raw, db_elems * sizeof(uint16_t)));
@@ -1631,12 +1677,9 @@ void run_db16_q64_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& bat
             h_db[i] = (uint16_t)(rand() & 0xFFFF);
         CUDA_CHECK(cudaMemcpy(d_db_raw, h_db.data(), db_elems * sizeof(uint16_t), cudaMemcpyHostToDevice));
 
-        for (int i = 0; i < 2; i++)
-            CUDA_CHECK(cudaMalloc(&d_db_bytes[i], db_elems));
-
         int threads = 256;
         int blocks = ((int)db_elems + threads - 1) / threads;
-        decompose_u16_bytes_kernel<<<blocks, threads>>>(d_db_bytes[0], d_db_bytes[1], d_db_raw, db_elems);
+        decompose_u16_stacked_kernel<<<blocks, threads>>>(d_db_stacked, d_db_raw, db_elems);
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaFree(d_db_raw));
     }
@@ -1645,6 +1688,7 @@ void run_db16_q64_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& bat
         size_t query_elems = K * (size_t)N;
         size_t output_elems = M * (size_t)N;
         size_t wide_N = 8 * (size_t)N;  // packed query width
+        size_t tall_M = 2 * M;          // stacked DB height
 
         // Allocate query buffers (keep host + raw device for E2E timing)
         uint8_t* d_query_packed;
@@ -1666,9 +1710,9 @@ void run_db16_q64_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& bat
         // Host result buffer for E2E download
         std::vector<uint64_t> h_result(output_elems);
 
-        // GEMM output: M × (8*N) int32 — reused for both DB bytes
+        // GEMM output: (2M) × (8*N) int32
         int32_t* d_gemm_out;
-        CUDA_CHECK(cudaMalloc(&d_gemm_out, M * wide_N * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_gemm_out, tall_M * wide_N * sizeof(int32_t)));
 
         // Accumulator: M × N uint64
         uint64_t* d_accum;
@@ -1681,12 +1725,10 @@ void run_db16_q64_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& bat
 
         // Warmup
         for (int w = 0; w < warmup; w++) {
-            run_u8tc_gemm(is_sm80, M, (int)wide_N, K,
-                d_db_bytes[0], (int)K, d_query_packed, (int)K, d_gemm_out, (int)M);
-            accumulate_db0_kernel<<<acc_blocks, acc_threads>>>(d_accum, d_gemm_out, M, N);
-            run_u8tc_gemm(is_sm80, M, (int)wide_N, K,
-                d_db_bytes[1], (int)K, d_query_packed, (int)K, d_gemm_out, (int)M);
-            accumulate_db1_kernel<<<acc_blocks, acc_threads>>>(d_accum, d_gemm_out, M, N);
+            run_u8tc_gemm(is_sm80, (int)tall_M, (int)wide_N, K,
+                d_db_stacked, (int)K, d_query_packed, (int)K, d_gemm_out, (int)tall_M);
+            accumulate_db16_q64_stacked_kernel<<<acc_blocks, acc_threads>>>(
+                d_accum, d_gemm_out, M, N);
         }
         CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -1697,12 +1739,10 @@ void run_db16_q64_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& bat
 
         CUDA_CHECK(cudaEventRecord(start));
         for (int i = 0; i < iters; i++) {
-            run_u8tc_gemm(is_sm80, M, (int)wide_N, K,
-                d_db_bytes[0], (int)K, d_query_packed, (int)K, d_gemm_out, (int)M);
-            accumulate_db0_kernel<<<acc_blocks, acc_threads>>>(d_accum, d_gemm_out, M, N);
-            run_u8tc_gemm(is_sm80, M, (int)wide_N, K,
-                d_db_bytes[1], (int)K, d_query_packed, (int)K, d_gemm_out, (int)M);
-            accumulate_db1_kernel<<<acc_blocks, acc_threads>>>(d_accum, d_gemm_out, M, N);
+            run_u8tc_gemm(is_sm80, (int)tall_M, (int)wide_N, K,
+                d_db_stacked, (int)K, d_query_packed, (int)K, d_gemm_out, (int)tall_M);
+            accumulate_db16_q64_stacked_kernel<<<acc_blocks, acc_threads>>>(
+                d_accum, d_gemm_out, M, N);
         }
         CUDA_CHECK(cudaEventRecord(stop));
         CUDA_CHECK(cudaEventSynchronize(stop));
@@ -1722,12 +1762,10 @@ void run_db16_q64_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& bat
                                   query_elems * sizeof(uint64_t), cudaMemcpyHostToDevice));
             decompose_u64_bytes_packed_kernel<<<decomp_blocks, decomp_threads>>>(
                 d_query_packed, d_query_raw, K, N);
-            run_u8tc_gemm(is_sm80, M, (int)wide_N, K,
-                d_db_bytes[0], (int)K, d_query_packed, (int)K, d_gemm_out, (int)M);
-            accumulate_db0_kernel<<<acc_blocks, acc_threads>>>(d_accum, d_gemm_out, M, N);
-            run_u8tc_gemm(is_sm80, M, (int)wide_N, K,
-                d_db_bytes[1], (int)K, d_query_packed, (int)K, d_gemm_out, (int)M);
-            accumulate_db1_kernel<<<acc_blocks, acc_threads>>>(d_accum, d_gemm_out, M, N);
+            run_u8tc_gemm(is_sm80, (int)tall_M, (int)wide_N, K,
+                d_db_stacked, (int)K, d_query_packed, (int)K, d_gemm_out, (int)tall_M);
+            accumulate_db16_q64_stacked_kernel<<<acc_blocks, acc_threads>>>(
+                d_accum, d_gemm_out, M, N);
             CUDA_CHECK(cudaMemcpy(h_result.data(), d_accum,
                                   output_elems * sizeof(uint64_t), cudaMemcpyDeviceToHost));
         }
@@ -1739,12 +1777,13 @@ void run_db16_q64_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& bat
         double e2e_qps = N / (e2e_ms / 1000.0);
         double eff_tput_gbs = (db_bytes * N) / (e2e_ms / 1000.0) / 1.0e9;
 
-        // HW BW: based on compute time (GPU utilization metric)
+        // HW BW: 1 stacked DB read (2M*K) + 1 packed query read (K*8N)
+        //       + 1 GEMM output write (2M*8N*4) + accum write (M*N*8)
         double hw_bw_gbs = (
-            2.0 * double(M) * K +                          // 2 DB byte slices
-            2.0 * double(K) * wide_N +                     // packed query read 2x
-            2.0 * double(M) * wide_N * sizeof(int32_t) +   // GEMM output write 2x
-            3.0 * double(M) * N * sizeof(uint64_t)          // accum: 1 write + 1 read + 1 RMW
+            2.0 * double(M) * K +                          // stacked DB (2M*K bytes)
+            double(K) * wide_N +                           // packed query read 1x
+            double(tall_M) * wide_N * sizeof(int32_t) +    // GEMM output write
+            double(M) * N * sizeof(uint64_t)                // accum write
         ) / (comp_ms / 1000.0) / 1.0e9;
 
         std::cout << std::setw(8) << N
@@ -1761,13 +1800,12 @@ void run_db16_q64_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& bat
         CUDA_CHECK(cudaFree(d_accum));
     }
 
-    for (int i = 0; i < 2; i++)
-        CUDA_CHECK(cudaFree(d_db_bytes[i]));
+    CUDA_CHECK(cudaFree(d_db_stacked));
     std::cout << std::string(80, '-') << std::endl;
     std::cout << "Comp    = GPU compute only (no PCIe)" << std::endl;
     std::cout << "E2E     = H->D query upload + compute + D->H result download" << std::endl;
     std::cout << "Eff Tput = (DB_uint16_size * batch) / E2E_time  [amortized]" << std::endl;
-    std::cout << "HW BW   = (2*db_bytes + 2*packed_query + 2*gemm_out + accum) / comp_time" << std::endl;
+    std::cout << "HW BW   = (stacked_db + packed_query + gemm_out + accum) / comp_time" << std::endl;
 }
 
 // ---------- Argument parsing ----------

@@ -106,17 +106,18 @@ static cutlass::Status run_u8tc_gemm(bool is_sm80,
 
 // ---------- Decomposition kernels ----------
 
-__global__ void decompose_u16_bytes(
-    uint8_t* __restrict__ b0,
-    uint8_t* __restrict__ b1,
-    const uint16_t* __restrict__ data,
-    size_t count)
+// Decompose uint16 DB into vertically stacked (2M)×K_padded row-major uint8:
+// First M rows = low bytes, next M rows = high bytes
+__global__ void decompose_u16_stacked(
+    uint8_t* __restrict__ out,          // (2M) × K_padded, row-major
+    const uint16_t* __restrict__ data,  // M × K_padded, row-major
+    size_t count)                       // M * K_padded
 {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < count) {
         uint16_t v = data[idx];
-        b0[idx] = (uint8_t)(v & 0xFF);
-        b1[idx] = (uint8_t)((v >> 8) & 0xFF);
+        out[idx] = (uint8_t)(v & 0xFF);
+        out[count + idx] = (uint8_t)((v >> 8) & 0xFF);
     }
 }
 
@@ -140,48 +141,29 @@ __global__ void decompose_u64_bytes_packed(
     out[idx + 7*K*N] = (uint8_t)((v >> 56) & 0xFF);
 }
 
-// ---------- Fused accumulate kernels ----------
+// ---------- Fused stacked accumulate kernel ----------
 
-// Accumulate 8 specs from db_b=0 GEMM output into uint64 accumulator.
-__global__ void accumulate_db0(
-    uint64_t* __restrict__ accum,           // M × N col-major
-    const int32_t* __restrict__ gemm_out,   // M × (8*N) col-major
+// Accumulate stacked GEMM output (2M)×(8N) → M×N uint64.
+// gemm_out is col-major (2M)×(8N), stride 2M.
+// Rows [0,M) = db_b0 products, rows [M,2M) = db_b1 products.
+// db_b0: 8 terms (shifts 0,8,...,56), db_b1: 7 terms (shifts 8,...,56).
+__global__ void accumulate_db16_stacked(
+    uint64_t* __restrict__ accum,          // M × N col-major
+    const int32_t* __restrict__ gemm_out,  // (2M) × (8*N) col-major, stride 2M
     size_t M, size_t N)
 {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= M * N) return;
     size_t m = idx % M;
     size_t n = idx / M;
+    size_t stride = 2 * M;
     uint64_t acc = 0;
-    acc += (uint64_t)(uint32_t)gemm_out[m + (0*N+n)*M];
-    acc += (uint64_t)(uint32_t)gemm_out[m + (1*N+n)*M] << 8;
-    acc += (uint64_t)(uint32_t)gemm_out[m + (2*N+n)*M] << 16;
-    acc += (uint64_t)(uint32_t)gemm_out[m + (3*N+n)*M] << 24;
-    acc += (uint64_t)(uint32_t)gemm_out[m + (4*N+n)*M] << 32;
-    acc += (uint64_t)(uint32_t)gemm_out[m + (5*N+n)*M] << 40;
-    acc += (uint64_t)(uint32_t)gemm_out[m + (6*N+n)*M] << 48;
-    acc += (uint64_t)(uint32_t)gemm_out[m + (7*N+n)*M] << 56;
-    accum[idx] = acc;
-}
-
-// Accumulate 7 specs from db_b=1, add to existing accumulator.
-__global__ void accumulate_db1(
-    uint64_t* __restrict__ accum,           // M × N col-major (has db0 partial)
-    const int32_t* __restrict__ gemm_out,   // M × (8*N) col-major
-    size_t M, size_t N)
-{
-    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= M * N) return;
-    size_t m = idx % M;
-    size_t n = idx / M;
-    uint64_t acc = accum[idx];
-    acc += (uint64_t)(uint32_t)gemm_out[m + (0*N+n)*M] << 8;
-    acc += (uint64_t)(uint32_t)gemm_out[m + (1*N+n)*M] << 16;
-    acc += (uint64_t)(uint32_t)gemm_out[m + (2*N+n)*M] << 24;
-    acc += (uint64_t)(uint32_t)gemm_out[m + (3*N+n)*M] << 32;
-    acc += (uint64_t)(uint32_t)gemm_out[m + (4*N+n)*M] << 40;
-    acc += (uint64_t)(uint32_t)gemm_out[m + (5*N+n)*M] << 48;
-    acc += (uint64_t)(uint32_t)gemm_out[m + (6*N+n)*M] << 56;
+    #pragma unroll
+    for (int q = 0; q < 8; q++)
+        acc += (uint64_t)(uint32_t)gemm_out[m + (q*N+n)*stride] << (8*q);
+    #pragma unroll
+    for (int q = 0; q < 7; q++)
+        acc += (uint64_t)(uint32_t)gemm_out[M + m + (q*N+n)*stride] << (8*(q+1));
     accum[idx] = acc;
 }
 
@@ -217,10 +199,10 @@ struct WordOfflineContext {
     bool has_tensor_cores;
     bool is_sm80;
 
-    // Tensor core path (CUTLASS uint8, 2 wide GEMMs)
-    uint8_t* d_db_bytes[2];        // DB decomposed bytes, M×K_padded
+    // Tensor core path (CUTLASS uint8, 1 stacked GEMM)
+    uint8_t* d_db_stacked;         // DB decomposed+stacked bytes, (2M)×K_padded
     uint8_t* d_A_bytes_packed;     // A decomposed bytes, K × (8*N) contiguous
-    int32_t* d_gemm_out;           // M × (8*N) int32, reused per DB byte
+    int32_t* d_gemm_out;           // (2M) × (8*N) int32
     uint64_t* d_accum_u64;         // M × N uint64 accumulator
 
     // SIMT path
@@ -275,7 +257,7 @@ void* init_word_offline_context(
     ctx->d_gemm_out = nullptr;
     ctx->d_accum_u64 = nullptr;
     ctx->d_A_bytes_packed = nullptr;
-    for (int i = 0; i < 2; i++) ctx->d_db_bytes[i] = nullptr;
+    ctx->d_db_stacked = nullptr;
 
     size_t M = db_cols;
     size_t N = poly_len;
@@ -301,18 +283,17 @@ void* init_word_offline_context(
     CUDA_CHECK(cudaMalloc(&ctx->d_out, M * N * sizeof(uint64_t)));
 
     if (ctx->has_tensor_cores) {
-        // Upload DB, decompose to 2 uint8 byte slices
+        // Upload DB, decompose to vertically stacked uint8 bytes
         uint16_t* d_db_raw;
         CUDA_CHECK(cudaMalloc(&d_db_raw, M * db_rows_padded * sizeof(uint16_t)));
         CUDA_CHECK(cudaMemcpy(d_db_raw, db, M * db_rows_padded * sizeof(uint16_t), cudaMemcpyHostToDevice));
 
         size_t db_elems = M * db_rows_padded;
-        for (int i = 0; i < 2; i++)
-            CUDA_CHECK(cudaMalloc(&ctx->d_db_bytes[i], db_elems));
+        CUDA_CHECK(cudaMalloc(&ctx->d_db_stacked, 2 * db_elems));
         {
             int threads = 256;
             int blocks = (db_elems + threads - 1) / threads;
-            decompose_u16_bytes<<<blocks, threads>>>(ctx->d_db_bytes[0], ctx->d_db_bytes[1], d_db_raw, db_elems);
+            decompose_u16_stacked<<<blocks, threads>>>(ctx->d_db_stacked, d_db_raw, db_elems);
             CUDA_CHECK(cudaGetLastError());
         }
         CUDA_CHECK(cudaFree(d_db_raw));
@@ -332,8 +313,8 @@ void* init_word_offline_context(
         }
         CUDA_CHECK(cudaFree(d_A_raw));
 
-        // Allocate GEMM output (reused) and uint64 accumulator
-        CUDA_CHECK(cudaMalloc(&ctx->d_gemm_out, M * 8 * N * sizeof(int32_t)));
+        // Allocate stacked GEMM output and uint64 accumulator
+        CUDA_CHECK(cudaMalloc(&ctx->d_gemm_out, 2 * M * 8 * N * sizeof(int32_t)));
         CUDA_CHECK(cudaMalloc(&ctx->d_accum_u64, M * N * sizeof(uint64_t)));
 
     } else {
@@ -377,28 +358,16 @@ int compute_hint_0_word_gpu(void* context, uint64_t* hint_0_out)
     size_t total = M * N;
 
     if (ctx->has_tensor_cores) {
-        // GEMM 0: DB[0]^T × A_packed → gemm_out  (M × 8N)
+        // Stacked GEMM: (2M) × K × K × (8N) → (2M) × (8N)
         {
-            auto status = run_u8tc_gemm(ctx->is_sm80, M, 8*N, K,
-                ctx->d_db_bytes[0], (int)ctx->db_rows_padded,
+            auto status = run_u8tc_gemm(ctx->is_sm80, 2*M, 8*N, K,
+                ctx->d_db_stacked, (int)ctx->db_rows_padded,
                 ctx->d_A_bytes_packed, (int)K,
-                ctx->d_gemm_out, (int)M);
-            if (status != cutlass::Status::kSuccess) { fprintf(stderr, "CUTLASS TC GEMM 0 failed\n"); return -1; }
+                ctx->d_gemm_out, (int)(2*M));
+            if (status != cutlass::Status::kSuccess) { fprintf(stderr, "CUTLASS TC stacked GEMM failed\n"); return -1; }
         }
         { int threads = 256, blocks = (total + threads - 1) / threads;
-          accumulate_db0<<<blocks, threads>>>(ctx->d_accum_u64, ctx->d_gemm_out, M, N);
-          CUDA_CHECK(cudaGetLastError()); }
-
-        // GEMM 1: DB[1]^T × A_packed → gemm_out  (M × 8N, reuse)
-        {
-            auto status = run_u8tc_gemm(ctx->is_sm80, M, 8*N, K,
-                ctx->d_db_bytes[1], (int)ctx->db_rows_padded,
-                ctx->d_A_bytes_packed, (int)K,
-                ctx->d_gemm_out, (int)M);
-            if (status != cutlass::Status::kSuccess) { fprintf(stderr, "CUTLASS TC GEMM 1 failed\n"); return -1; }
-        }
-        { int threads = 256, blocks = (total + threads - 1) / threads;
-          accumulate_db1<<<blocks, threads>>>(ctx->d_accum_u64, ctx->d_gemm_out, M, N);
+          accumulate_db16_stacked<<<blocks, threads>>>(ctx->d_accum_u64, ctx->d_gemm_out, M, N);
           CUDA_CHECK(cudaGetLastError()); }
 
         // Modswitch + transpose: col-major M×N → row-major N×M
@@ -458,9 +427,7 @@ void free_word_offline_context(void* context)
     WordOfflineContext* ctx = (WordOfflineContext*)context;
     if (!ctx) return;
 
-    for (int i = 0; i < 2; i++) {
-        if (ctx->d_db_bytes[i]) cudaFree(ctx->d_db_bytes[i]);
-    }
+    if (ctx->d_db_stacked) cudaFree(ctx->d_db_stacked);
     if (ctx->d_A_bytes_packed) cudaFree(ctx->d_A_bytes_packed);
     if (ctx->d_gemm_out) cudaFree(ctx->d_gemm_out);
     if (ctx->d_accum_u64) cudaFree(ctx->d_accum_u64);
