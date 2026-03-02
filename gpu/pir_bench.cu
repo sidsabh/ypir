@@ -1234,7 +1234,7 @@ using CutlassGemmU8TC_Sm75 = cutlass::gemm::device::Gemm<
     cutlass::gemm::GemmShape<64, 64, 64>,
     cutlass::gemm::GemmShape<8, 8, 16>,
     cutlass::epilogue::thread::LinearCombination<int32_t, 4, int32_t, int32_t>,
-    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>, 3
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>, 2  // SM75: 2 stages (no async copy)
 >;
 
 static bool detect_sm80() {
