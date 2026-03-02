@@ -1209,10 +1209,11 @@ void run_db16_q64_tensor(uint64_t M, uint64_t K, const std::vector<int>& batch_s
 // Pack 4 query byte slices into K × (4*N), do 1 GEMM.
 // DB read exactly once.
 
-using CutlassGemmU8TC = cutlass::gemm::device::Gemm<
-    uint8_t, cutlass::layout::RowMajor,     // A (DB, row-major)
-    uint8_t, cutlass::layout::ColumnMajor,   // B (packed query bytes, col-major)
-    int32_t, cutlass::layout::ColumnMajor,   // C/D (output, col-major)
+// SM80+ (Ampere): wider instruction shape
+using CutlassGemmU8TC_Sm80 = cutlass::gemm::device::Gemm<
+    uint8_t, cutlass::layout::RowMajor,
+    uint8_t, cutlass::layout::ColumnMajor,
+    int32_t, cutlass::layout::ColumnMajor,
     int32_t,
     cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
     cutlass::gemm::GemmShape<128, 256, 64>,
@@ -1221,6 +1222,57 @@ using CutlassGemmU8TC = cutlass::gemm::device::Gemm<
     cutlass::epilogue::thread::LinearCombination<int32_t, 4, int32_t, int32_t>,
     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>, 3
 >;
+
+// SM75 (Turing): u8 IMMA with 8×8×16 instruction shape
+using CutlassGemmU8TC_Sm75 = cutlass::gemm::device::Gemm<
+    uint8_t, cutlass::layout::RowMajor,
+    uint8_t, cutlass::layout::ColumnMajor,
+    int32_t, cutlass::layout::ColumnMajor,
+    int32_t,
+    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm75,
+    cutlass::gemm::GemmShape<128, 256, 64>,
+    cutlass::gemm::GemmShape<64, 64, 64>,
+    cutlass::gemm::GemmShape<8, 8, 16>,
+    cutlass::epilogue::thread::LinearCombination<int32_t, 4, int32_t, int32_t>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>, 3
+>;
+
+static bool detect_sm80() {
+    int device;
+    cudaGetDevice(&device);
+    int major;
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+    return major >= 8;
+}
+
+// Helper: run the correct TC GEMM based on SM version
+static cutlass::Status run_u8tc_gemm(bool is_sm80,
+    int M, int wide_N, int K,
+    const uint8_t* A, int lda,
+    const uint8_t* B, int ldb,
+    int32_t* C, int ldc,
+    void* workspace = nullptr)
+{
+    int32_t alpha = 1, beta = 0;
+    cutlass::gemm::GemmCoord problem_size(M, wide_N, K);
+    if (is_sm80) {
+        CutlassGemmU8TC_Sm80::Arguments args{
+            problem_size, {A, lda}, {B, ldb}, {C, ldc}, {C, ldc}, {alpha, beta}, 1
+        };
+        CutlassGemmU8TC_Sm80 gemm_op;
+        auto s = gemm_op.initialize(args, workspace);
+        if (s != cutlass::Status::kSuccess) return s;
+        return gemm_op();
+    } else {
+        CutlassGemmU8TC_Sm75::Arguments args{
+            problem_size, {A, lda}, {B, ldb}, {C, ldc}, {C, ldc}, {alpha, beta}, 1
+        };
+        CutlassGemmU8TC_Sm75 gemm_op;
+        auto s = gemm_op.initialize(args, workspace);
+        if (s != cutlass::Status::kSuccess) return s;
+        return gemm_op();
+    }
+}
 
 void run_db8_q32_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& batch_sizes,
                              int warmup, int iters) {
@@ -1245,8 +1297,8 @@ void run_db8_q32_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& batc
               << (2.0 * props.memoryClockRate * (props.memoryBusWidth / 8.0) / 1.0e6)
               << " GB/s" << std::endl;
 
-    if (props.major < 8) {
-        std::cout << "SKIPPED: CUTLASS uint8 tensor cores require SM80+ (Ampere or later)" << std::endl;
+    if (props.major < 7 || (props.major == 7 && props.minor < 5)) {
+        std::cout << "SKIPPED: CUTLASS uint8 tensor cores require SM75+ (Turing or later)" << std::endl;
         return;
     }
 
@@ -1303,42 +1355,19 @@ void run_db8_q32_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& batc
         uint32_t* d_accum;
         CUDA_CHECK(cudaMalloc(&d_accum, output_elems * sizeof(uint32_t)));
 
-        int32_t alpha = 1, beta = 0;
-
-        // GEMM: M × (4*N) × K
-        cutlass::gemm::GemmCoord problem_size(M, (int)wide_N, K);
-
-        CutlassGemmU8TC::Arguments args{
-            problem_size,
-            {d_db, (int)K},              // A: M×K row-major, stride=K
-            {d_query_packed, (int)K},    // B: K×(4N) col-major, stride=K
-            {d_gemm_out, (int)M},        // C (unused, beta=0)
-            {d_gemm_out, (int)M},        // D: M×(4N) col-major, stride=M
-            {alpha, beta},
-            1
-        };
-
-        CutlassGemmU8TC gemm_op;
-        cutlass::Status s = gemm_op.can_implement(args);
-        if (s != cutlass::Status::kSuccess) {
-            std::cerr << "Cannot implement CUTLASS u8 TC GEMM for batch=" << N
-                      << ": " << cutlassGetStatusString(s) << std::endl;
-            CUDA_CHECK(cudaFree(d_query_packed));
-            CUDA_CHECK(cudaFree(d_gemm_out));
-            CUDA_CHECK(cudaFree(d_accum));
-            continue;
-        }
-
-        size_t ws = CutlassGemmU8TC::get_workspace_size(args);
-        cutlass::device_memory::allocation<uint8_t> workspace(ws);
-        CUTLASS_CHECK(gemm_op.initialize(args, workspace.get()));
+        bool is_sm80 = detect_sm80();
 
         int acc_threads = 256;
         int acc_blocks = ((int)output_elems + acc_threads - 1) / acc_threads;
 
         // Warmup
         for (int w = 0; w < warmup; w++) {
-            CUTLASS_CHECK(gemm_op());
+            auto s = run_u8tc_gemm(is_sm80, M, (int)wide_N, K,
+                d_db, (int)K, d_query_packed, (int)K, d_gemm_out, (int)M);
+            if (s != cutlass::Status::kSuccess) {
+                std::cerr << "CUTLASS TC GEMM failed: " << cutlassGetStatusString(s) << std::endl;
+                break;
+            }
             accumulate_db8_q32_kernel<<<acc_blocks, acc_threads>>>(d_accum, d_gemm_out, M, N);
         }
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -1350,7 +1379,8 @@ void run_db8_q32_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& batc
 
         CUDA_CHECK(cudaEventRecord(start));
         for (int i = 0; i < iters; i++) {
-            CUTLASS_CHECK(gemm_op());
+            run_u8tc_gemm(is_sm80, M, (int)wide_N, K,
+                d_db, (int)K, d_query_packed, (int)K, d_gemm_out, (int)M);
             accumulate_db8_q32_kernel<<<acc_blocks, acc_threads>>>(d_accum, d_gemm_out, M, N);
         }
         CUDA_CHECK(cudaEventRecord(stop));
@@ -1400,7 +1430,7 @@ void run_db8_q32_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& batc
 // slices contiguously into K × (8*N) matrix, then do 2 GEMMs (one per DB byte).
 // Each GEMM: M×K (uint8) × K×(8*N) (uint8) → M×(8*N) (int32)
 // DB is read exactly 2 times (vs 15 in the old approach).
-// Reuses CutlassGemmU8TC defined above.
+// Reuses CutlassGemmU8TC_Sm80/Sm75 + run_u8tc_gemm helper defined above.
 
 void run_db16_q64_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& batch_sizes,
                               int warmup, int iters) {
@@ -1425,8 +1455,8 @@ void run_db16_q64_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& bat
               << (2.0 * props.memoryClockRate * (props.memoryBusWidth / 8.0) / 1.0e6)
               << " GB/s" << std::endl;
 
-    if (props.major < 8) {
-        std::cout << "SKIPPED: CUTLASS uint8 tensor cores require SM80+ (Ampere or later)" << std::endl;
+    if (props.major < 7 || (props.major == 7 && props.minor < 5)) {
+        std::cout << "SKIPPED: CUTLASS uint8 tensor cores require SM75+ (Turing or later)" << std::endl;
         return;
     }
 
@@ -1494,62 +1524,18 @@ void run_db16_q64_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& bat
         uint64_t* d_accum;
         CUDA_CHECK(cudaMalloc(&d_accum, output_elems * sizeof(uint64_t)));
 
-        // Zero output for accumulate_db1
-        int32_t alpha = 1, beta = 0;
-
-        // Set up CUTLASS GEMM problem: M × (8*N) × K
-        cutlass::gemm::GemmCoord problem_size(M, (int)wide_N, K);
-
-        // DB byte 0 GEMM
-        CutlassGemmU8TC::Arguments args0{
-            problem_size,
-            {d_db_bytes[0], (int)K},       // A ref: M×K row-major, stride=K
-            {d_query_packed, (int)K},       // B ref: K×(8N) col-major, stride=K
-            {d_gemm_out, (int)M},           // C ref (unused, beta=0)
-            {d_gemm_out, (int)M},           // D ref: M×(8N) col-major, stride=M
-            {alpha, beta},
-            1
-        };
-
-        // DB byte 1 GEMM (same B, reuse d_gemm_out)
-        CutlassGemmU8TC::Arguments args1{
-            problem_size,
-            {d_db_bytes[1], (int)K},
-            {d_query_packed, (int)K},
-            {d_gemm_out, (int)M},
-            {d_gemm_out, (int)M},
-            {alpha, beta},
-            1
-        };
-
-        CutlassGemmU8TC gemm_op0, gemm_op1;
-
-        cutlass::Status s0 = gemm_op0.can_implement(args0);
-        cutlass::Status s1 = gemm_op1.can_implement(args1);
-        if (s0 != cutlass::Status::kSuccess || s1 != cutlass::Status::kSuccess) {
-            std::cerr << "Cannot implement CUTLASS u8 TC GEMM for batch=" << N
-                      << ": " << cutlassGetStatusString(s0) << " / "
-                      << cutlassGetStatusString(s1) << std::endl;
-            CUDA_CHECK(cudaFree(d_query_packed));
-            CUDA_CHECK(cudaFree(d_gemm_out));
-            CUDA_CHECK(cudaFree(d_accum));
-            continue;
-        }
-
-        size_t ws0 = CutlassGemmU8TC::get_workspace_size(args0);
-        size_t ws1 = CutlassGemmU8TC::get_workspace_size(args1);
-        cutlass::device_memory::allocation<uint8_t> workspace0(ws0), workspace1(ws1);
-        CUTLASS_CHECK(gemm_op0.initialize(args0, workspace0.get()));
-        CUTLASS_CHECK(gemm_op1.initialize(args1, workspace1.get()));
+        bool is_sm80 = detect_sm80();
 
         int acc_threads = 256;
         int acc_blocks = ((int)output_elems + acc_threads - 1) / acc_threads;
 
         // Warmup
         for (int w = 0; w < warmup; w++) {
-            CUTLASS_CHECK(gemm_op0());
+            run_u8tc_gemm(is_sm80, M, (int)wide_N, K,
+                d_db_bytes[0], (int)K, d_query_packed, (int)K, d_gemm_out, (int)M);
             accumulate_db0_kernel<<<acc_blocks, acc_threads>>>(d_accum, d_gemm_out, M, N);
-            CUTLASS_CHECK(gemm_op1());
+            run_u8tc_gemm(is_sm80, M, (int)wide_N, K,
+                d_db_bytes[1], (int)K, d_query_packed, (int)K, d_gemm_out, (int)M);
             accumulate_db1_kernel<<<acc_blocks, acc_threads>>>(d_accum, d_gemm_out, M, N);
         }
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -1561,9 +1547,11 @@ void run_db16_q64_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& bat
 
         CUDA_CHECK(cudaEventRecord(start));
         for (int i = 0; i < iters; i++) {
-            CUTLASS_CHECK(gemm_op0());
+            run_u8tc_gemm(is_sm80, M, (int)wide_N, K,
+                d_db_bytes[0], (int)K, d_query_packed, (int)K, d_gemm_out, (int)M);
             accumulate_db0_kernel<<<acc_blocks, acc_threads>>>(d_accum, d_gemm_out, M, N);
-            CUTLASS_CHECK(gemm_op1());
+            run_u8tc_gemm(is_sm80, M, (int)wide_N, K,
+                d_db_bytes[1], (int)K, d_query_packed, (int)K, d_gemm_out, (int)M);
             accumulate_db1_kernel<<<acc_blocks, acc_threads>>>(d_accum, d_gemm_out, M, N);
         }
         CUDA_CHECK(cudaEventRecord(stop));

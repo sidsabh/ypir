@@ -24,9 +24,9 @@ endif()
 message(STATUS "Using CUTLASS from: ${CUTLASS_DIR}")
 
 # ---------- Detect GPU architecture ----------
-# Default to sm_80 (A100). Change if needed.
+# Default to sm_75 (Turing+). Override with -DCMAKE_CUDA_ARCHITECTURES=80 for Ampere.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 80)
+    set(CMAKE_CUDA_ARCHITECTURES 75)
 endif()
 message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
