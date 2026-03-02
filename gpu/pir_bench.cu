@@ -286,15 +286,16 @@ struct PirBench {
         std::cout << "HBM BW (theoretical): ~"
                   << (2.0 * props.memoryClockRate * (props.memoryBusWidth / 8.0) / 1.0e6)
                   << " GB/s" << std::endl;
-        std::cout << std::string(72, '-') << std::endl;
+        std::cout << std::string(80, '-') << std::endl;
 
         std::cout << std::setw(8) << "Batch"
-                  << std::setw(14) << "Time (ms)"
-                  << std::setw(14) << "QPS"
+                  << std::setw(12) << "Comp (ms)"
+                  << std::setw(12) << "E2E (ms)"
+                  << std::setw(12) << "E2E QPS"
                   << std::setw(18) << "Eff Tput (GB/s)"
                   << std::setw(18) << "HW BW (GB/s)"
                   << std::endl;
-        std::cout << std::string(72, '-') << std::endl;
+        std::cout << std::string(80, '-') << std::endl;
     }
 
     static void run(uint64_t M, uint64_t K, const std::vector<int>& batch_sizes,
@@ -353,6 +354,7 @@ struct PirBench {
             }
             CUDA_CHECK(cudaDeviceSynchronize());
 
+            // Compute-only timing (GPU events)
             cudaEvent_t start, stop;
             CUDA_CHECK(cudaEventCreate(&start));
             CUDA_CHECK(cudaEventCreate(&stop));
@@ -367,30 +369,45 @@ struct PirBench {
 
             float elapsed_ms = 0;
             CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-            double avg_ms = elapsed_ms / iters;
-
-            double db_bytes = double(M) * K * sizeof(DbT);
-            double queries_per_sec = N / (avg_ms / 1000.0);
-            double eff_tput_gbs = (db_bytes * N) / (avg_ms / 1000.0) / 1.0e9;
-
-            double query_bytes = double(K) * N * sizeof(QueryT);
-            double output_bytes = double(M) * N * sizeof(QueryT);
-            double hw_bw_gbs = (db_bytes + query_bytes + output_bytes) / (avg_ms / 1000.0) / 1.0e9;
-
-            std::cout << std::setw(8) << N
-                      << std::setw(14) << std::fixed << std::setprecision(2) << avg_ms
-                      << std::setw(14) << std::fixed << std::setprecision(0) << queries_per_sec
-                      << std::setw(18) << std::fixed << std::setprecision(1) << eff_tput_gbs
-                      << std::setw(18) << std::fixed << std::setprecision(1) << hw_bw_gbs
-                      << std::endl;
+            double comp_ms = elapsed_ms / iters;
 
             CUDA_CHECK(cudaEventDestroy(start));
             CUDA_CHECK(cudaEventDestroy(stop));
+
+            // E2E timing (wall clock: H->D query + compute + D->H result)
+            CUDA_CHECK(cudaDeviceSynchronize());
+            auto t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < iters; i++) {
+                tensor_B.sync_device();
+                status = gemm_op();
+                CUTLASS_CHECK(status);
+                tensor_D.sync_host();
+            }
+            auto t1 = std::chrono::high_resolution_clock::now();
+            double e2e_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+
+            double db_bytes = double(M) * K * sizeof(DbT);
+            double e2e_qps = N / (e2e_ms / 1000.0);
+            double eff_tput_gbs = (db_bytes * N) / (e2e_ms / 1000.0) / 1.0e9;
+
+            double query_bytes = double(K) * N * sizeof(QueryT);
+            double output_bytes = double(M) * N * sizeof(QueryT);
+            double hw_bw_gbs = (db_bytes + query_bytes + output_bytes) / (comp_ms / 1000.0) / 1.0e9;
+
+            std::cout << std::setw(8) << N
+                      << std::setw(12) << std::fixed << std::setprecision(2) << comp_ms
+                      << std::setw(12) << std::fixed << std::setprecision(2) << e2e_ms
+                      << std::setw(12) << std::fixed << std::setprecision(0) << e2e_qps
+                      << std::setw(18) << std::fixed << std::setprecision(1) << eff_tput_gbs
+                      << std::setw(18) << std::fixed << std::setprecision(1) << hw_bw_gbs
+                      << std::endl;
         }
 
-        std::cout << std::string(72, '-') << std::endl;
-        std::cout << "Eff Tput = (DB_size * batch) / time  [amortized]" << std::endl;
-        std::cout << "HW BW   = (DB + queries + output) / time" << std::endl;
+        std::cout << std::string(80, '-') << std::endl;
+        std::cout << "Comp    = GPU compute only (no PCIe)" << std::endl;
+        std::cout << "E2E     = H->D query upload + compute + D->H result download" << std::endl;
+        std::cout << "Eff Tput = (DB_size * batch) / E2E_time  [amortized]" << std::endl;
+        std::cout << "HW BW   = (DB + queries + output) / comp_time" << std::endl;
     }
 };
 
@@ -418,15 +435,16 @@ void run_crt(uint64_t M, uint64_t K, const std::vector<int>& batch_sizes,
     cudaDeviceProp props;
     CUDA_CHECK(cudaGetDeviceProperties(&props, 0));
     std::cout << "GPU: " << props.name << std::endl;
-    std::cout << std::string(72, '-') << std::endl;
+    std::cout << std::string(80, '-') << std::endl;
 
     std::cout << std::setw(8) << "Batch"
-              << std::setw(14) << "Time (ms)"
-              << std::setw(14) << "QPS"
+              << std::setw(12) << "Comp (ms)"
+              << std::setw(12) << "E2E (ms)"
+              << std::setw(12) << "E2E QPS"
               << std::setw(18) << "Eff Tput (GB/s)"
               << std::setw(18) << "HW BW (GB/s)"
               << std::endl;
-    std::cout << std::string(72, '-') << std::endl;
+    std::cout << std::string(80, '-') << std::endl;
 
     // Allocate DB once
     cutlass::HostTensor<uint16_t, Rows> tensor_A({int(M), int(K)});
@@ -485,6 +503,7 @@ void run_crt(uint64_t M, uint64_t K, const std::vector<int>& batch_sizes,
         }
         CUDA_CHECK(cudaDeviceSynchronize());
 
+        // Compute-only timing (GPU events)
         cudaEvent_t start, stop;
         CUDA_CHECK(cudaEventCreate(&start));
         CUDA_CHECK(cudaEventCreate(&stop));
@@ -499,32 +518,46 @@ void run_crt(uint64_t M, uint64_t K, const std::vector<int>& batch_sizes,
 
         float elapsed_ms = 0;
         CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-        double avg_ms = elapsed_ms / iters;
+        double comp_ms = elapsed_ms / iters;
 
-        // Effective throughput uses DB size (uint16)
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+
+        // E2E timing (wall clock: H->D queries + compute + D->H results)
+        CUDA_CHECK(cudaDeviceSynchronize());
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; i++) {
+            tensor_B1.sync_device(); tensor_B2.sync_device();
+            CUTLASS_CHECK(gemm_op1());
+            CUTLASS_CHECK(gemm_op2());
+            tensor_D1.sync_host(); tensor_D2.sync_host();
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double e2e_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+
         double db_bytes = double(M) * K * sizeof(uint16_t);
-        double queries_per_sec = N / (avg_ms / 1000.0);
-        double eff_tput_gbs = (db_bytes * N) / (avg_ms / 1000.0) / 1.0e9;
+        double e2e_qps = N / (e2e_ms / 1000.0);
+        double eff_tput_gbs = (db_bytes * N) / (e2e_ms / 1000.0) / 1.0e9;
 
         // HW BW: read DB twice + read 2x queries + write 2x outputs
         double query_bytes = 2.0 * double(K) * N * sizeof(uint32_t);
         double output_bytes = 2.0 * double(M) * N * sizeof(uint32_t);
-        double hw_bw_gbs = (2.0 * db_bytes + query_bytes + output_bytes) / (avg_ms / 1000.0) / 1.0e9;
+        double hw_bw_gbs = (2.0 * db_bytes + query_bytes + output_bytes) / (comp_ms / 1000.0) / 1.0e9;
 
         std::cout << std::setw(8) << N
-                  << std::setw(14) << std::fixed << std::setprecision(2) << avg_ms
-                  << std::setw(14) << std::fixed << std::setprecision(0) << queries_per_sec
+                  << std::setw(12) << std::fixed << std::setprecision(2) << comp_ms
+                  << std::setw(12) << std::fixed << std::setprecision(2) << e2e_ms
+                  << std::setw(12) << std::fixed << std::setprecision(0) << e2e_qps
                   << std::setw(18) << std::fixed << std::setprecision(1) << eff_tput_gbs
                   << std::setw(18) << std::fixed << std::setprecision(1) << hw_bw_gbs
                   << std::endl;
-
-        CUDA_CHECK(cudaEventDestroy(start));
-        CUDA_CHECK(cudaEventDestroy(stop));
     }
 
-    std::cout << std::string(72, '-') << std::endl;
-    std::cout << "Eff Tput = (DB_size * batch) / time  [amortized]" << std::endl;
-    std::cout << "HW BW   = (2*DB + 2*queries + 2*output) / time  [both GEMMs]" << std::endl;
+    std::cout << std::string(80, '-') << std::endl;
+    std::cout << "Comp    = GPU compute only (no PCIe)" << std::endl;
+    std::cout << "E2E     = H->D query upload + compute + D->H result download" << std::endl;
+    std::cout << "Eff Tput = (DB_size * batch) / E2E_time  [amortized]" << std::endl;
+    std::cout << "HW BW   = (2*DB + 2*queries + 2*output) / comp_time  [both GEMMs]" << std::endl;
 }
 
 // ---------- Mixed-precision: uint8 DB x uint32 query -> uint32 accum ----------
@@ -570,15 +603,16 @@ void run_db8_q32(uint64_t M, uint64_t K, const std::vector<int>& batch_sizes,
     std::cout << "HBM BW (theoretical): ~"
               << (2.0 * props.memoryClockRate * (props.memoryBusWidth / 8.0) / 1.0e6)
               << " GB/s" << std::endl;
-    std::cout << std::string(72, '-') << std::endl;
+    std::cout << std::string(80, '-') << std::endl;
 
     std::cout << std::setw(8) << "Batch"
-              << std::setw(14) << "Time (ms)"
-              << std::setw(14) << "QPS"
+              << std::setw(12) << "Comp (ms)"
+              << std::setw(12) << "E2E (ms)"
+              << std::setw(12) << "E2E QPS"
               << std::setw(18) << "Eff Tput (GB/s)"
               << std::setw(18) << "HW BW (GB/s)"
               << std::endl;
-    std::cout << std::string(72, '-') << std::endl;
+    std::cout << std::string(80, '-') << std::endl;
 
     cutlass::HostTensor<uint8_t, Rows> tensor_A({int(M), int(K)});
     cutlass::reference::host::TensorFill(tensor_A.host_view());
@@ -628,6 +662,7 @@ void run_db8_q32(uint64_t M, uint64_t K, const std::vector<int>& batch_sizes,
         }
         CUDA_CHECK(cudaDeviceSynchronize());
 
+        // Compute-only timing (GPU events)
         cudaEvent_t start, stop;
         CUDA_CHECK(cudaEventCreate(&start));
         CUDA_CHECK(cudaEventCreate(&stop));
@@ -642,30 +677,45 @@ void run_db8_q32(uint64_t M, uint64_t K, const std::vector<int>& batch_sizes,
 
         float elapsed_ms = 0;
         CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-        double avg_ms = elapsed_ms / iters;
-
-        double db_bytes = double(M) * K * sizeof(uint8_t);
-        double queries_per_sec = N / (avg_ms / 1000.0);
-        double eff_tput_gbs = (db_bytes * N) / (avg_ms / 1000.0) / 1.0e9;
-
-        double query_bytes = double(K) * N * sizeof(uint32_t);
-        double output_bytes = double(M) * N * sizeof(uint32_t);
-        double hw_bw_gbs = (db_bytes + query_bytes + output_bytes) / (avg_ms / 1000.0) / 1.0e9;
-
-        std::cout << std::setw(8) << N
-                  << std::setw(14) << std::fixed << std::setprecision(2) << avg_ms
-                  << std::setw(14) << std::fixed << std::setprecision(0) << queries_per_sec
-                  << std::setw(18) << std::fixed << std::setprecision(1) << eff_tput_gbs
-                  << std::setw(18) << std::fixed << std::setprecision(1) << hw_bw_gbs
-                  << std::endl;
+        double comp_ms = elapsed_ms / iters;
 
         CUDA_CHECK(cudaEventDestroy(start));
         CUDA_CHECK(cudaEventDestroy(stop));
+
+        // E2E timing (wall clock: H->D query + compute + D->H result)
+        CUDA_CHECK(cudaDeviceSynchronize());
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; i++) {
+            tensor_B.sync_device();
+            status = gemm_op();
+            CUTLASS_CHECK(status);
+            tensor_D.sync_host();
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double e2e_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+
+        double db_bytes = double(M) * K * sizeof(uint8_t);
+        double e2e_qps = N / (e2e_ms / 1000.0);
+        double eff_tput_gbs = (db_bytes * N) / (e2e_ms / 1000.0) / 1.0e9;
+
+        double query_bytes = double(K) * N * sizeof(uint32_t);
+        double output_bytes = double(M) * N * sizeof(uint32_t);
+        double hw_bw_gbs = (db_bytes + query_bytes + output_bytes) / (comp_ms / 1000.0) / 1.0e9;
+
+        std::cout << std::setw(8) << N
+                  << std::setw(12) << std::fixed << std::setprecision(2) << comp_ms
+                  << std::setw(12) << std::fixed << std::setprecision(2) << e2e_ms
+                  << std::setw(12) << std::fixed << std::setprecision(0) << e2e_qps
+                  << std::setw(18) << std::fixed << std::setprecision(1) << eff_tput_gbs
+                  << std::setw(18) << std::fixed << std::setprecision(1) << hw_bw_gbs
+                  << std::endl;
     }
 
-    std::cout << std::string(72, '-') << std::endl;
-    std::cout << "Eff Tput = (DB_uint8_size * batch) / time  [amortized]" << std::endl;
-    std::cout << "HW BW   = (DB + queries + output) / time" << std::endl;
+    std::cout << std::string(80, '-') << std::endl;
+    std::cout << "Comp    = GPU compute only (no PCIe)" << std::endl;
+    std::cout << "E2E     = H->D query upload + compute + D->H result download" << std::endl;
+    std::cout << "Eff Tput = (DB_uint8_size * batch) / E2E_time  [amortized]" << std::endl;
+    std::cout << "HW BW   = (DB + queries + output) / comp_time" << std::endl;
 }
 
 // ---------- CRT benchmark: 2x (int32 DB x int32 query -> int64 accum) ----------
@@ -709,15 +759,16 @@ void run_crt_i64(uint64_t M, uint64_t K, const std::vector<int>& batch_sizes,
     std::cout << "HBM BW (theoretical): ~"
               << (2.0 * props.memoryClockRate * (props.memoryBusWidth / 8.0) / 1.0e6)
               << " GB/s" << std::endl;
-    std::cout << std::string(72, '-') << std::endl;
+    std::cout << std::string(80, '-') << std::endl;
 
     std::cout << std::setw(8) << "Batch"
-              << std::setw(14) << "Time (ms)"
-              << std::setw(14) << "QPS"
+              << std::setw(12) << "Comp (ms)"
+              << std::setw(12) << "E2E (ms)"
+              << std::setw(12) << "E2E QPS"
               << std::setw(18) << "Eff Tput (GB/s)"
               << std::setw(18) << "HW BW (GB/s)"
               << std::endl;
-    std::cout << std::string(72, '-') << std::endl;
+    std::cout << std::string(80, '-') << std::endl;
 
     // Allocate widened DB (int32, simulating uint16 -> int32 widen)
     cutlass::HostTensor<int32_t, Rows> tensor_A({int(M), int(K)});
@@ -777,6 +828,7 @@ void run_crt_i64(uint64_t M, uint64_t K, const std::vector<int>& batch_sizes,
         }
         CUDA_CHECK(cudaDeviceSynchronize());
 
+        // Compute-only timing (GPU events)
         cudaEvent_t start, stop;
         CUDA_CHECK(cudaEventCreate(&start));
         CUDA_CHECK(cudaEventCreate(&stop));
@@ -791,33 +843,48 @@ void run_crt_i64(uint64_t M, uint64_t K, const std::vector<int>& batch_sizes,
 
         float elapsed_ms = 0;
         CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-        double avg_ms = elapsed_ms / iters;
+        double comp_ms = elapsed_ms / iters;
+
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+
+        // E2E timing (wall clock: H->D queries + compute + D->H results)
+        CUDA_CHECK(cudaDeviceSynchronize());
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; i++) {
+            tensor_B1.sync_device(); tensor_B2.sync_device();
+            CUTLASS_CHECK(gemm_op1());
+            CUTLASS_CHECK(gemm_op2());
+            tensor_D1.sync_host(); tensor_D2.sync_host();
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double e2e_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
 
         // Effective throughput uses original DB size (uint16, since that's the real data)
         double db_bytes_real = double(M) * K * sizeof(uint16_t);
-        double queries_per_sec = N / (avg_ms / 1000.0);
-        double eff_tput_gbs = (db_bytes_real * N) / (avg_ms / 1000.0) / 1.0e9;
+        double e2e_qps = N / (e2e_ms / 1000.0);
+        double eff_tput_gbs = (db_bytes_real * N) / (e2e_ms / 1000.0) / 1.0e9;
 
         // HW BW: read int32 DB twice + read 2x int32 queries + write 2x int64 outputs
         double db_bytes_gpu = double(M) * K * sizeof(int32_t);
         double query_bytes = 2.0 * double(K) * N * sizeof(int32_t);
         double output_bytes = 2.0 * double(M) * N * sizeof(int64_t);
-        double hw_bw_gbs = (2.0 * db_bytes_gpu + query_bytes + output_bytes) / (avg_ms / 1000.0) / 1.0e9;
+        double hw_bw_gbs = (2.0 * db_bytes_gpu + query_bytes + output_bytes) / (comp_ms / 1000.0) / 1.0e9;
 
         std::cout << std::setw(8) << N
-                  << std::setw(14) << std::fixed << std::setprecision(2) << avg_ms
-                  << std::setw(14) << std::fixed << std::setprecision(0) << queries_per_sec
+                  << std::setw(12) << std::fixed << std::setprecision(2) << comp_ms
+                  << std::setw(12) << std::fixed << std::setprecision(2) << e2e_ms
+                  << std::setw(12) << std::fixed << std::setprecision(0) << e2e_qps
                   << std::setw(18) << std::fixed << std::setprecision(1) << eff_tput_gbs
                   << std::setw(18) << std::fixed << std::setprecision(1) << hw_bw_gbs
                   << std::endl;
-
-        CUDA_CHECK(cudaEventDestroy(start));
-        CUDA_CHECK(cudaEventDestroy(stop));
     }
 
-    std::cout << std::string(72, '-') << std::endl;
-    std::cout << "Eff Tput = (DB_uint16_size * batch) / time  [amortized]" << std::endl;
-    std::cout << "HW BW   = (2*DB_i32 + 2*queries_i32 + 2*output_i64) / time" << std::endl;
+    std::cout << std::string(80, '-') << std::endl;
+    std::cout << "Comp    = GPU compute only (no PCIe)" << std::endl;
+    std::cout << "E2E     = H->D query upload + compute + D->H result download" << std::endl;
+    std::cout << "Eff Tput = (DB_uint16_size * batch) / E2E_time  [amortized]" << std::endl;
+    std::cout << "HW BW   = (2*DB_i32 + 2*queries_i32 + 2*output_i64) / comp_time" << std::endl;
 }
 
 // ---------- Tensor Core: 4x int8 GEMM via cuBLAS (DoublePIR Step 1) ----------
@@ -857,14 +924,15 @@ void run_db8_q32_tensor(uint64_t M, uint64_t K, const std::vector<int>& batch_si
         return;
     }
 
-    std::cout << std::string(72, '-') << std::endl;
+    std::cout << std::string(80, '-') << std::endl;
     std::cout << std::setw(8) << "Batch"
-              << std::setw(14) << "Time (ms)"
-              << std::setw(14) << "QPS"
+              << std::setw(12) << "Comp (ms)"
+              << std::setw(12) << "E2E (ms)"
+              << std::setw(12) << "E2E QPS"
               << std::setw(18) << "Eff Tput (GB/s)"
               << std::setw(18) << "HW BW (GB/s)"
               << std::endl;
-    std::cout << std::string(72, '-') << std::endl;
+    std::cout << std::string(80, '-') << std::endl;
 
     cublasHandle_t handle;
     CUBLAS_CHECK(cublasCreate(&handle));
@@ -885,33 +953,32 @@ void run_db8_q32_tensor(uint64_t M, uint64_t K, const std::vector<int>& batch_si
         size_t query_elems = K * N;
         size_t output_elems = M * N;
 
-        // Allocate and fill query (int32), then decompose
+        // Allocate and fill query (int32), keep host copy for E2E
         int32_t* d_query;
         CUDA_CHECK(cudaMalloc(&d_query, query_elems * sizeof(int32_t)));
-        {
-            std::vector<int32_t> h_query(query_elems);
-            for (size_t i = 0; i < h_query.size(); i++)
-                h_query[i] = (int32_t)rand();
-            CUDA_CHECK(cudaMemcpy(d_query, h_query.data(),
-                                  query_elems * sizeof(int32_t),
-                                  cudaMemcpyHostToDevice));
-        }
+        std::vector<int32_t> h_query(query_elems);
+        for (size_t i = 0; i < h_query.size(); i++)
+            h_query[i] = (int32_t)rand();
+        CUDA_CHECK(cudaMemcpy(d_query, h_query.data(),
+                              query_elems * sizeof(int32_t),
+                              cudaMemcpyHostToDevice));
 
-        // Decompose into 4 byte slices (not timed — negligible)
+        // Decompose into 4 byte slices
         int8_t* d_q[4];
         for (int i = 0; i < 4; i++)
             CUDA_CHECK(cudaMalloc(&d_q[i], query_elems));
-        {
-            int threads = 256;
-            int blocks = ((int)query_elems + threads - 1) / threads;
-            decompose_query_bytes_kernel<<<blocks, threads>>>(
-                d_q[0], d_q[1], d_q[2], d_q[3], d_query, query_elems);
-            CUDA_CHECK(cudaDeviceSynchronize());
-        }
+        int decomp_threads = 256;
+        int decomp_blocks = ((int)query_elems + decomp_threads - 1) / decomp_threads;
+        decompose_query_bytes_kernel<<<decomp_blocks, decomp_threads>>>(
+            d_q[0], d_q[1], d_q[2], d_q[3], d_query, query_elems);
+        CUDA_CHECK(cudaDeviceSynchronize());
 
         // Output buffer (int32, col-major M×N)
         int32_t* d_output;
         CUDA_CHECK(cudaMalloc(&d_output, output_elems * sizeof(int32_t)));
+
+        // Host result buffer for E2E download
+        std::vector<int32_t> h_result(output_elems);
 
         int32_t alphas[4] = {1, 256, 65536, 16777216};
         int32_t betas[4]  = {0, 1, 1, 1};
@@ -923,17 +990,17 @@ void run_db8_q32_tensor(uint64_t M, uint64_t K, const std::vector<int>& batch_si
                     CUBLAS_OP_T, CUBLAS_OP_N,
                     (int)M, N, (int)K,
                     &alphas[g],
-                    d_db,     CUDA_R_8I, (int)K,   // A: row-major → OP_T, lda=K
-                    d_q[g],   CUDA_R_8I, (int)K,   // B: col-major, ldb=K
+                    d_db,     CUDA_R_8I, (int)K,
+                    d_q[g],   CUDA_R_8I, (int)K,
                     &betas[g],
-                    d_output, CUDA_R_32I, (int)M,   // C: col-major, ldc=M
+                    d_output, CUDA_R_32I, (int)M,
                     CUBLAS_COMPUTE_32I,
                     CUBLAS_GEMM_DEFAULT_TENSOR_OP));
             }
         }
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // Timed
+        // Compute-only timing (GPU events)
         cudaEvent_t start, stop;
         CUDA_CHECK(cudaEventCreate(&start));
         CUDA_CHECK(cudaEventCreate(&stop));
@@ -956,28 +1023,54 @@ void run_db8_q32_tensor(uint64_t M, uint64_t K, const std::vector<int>& batch_si
 
         float elapsed_ms = 0;
         CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-        double avg_ms = elapsed_ms / iters;
+        double comp_ms = elapsed_ms / iters;
+
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+
+        // E2E timing (wall clock: H->D query + decompose + compute + D->H result)
+        CUDA_CHECK(cudaDeviceSynchronize());
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; i++) {
+            CUDA_CHECK(cudaMemcpy(d_query, h_query.data(),
+                                  query_elems * sizeof(int32_t), cudaMemcpyHostToDevice));
+            decompose_query_bytes_kernel<<<decomp_blocks, decomp_threads>>>(
+                d_q[0], d_q[1], d_q[2], d_q[3], d_query, query_elems);
+            for (int g = 0; g < 4; g++)
+                CUBLAS_CHECK(cublasGemmEx(handle,
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    (int)M, N, (int)K,
+                    &alphas[g],
+                    d_db,     CUDA_R_8I, (int)K,
+                    d_q[g],   CUDA_R_8I, (int)K,
+                    &betas[g],
+                    d_output, CUDA_R_32I, (int)M,
+                    CUBLAS_COMPUTE_32I,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            CUDA_CHECK(cudaMemcpy(h_result.data(), d_output,
+                                  output_elems * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double e2e_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
 
         double db_bytes = double(M) * K;  // int8
-        double queries_per_sec = N / (avg_ms / 1000.0);
-        double eff_tput_gbs = (db_bytes * N) / (avg_ms / 1000.0) / 1.0e9;
+        double e2e_qps = N / (e2e_ms / 1000.0);
+        double eff_tput_gbs = (db_bytes * N) / (e2e_ms / 1000.0) / 1.0e9;
 
         // HW BW: DB read 4x, 4 query byte arrays, output: 1 write + 3 RMW
         double hw_bw_gbs = (
             4.0 * db_bytes +
             4.0 * double(K) * N +
             (1 + 3 * 2) * double(M) * N * sizeof(int32_t)
-        ) / (avg_ms / 1000.0) / 1.0e9;
+        ) / (comp_ms / 1000.0) / 1.0e9;
 
         std::cout << std::setw(8) << N
-                  << std::setw(14) << std::fixed << std::setprecision(2) << avg_ms
-                  << std::setw(14) << std::fixed << std::setprecision(0) << queries_per_sec
+                  << std::setw(12) << std::fixed << std::setprecision(2) << comp_ms
+                  << std::setw(12) << std::fixed << std::setprecision(2) << e2e_ms
+                  << std::setw(12) << std::fixed << std::setprecision(0) << e2e_qps
                   << std::setw(18) << std::fixed << std::setprecision(1) << eff_tput_gbs
                   << std::setw(18) << std::fixed << std::setprecision(1) << hw_bw_gbs
                   << std::endl;
-
-        CUDA_CHECK(cudaEventDestroy(start));
-        CUDA_CHECK(cudaEventDestroy(stop));
 
         CUDA_CHECK(cudaFree(d_query));
         for (int i = 0; i < 4; i++)
@@ -987,9 +1080,11 @@ void run_db8_q32_tensor(uint64_t M, uint64_t K, const std::vector<int>& batch_si
 
     CUDA_CHECK(cudaFree(d_db));
     cublasDestroy(handle);
-    std::cout << std::string(72, '-') << std::endl;
-    std::cout << "Eff Tput = (DB_int8_size * batch) / time  [amortized]" << std::endl;
-    std::cout << "HW BW   = (4*DB + 4*q_bytes + output_writes) / time  [no L2 cache assumed]" << std::endl;
+    std::cout << std::string(80, '-') << std::endl;
+    std::cout << "Comp    = GPU compute only (no PCIe)" << std::endl;
+    std::cout << "E2E     = H->D query upload + compute + D->H result download" << std::endl;
+    std::cout << "Eff Tput = (DB_int8_size * batch) / E2E_time  [amortized]" << std::endl;
+    std::cout << "HW BW   = (4*DB + 4*q_bytes + output_writes) / comp_time" << std::endl;
 }
 
 // ---------- Tensor Core: 15x int8 GEMM via cuBLAS (uint16 DB x uint64 query) ----------
@@ -1029,14 +1124,15 @@ void run_db16_q64_tensor(uint64_t M, uint64_t K, const std::vector<int>& batch_s
         return;
     }
 
-    std::cout << std::string(72, '-') << std::endl;
+    std::cout << std::string(80, '-') << std::endl;
     std::cout << std::setw(8) << "Batch"
-              << std::setw(14) << "Time (ms)"
-              << std::setw(14) << "QPS"
+              << std::setw(12) << "Comp (ms)"
+              << std::setw(12) << "E2E (ms)"
+              << std::setw(12) << "E2E QPS"
               << std::setw(18) << "Eff Tput (GB/s)"
               << std::setw(18) << "HW BW (GB/s)"
               << std::endl;
-    std::cout << std::string(72, '-') << std::endl;
+    std::cout << std::string(80, '-') << std::endl;
 
     cublasHandle_t handle;
     CUBLAS_CHECK(cublasCreate(&handle));
@@ -1092,35 +1188,36 @@ void run_db16_q64_tensor(uint64_t M, uint64_t K, const std::vector<int>& batch_s
         size_t query_elems = K * N;
         size_t output_elems = M * N;
 
-        // Allocate and decompose query (uint64, col-major K×N) into 8 int8 byte slices
+        // Allocate query buffers (keep host + raw device for E2E timing)
+        uint64_t* d_query_raw;
+        CUDA_CHECK(cudaMalloc(&d_query_raw, query_elems * sizeof(uint64_t)));
+        std::vector<uint64_t> h_query(query_elems);
+        for (size_t i = 0; i < h_query.size(); i++)
+            h_query[i] = ((uint64_t)rand() << 32) | (uint64_t)rand();
+        CUDA_CHECK(cudaMemcpy(d_query_raw, h_query.data(),
+                              query_elems * sizeof(uint64_t),
+                              cudaMemcpyHostToDevice));
+
+        // Decompose into 8 int8 byte slices
         int8_t* d_q_b[8];
-        {
-            uint64_t* d_query_raw;
-            CUDA_CHECK(cudaMalloc(&d_query_raw, query_elems * sizeof(uint64_t)));
-            std::vector<uint64_t> h_query(query_elems);
-            for (size_t i = 0; i < h_query.size(); i++)
-                h_query[i] = ((uint64_t)rand() << 32) | (uint64_t)rand();
-            CUDA_CHECK(cudaMemcpy(d_query_raw, h_query.data(),
-                                  query_elems * sizeof(uint64_t),
-                                  cudaMemcpyHostToDevice));
+        for (int i = 0; i < 8; i++)
+            CUDA_CHECK(cudaMalloc(&d_q_b[i], query_elems));
 
-            for (int i = 0; i < 8; i++)
-                CUDA_CHECK(cudaMalloc(&d_q_b[i], query_elems));
-
-            int threads = 256;
-            int blocks = ((int)query_elems + threads - 1) / threads;
-            decompose_i64_bytes_kernel<<<blocks, threads>>>(
-                d_q_b[0], d_q_b[1], d_q_b[2], d_q_b[3],
-                d_q_b[4], d_q_b[5], d_q_b[6], d_q_b[7],
-                d_query_raw, query_elems);
-            CUDA_CHECK(cudaDeviceSynchronize());
-            CUDA_CHECK(cudaFree(d_query_raw));
-        }
+        int decomp_threads = 256;
+        int decomp_blocks = ((int)query_elems + decomp_threads - 1) / decomp_threads;
+        decompose_i64_bytes_kernel<<<decomp_blocks, decomp_threads>>>(
+            d_q_b[0], d_q_b[1], d_q_b[2], d_q_b[3],
+            d_q_b[4], d_q_b[5], d_q_b[6], d_q_b[7],
+            d_query_raw, query_elems);
+        CUDA_CHECK(cudaDeviceSynchronize());
 
         // Two output accumulators (int32, col-major M×N)
         int32_t* d_output[2];
         CUDA_CHECK(cudaMalloc(&d_output[0], output_elems * sizeof(int32_t)));
         CUDA_CHECK(cudaMalloc(&d_output[1], output_elems * sizeof(int32_t)));
+
+        // Host result buffers for E2E download
+        std::vector<int32_t> h_result_lo(output_elems), h_result_hi(output_elems);
 
         // Warmup
         for (int w = 0; w < warmup; w++) {
@@ -1139,7 +1236,7 @@ void run_db16_q64_tensor(uint64_t M, uint64_t K, const std::vector<int>& batch_s
         }
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // Timed
+        // Compute-only timing (GPU events)
         cudaEvent_t start, stop;
         CUDA_CHECK(cudaEventCreate(&start));
         CUDA_CHECK(cudaEventCreate(&stop));
@@ -1162,33 +1259,62 @@ void run_db16_q64_tensor(uint64_t M, uint64_t K, const std::vector<int>& batch_s
 
         float elapsed_ms = 0;
         CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-        double avg_ms = elapsed_ms / iters;
+        double comp_ms = elapsed_ms / iters;
 
-        // Effective throughput: DB_uint16_size * batch / time
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+
+        // E2E timing (wall clock: H->D query + decompose + compute + D->H result)
+        CUDA_CHECK(cudaDeviceSynchronize());
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; i++) {
+            CUDA_CHECK(cudaMemcpy(d_query_raw, h_query.data(),
+                                  query_elems * sizeof(uint64_t), cudaMemcpyHostToDevice));
+            decompose_i64_bytes_kernel<<<decomp_blocks, decomp_threads>>>(
+                d_q_b[0], d_q_b[1], d_q_b[2], d_q_b[3],
+                d_q_b[4], d_q_b[5], d_q_b[6], d_q_b[7],
+                d_query_raw, query_elems);
+            for (int g = 0; g < 15; g++)
+                CUBLAS_CHECK(cublasGemmEx(handle,
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    (int)M, N, (int)K,
+                    &specs[g].alpha,
+                    d_db_b[specs[g].db_b], CUDA_R_8I, (int)K,
+                    d_q_b[specs[g].q_b],   CUDA_R_8I, (int)K,
+                    &specs[g].beta,
+                    d_output[specs[g].out], CUDA_R_32I, (int)M,
+                    CUBLAS_COMPUTE_32I,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            CUDA_CHECK(cudaMemcpy(h_result_lo.data(), d_output[0],
+                                  output_elems * sizeof(int32_t), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h_result_hi.data(), d_output[1],
+                                  output_elems * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double e2e_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+
+        // Effective throughput: DB_uint16_size * batch / E2E time
         double db_bytes = double(M) * K * sizeof(uint16_t);
-        double queries_per_sec = N / (avg_ms / 1000.0);
-        double eff_tput_gbs = (db_bytes * N) / (avg_ms / 1000.0) / 1.0e9;
+        double e2e_qps = N / (e2e_ms / 1000.0);
+        double eff_tput_gbs = (db_bytes * N) / (e2e_ms / 1000.0) / 1.0e9;
 
-        // HW BW: 2 DB byte slices read 8x and 7x respectively (total 15 reads of M*K bytes each),
-        // 8 query byte slices read 2x each except q7 read 1x (total 15 reads of K*N bytes each),
-        // 2 output buffers: 1 write + 6 RMW (low), 1 write + 7 RMW (high)
+        // HW BW: based on compute time (GPU utilization metric)
         double hw_bw_gbs = (
             15.0 * double(M) * K +                              // DB byte slice reads
             15.0 * double(K) * N +                              // query byte slice reads
             (1 + 6 * 2) * double(M) * N * sizeof(int32_t) +     // low accum (1 write + 6 RMW)
             (1 + 7 * 2) * double(M) * N * sizeof(int32_t)       // high accum (1 write + 7 RMW)
-        ) / (avg_ms / 1000.0) / 1.0e9;
+        ) / (comp_ms / 1000.0) / 1.0e9;
 
         std::cout << std::setw(8) << N
-                  << std::setw(14) << std::fixed << std::setprecision(2) << avg_ms
-                  << std::setw(14) << std::fixed << std::setprecision(0) << queries_per_sec
+                  << std::setw(12) << std::fixed << std::setprecision(2) << comp_ms
+                  << std::setw(12) << std::fixed << std::setprecision(2) << e2e_ms
+                  << std::setw(12) << std::fixed << std::setprecision(0) << e2e_qps
                   << std::setw(18) << std::fixed << std::setprecision(1) << eff_tput_gbs
                   << std::setw(18) << std::fixed << std::setprecision(1) << hw_bw_gbs
                   << std::endl;
 
-        CUDA_CHECK(cudaEventDestroy(start));
-        CUDA_CHECK(cudaEventDestroy(stop));
-
+        CUDA_CHECK(cudaFree(d_query_raw));
         for (int i = 0; i < 8; i++)
             CUDA_CHECK(cudaFree(d_q_b[i]));
         CUDA_CHECK(cudaFree(d_output[0]));
@@ -1198,9 +1324,11 @@ void run_db16_q64_tensor(uint64_t M, uint64_t K, const std::vector<int>& batch_s
     for (int i = 0; i < 2; i++)
         CUDA_CHECK(cudaFree(d_db_b[i]));
     cublasDestroy(handle);
-    std::cout << std::string(72, '-') << std::endl;
-    std::cout << "Eff Tput = (DB_uint16_size * batch) / time  [amortized]" << std::endl;
-    std::cout << "HW BW   = (15*db_slices + 15*q_slices + output_accesses) / time" << std::endl;
+    std::cout << std::string(80, '-') << std::endl;
+    std::cout << "Comp    = GPU compute only (no PCIe)" << std::endl;
+    std::cout << "E2E     = H->D query upload + compute + D->H result download" << std::endl;
+    std::cout << "Eff Tput = (DB_uint16_size * batch) / E2E_time  [amortized]" << std::endl;
+    std::cout << "HW BW   = (15*db_slices + 15*q_slices + output_accesses) / comp_time" << std::endl;
 }
 
 // ---------- CUTLASS uint8 Tensor Core: 1x wide GEMM (uint8 DB x uint32 query) ----------
@@ -1302,14 +1430,15 @@ void run_db8_q32_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& batc
         return;
     }
 
-    std::cout << std::string(72, '-') << std::endl;
+    std::cout << std::string(80, '-') << std::endl;
     std::cout << std::setw(8) << "Batch"
-              << std::setw(14) << "Time (ms)"
-              << std::setw(14) << "QPS"
+              << std::setw(12) << "Comp (ms)"
+              << std::setw(12) << "E2E (ms)"
+              << std::setw(12) << "E2E QPS"
               << std::setw(18) << "Eff Tput (GB/s)"
               << std::setw(18) << "HW BW (GB/s)"
               << std::endl;
-    std::cout << std::string(72, '-') << std::endl;
+    std::cout << std::string(80, '-') << std::endl;
 
     // Allocate DB (already uint8, row-major M×K)
     uint8_t* d_db;
@@ -1327,25 +1456,25 @@ void run_db8_q32_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& batc
         size_t output_elems = M * (size_t)N;
         size_t wide_N = 4 * (size_t)N;  // packed query width
 
-        // Allocate and decompose query (uint32) into packed uint8: K × (4*N)
+        // Allocate query buffers (keep host + raw device for E2E timing)
         uint8_t* d_query_packed;
         CUDA_CHECK(cudaMalloc(&d_query_packed, K * wide_N));
-        {
-            uint32_t* d_query_raw;
-            CUDA_CHECK(cudaMalloc(&d_query_raw, query_elems * sizeof(uint32_t)));
-            std::vector<uint32_t> h_query(query_elems);
-            for (size_t i = 0; i < h_query.size(); i++)
-                h_query[i] = (uint32_t)rand();
-            CUDA_CHECK(cudaMemcpy(d_query_raw, h_query.data(),
-                                  query_elems * sizeof(uint32_t), cudaMemcpyHostToDevice));
+        uint32_t* d_query_raw;
+        CUDA_CHECK(cudaMalloc(&d_query_raw, query_elems * sizeof(uint32_t)));
+        std::vector<uint32_t> h_query(query_elems);
+        for (size_t i = 0; i < h_query.size(); i++)
+            h_query[i] = (uint32_t)rand();
+        CUDA_CHECK(cudaMemcpy(d_query_raw, h_query.data(),
+                              query_elems * sizeof(uint32_t), cudaMemcpyHostToDevice));
 
-            int threads = 256;
-            int blocks = ((int)query_elems + threads - 1) / threads;
-            decompose_u32_bytes_packed_kernel<<<blocks, threads>>>(
-                d_query_packed, d_query_raw, K, N);
-            CUDA_CHECK(cudaDeviceSynchronize());
-            CUDA_CHECK(cudaFree(d_query_raw));
-        }
+        int decomp_threads = 256;
+        int decomp_blocks = ((int)query_elems + decomp_threads - 1) / decomp_threads;
+        decompose_u32_bytes_packed_kernel<<<decomp_blocks, decomp_threads>>>(
+            d_query_packed, d_query_raw, K, N);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // Host result buffer for E2E download
+        std::vector<uint32_t> h_result(output_elems);
 
         // GEMM output: M × (4*N) int32
         int32_t* d_gemm_out;
@@ -1372,7 +1501,7 @@ void run_db8_q32_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& batc
         }
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // Timed
+        // Compute-only timing (GPU events)
         cudaEvent_t start, stop;
         CUDA_CHECK(cudaEventCreate(&start));
         CUDA_CHECK(cudaEventCreate(&stop));
@@ -1388,40 +1517,60 @@ void run_db8_q32_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& batc
 
         float elapsed_ms = 0;
         CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-        double avg_ms = elapsed_ms / iters;
+        double comp_ms = elapsed_ms / iters;
+
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+
+        // E2E timing (wall clock: H->D query + compute + D->H result)
+        CUDA_CHECK(cudaDeviceSynchronize());
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; i++) {
+            CUDA_CHECK(cudaMemcpy(d_query_raw, h_query.data(),
+                                  query_elems * sizeof(uint32_t), cudaMemcpyHostToDevice));
+            decompose_u32_bytes_packed_kernel<<<decomp_blocks, decomp_threads>>>(
+                d_query_packed, d_query_raw, K, N);
+            run_u8tc_gemm(is_sm80, M, (int)wide_N, K,
+                d_db, (int)K, d_query_packed, (int)K, d_gemm_out, (int)M);
+            accumulate_db8_q32_kernel<<<acc_blocks, acc_threads>>>(d_accum, d_gemm_out, M, N);
+            CUDA_CHECK(cudaMemcpy(h_result.data(), d_accum,
+                                  output_elems * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double e2e_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
 
         double db_bytes = double(M) * K;  // uint8
-        double queries_per_sec = N / (avg_ms / 1000.0);
-        double eff_tput_gbs = (db_bytes * N) / (avg_ms / 1000.0) / 1.0e9;
+        double e2e_qps = N / (e2e_ms / 1000.0);
+        double eff_tput_gbs = (db_bytes * N) / (e2e_ms / 1000.0) / 1.0e9;
 
-        // HW BW: 1 DB read + 1 packed query read (K*4N) + 1 GEMM output write (M*4N*4)
-        //       + accum write (M*N*4)
+        // HW BW: based on compute time (GPU utilization metric)
         double hw_bw_gbs = (
             double(M) * K +                              // DB read
             double(K) * wide_N +                         // packed query read
             double(M) * wide_N * sizeof(int32_t) +       // GEMM output write
             double(M) * N * sizeof(uint32_t)              // accum write
-        ) / (avg_ms / 1000.0) / 1.0e9;
+        ) / (comp_ms / 1000.0) / 1.0e9;
 
         std::cout << std::setw(8) << N
-                  << std::setw(14) << std::fixed << std::setprecision(2) << avg_ms
-                  << std::setw(14) << std::fixed << std::setprecision(0) << queries_per_sec
+                  << std::setw(12) << std::fixed << std::setprecision(2) << comp_ms
+                  << std::setw(12) << std::fixed << std::setprecision(2) << e2e_ms
+                  << std::setw(12) << std::fixed << std::setprecision(0) << e2e_qps
                   << std::setw(18) << std::fixed << std::setprecision(1) << eff_tput_gbs
                   << std::setw(18) << std::fixed << std::setprecision(1) << hw_bw_gbs
                   << std::endl;
 
-        CUDA_CHECK(cudaEventDestroy(start));
-        CUDA_CHECK(cudaEventDestroy(stop));
-
+        CUDA_CHECK(cudaFree(d_query_raw));
         CUDA_CHECK(cudaFree(d_query_packed));
         CUDA_CHECK(cudaFree(d_gemm_out));
         CUDA_CHECK(cudaFree(d_accum));
     }
 
     CUDA_CHECK(cudaFree(d_db));
-    std::cout << std::string(72, '-') << std::endl;
-    std::cout << "Eff Tput = (DB_uint8_size * batch) / time  [amortized]" << std::endl;
-    std::cout << "HW BW   = (db + packed_query + gemm_out + accum) / time" << std::endl;
+    std::cout << std::string(80, '-') << std::endl;
+    std::cout << "Comp    = GPU compute only (no PCIe)" << std::endl;
+    std::cout << "E2E     = H->D query upload + compute + D->H result download" << std::endl;
+    std::cout << "Eff Tput = (DB_uint8_size * batch) / E2E_time  [amortized]" << std::endl;
+    std::cout << "HW BW   = (db + packed_query + gemm_out + accum) / comp_time" << std::endl;
 }
 
 // ---------- CUTLASS uint8 Tensor Core: 2x wide GEMM (uint16 DB x uint64 query) ----------
@@ -1460,14 +1609,15 @@ void run_db16_q64_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& bat
         return;
     }
 
-    std::cout << std::string(72, '-') << std::endl;
+    std::cout << std::string(80, '-') << std::endl;
     std::cout << std::setw(8) << "Batch"
-              << std::setw(14) << "Time (ms)"
-              << std::setw(14) << "QPS"
+              << std::setw(12) << "Comp (ms)"
+              << std::setw(12) << "E2E (ms)"
+              << std::setw(12) << "E2E QPS"
               << std::setw(18) << "Eff Tput (GB/s)"
               << std::setw(18) << "HW BW (GB/s)"
               << std::endl;
-    std::cout << std::string(72, '-') << std::endl;
+    std::cout << std::string(80, '-') << std::endl;
 
     // Allocate and decompose DB (uint16) into 2 uint8 byte slices
     size_t db_elems = M * K;
@@ -1496,25 +1646,25 @@ void run_db16_q64_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& bat
         size_t output_elems = M * (size_t)N;
         size_t wide_N = 8 * (size_t)N;  // packed query width
 
-        // Allocate and decompose query (uint64) into packed uint8: K × (8*N)
+        // Allocate query buffers (keep host + raw device for E2E timing)
         uint8_t* d_query_packed;
         CUDA_CHECK(cudaMalloc(&d_query_packed, K * wide_N));
-        {
-            uint64_t* d_query_raw;
-            CUDA_CHECK(cudaMalloc(&d_query_raw, query_elems * sizeof(uint64_t)));
-            std::vector<uint64_t> h_query(query_elems);
-            for (size_t i = 0; i < h_query.size(); i++)
-                h_query[i] = ((uint64_t)rand() << 32) | (uint64_t)rand();
-            CUDA_CHECK(cudaMemcpy(d_query_raw, h_query.data(),
-                                  query_elems * sizeof(uint64_t), cudaMemcpyHostToDevice));
+        uint64_t* d_query_raw;
+        CUDA_CHECK(cudaMalloc(&d_query_raw, query_elems * sizeof(uint64_t)));
+        std::vector<uint64_t> h_query(query_elems);
+        for (size_t i = 0; i < h_query.size(); i++)
+            h_query[i] = ((uint64_t)rand() << 32) | (uint64_t)rand();
+        CUDA_CHECK(cudaMemcpy(d_query_raw, h_query.data(),
+                              query_elems * sizeof(uint64_t), cudaMemcpyHostToDevice));
 
-            int threads = 256;
-            int blocks = ((int)query_elems + threads - 1) / threads;
-            decompose_u64_bytes_packed_kernel<<<blocks, threads>>>(
-                d_query_packed, d_query_raw, K, N);
-            CUDA_CHECK(cudaDeviceSynchronize());
-            CUDA_CHECK(cudaFree(d_query_raw));
-        }
+        int decomp_threads = 256;
+        int decomp_blocks = ((int)query_elems + decomp_threads - 1) / decomp_threads;
+        decompose_u64_bytes_packed_kernel<<<decomp_blocks, decomp_threads>>>(
+            d_query_packed, d_query_raw, K, N);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // Host result buffer for E2E download
+        std::vector<uint64_t> h_result(output_elems);
 
         // GEMM output: M × (8*N) int32 — reused for both DB bytes
         int32_t* d_gemm_out;
@@ -1540,7 +1690,7 @@ void run_db16_q64_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& bat
         }
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // Timed
+        // Compute-only timing (GPU events)
         cudaEvent_t start, stop;
         CUDA_CHECK(cudaEventCreate(&start));
         CUDA_CHECK(cudaEventCreate(&stop));
@@ -1559,32 +1709,53 @@ void run_db16_q64_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& bat
 
         float elapsed_ms = 0;
         CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-        double avg_ms = elapsed_ms / iters;
+        double comp_ms = elapsed_ms / iters;
 
-        // Effective throughput: DB_uint16_size * batch / time
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+
+        // E2E timing (wall clock: H->D query + compute + D->H result)
+        CUDA_CHECK(cudaDeviceSynchronize());
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; i++) {
+            CUDA_CHECK(cudaMemcpy(d_query_raw, h_query.data(),
+                                  query_elems * sizeof(uint64_t), cudaMemcpyHostToDevice));
+            decompose_u64_bytes_packed_kernel<<<decomp_blocks, decomp_threads>>>(
+                d_query_packed, d_query_raw, K, N);
+            run_u8tc_gemm(is_sm80, M, (int)wide_N, K,
+                d_db_bytes[0], (int)K, d_query_packed, (int)K, d_gemm_out, (int)M);
+            accumulate_db0_kernel<<<acc_blocks, acc_threads>>>(d_accum, d_gemm_out, M, N);
+            run_u8tc_gemm(is_sm80, M, (int)wide_N, K,
+                d_db_bytes[1], (int)K, d_query_packed, (int)K, d_gemm_out, (int)M);
+            accumulate_db1_kernel<<<acc_blocks, acc_threads>>>(d_accum, d_gemm_out, M, N);
+            CUDA_CHECK(cudaMemcpy(h_result.data(), d_accum,
+                                  output_elems * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double e2e_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+
+        // Effective throughput: DB_uint16_size * batch / E2E time
         double db_bytes = double(M) * K * sizeof(uint16_t);
-        double queries_per_sec = N / (avg_ms / 1000.0);
-        double eff_tput_gbs = (db_bytes * N) / (avg_ms / 1000.0) / 1.0e9;
+        double e2e_qps = N / (e2e_ms / 1000.0);
+        double eff_tput_gbs = (db_bytes * N) / (e2e_ms / 1000.0) / 1.0e9;
 
-        // HW BW: 2 DB byte reads (M*K each) + 2 packed query reads (K*8N each)
-        //       + 2 GEMM output writes (M*8N*4 each) + accum read/writes
+        // HW BW: based on compute time (GPU utilization metric)
         double hw_bw_gbs = (
             2.0 * double(M) * K +                          // 2 DB byte slices
             2.0 * double(K) * wide_N +                     // packed query read 2x
             2.0 * double(M) * wide_N * sizeof(int32_t) +   // GEMM output write 2x
             3.0 * double(M) * N * sizeof(uint64_t)          // accum: 1 write + 1 read + 1 RMW
-        ) / (avg_ms / 1000.0) / 1.0e9;
+        ) / (comp_ms / 1000.0) / 1.0e9;
 
         std::cout << std::setw(8) << N
-                  << std::setw(14) << std::fixed << std::setprecision(2) << avg_ms
-                  << std::setw(14) << std::fixed << std::setprecision(0) << queries_per_sec
+                  << std::setw(12) << std::fixed << std::setprecision(2) << comp_ms
+                  << std::setw(12) << std::fixed << std::setprecision(2) << e2e_ms
+                  << std::setw(12) << std::fixed << std::setprecision(0) << e2e_qps
                   << std::setw(18) << std::fixed << std::setprecision(1) << eff_tput_gbs
                   << std::setw(18) << std::fixed << std::setprecision(1) << hw_bw_gbs
                   << std::endl;
 
-        CUDA_CHECK(cudaEventDestroy(start));
-        CUDA_CHECK(cudaEventDestroy(stop));
-
+        CUDA_CHECK(cudaFree(d_query_raw));
         CUDA_CHECK(cudaFree(d_query_packed));
         CUDA_CHECK(cudaFree(d_gemm_out));
         CUDA_CHECK(cudaFree(d_accum));
@@ -1592,9 +1763,11 @@ void run_db16_q64_tc_cutlass(uint64_t M, uint64_t K, const std::vector<int>& bat
 
     for (int i = 0; i < 2; i++)
         CUDA_CHECK(cudaFree(d_db_bytes[i]));
-    std::cout << std::string(72, '-') << std::endl;
-    std::cout << "Eff Tput = (DB_uint16_size * batch) / time  [amortized]" << std::endl;
-    std::cout << "HW BW   = (2*db_bytes + 2*packed_query + 2*gemm_out + accum) / time" << std::endl;
+    std::cout << std::string(80, '-') << std::endl;
+    std::cout << "Comp    = GPU compute only (no PCIe)" << std::endl;
+    std::cout << "E2E     = H->D query upload + compute + D->H result download" << std::endl;
+    std::cout << "Eff Tput = (DB_uint16_size * batch) / E2E_time  [amortized]" << std::endl;
+    std::cout << "HW BW   = (2*db_bytes + 2*packed_query + 2*gemm_out + accum) / comp_time" << std::endl;
 }
 
 // ---------- Argument parsing ----------
