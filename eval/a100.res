@@ -901,3 +901,43 @@ Result:
     "stdDevServerTimeMs": 0.0
   }
 }
+
+
+# new inspiring 
+
+Hint Prep. Throughput 7.68 GB/sec
+Throughput: 2748.09 GB/sec
+Word InspiRING Step1(TC)=24.4 ms, total=123.2 ms, packing_overhead=98.8 ms (64 clients, 256 streams)
+Measurement completed. See the README for details on what the following fields mean.
+Result:
+{
+  "offline": {
+    "uploadBytes": 0,
+    "downloadBytes": 0,
+    "serverTimeMs": 239055,
+    "clientTimeMs": 0,
+    "simplepirPrepTimeMs": 732,
+    "simplepirHintBytes": 0,
+    "doublepirHintBytes": 0
+  },
+  "online": {
+    "uploadBytes": 610304,
+    "downloadBytes": 18874368,
+    "simplepirQueryBytes": 0,
+    "doublepirQueryBytes": 0,
+    "simplepirRespBytes": 0,
+    "doublepirRespBytes": 0,
+    "serverTimeMs": 131,
+    "clientQueryGenTimeMs": 958,
+    "clientDecodeTimeMs": 11,
+    "firstPassTimeMs": 128,
+    "secondPassTimeMs": 0,
+    "ringPackingTimeMs": 0,
+    "sqrtNBytes": 0,
+    "allServerTimesMs": [
+      131
+    ],
+    "stdDevServerTimeMs": 0.0
+  }
+}
+Word InspiRING Step1(TC)=24.4 ms, total=123.2 ms, packing_overhead=98.8 ms (64 clients, 256 streams)

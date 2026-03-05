@@ -784,6 +784,14 @@ extern "C" {
 
     fn compute_hint_0_word_gpu(context: *mut std::ffi::c_void, hint_0_out: *mut u64) -> i32;
 
+    fn ypir_word_offline_get_hint_device_ptr(context: *mut std::ffi::c_void) -> *mut u64;
+    fn ypir_word_offline_take_hint_device_ptr(context: *mut std::ffi::c_void) -> *mut u64;
+    fn ypir_word_offline_take_db_device_ptrs(
+        context: *mut std::ffi::c_void,
+        out_db_stacked: *mut *mut u8,
+        out_db_u16: *mut *mut u16,
+    );
+
     fn free_word_offline_context(context: *mut std::ffi::c_void);
 }
 
@@ -847,6 +855,29 @@ impl WordOfflineContext {
         } else {
             Err("Word GPU hint_0 computation failed".to_string())
         }
+    }
+
+    /// Get the device pointer to hint_0 (d_out) without D2H copy.
+    pub fn get_hint_device_ptr(&self) -> *mut u64 {
+        unsafe { ypir_word_offline_get_hint_device_ptr(self.ctx) }
+    }
+
+    /// Take ownership of the device pointer to hint_0.
+    /// After this call, the offline context no longer owns d_out
+    /// and won't free it when dropped.
+    pub fn take_hint_device_ptr(&self) -> *mut u64 {
+        unsafe { ypir_word_offline_take_hint_device_ptr(self.ctx) }
+    }
+
+    /// Take ownership of DB device pointers (d_db_stacked, d_db_u16).
+    /// After this call, the offline context no longer owns the DB.
+    pub fn take_db_device_ptrs(&self) -> (*mut u8, *mut u16) {
+        let mut stacked: *mut u8 = std::ptr::null_mut();
+        let mut u16_ptr: *mut u16 = std::ptr::null_mut();
+        unsafe {
+            ypir_word_offline_take_db_device_ptrs(self.ctx, &mut stacked, &mut u16_ptr);
+        }
+        (stacked, u16_ptr)
     }
 }
 
@@ -922,6 +953,63 @@ extern "C" {
         gen_pows: *const u32, num_rotations: usize,
     );
 
+    fn ypir_word_online_init_packing_inspir_from_gpu(
+        context: *mut std::ffi::c_void,
+        d_bold_t_condensed: *mut u64,
+        d_bold_t_bar_condensed: *mut u64,
+        d_bold_t_hat_condensed: *mut u64,
+        d_a_hat: *mut u64,
+        num_iter: usize,
+        tables: *const u32, num_tables: usize,
+        gen_pows: *const u32, num_rotations: usize,
+    );
+
+    // InspiRING GPU precomputation
+    fn inspir_precomp_init(
+        d_hint_0: *const u64,
+        db_cols: u32,
+        poly_len: u32,
+        crt_count: u32,
+        t_exp_left: u32,
+        modulus_log2: u32,
+        q2_bits: u32,
+        num_outputs: u32,
+        moduli: *const u64,
+        barrett_cr: *const u64,
+        forward_table: *const u64,
+        forward_prime_table: *const u64,
+        inverse_table: *const u64,
+        inverse_prime_table: *const u64,
+        mod0_inv_mod1: u64,
+        mod1_inv_mod0: u64,
+        barrett_cr_0_modulus: u64,
+        barrett_cr_1_modulus: u64,
+        modulus: u64,
+        w_mask: *const u64,
+        v_mask: *const u64,
+        mod_inv_poly: *const u64,
+        tables: *const u32,
+        num_tables: u32,
+        gen_pows: *const u32,
+        gen_pows_len: u32,
+    ) -> *mut std::ffi::c_void;
+
+    fn inspir_precomp_compute(context: *mut std::ffi::c_void);
+
+    fn inspir_precomp_get_results(
+        context: *mut std::ffi::c_void,
+        out_bold_t: *mut *mut u64,
+        out_bold_t_bar: *mut *mut u64,
+        out_bold_t_hat: *mut *mut u64,
+        out_a_hat: *mut *mut u64,
+        out_bold_t_size: *mut usize,
+        out_bold_t_bar_size: *mut usize,
+        out_bold_t_hat_size: *mut usize,
+        out_a_hat_size: *mut usize,
+    );
+
+    fn inspir_precomp_free(context: *mut std::ffi::c_void, free_outputs: bool);
+
     fn ypir_word_online_compute_batch_inspir(
         context: *mut std::ffi::c_void,
         queries: *const u64,
@@ -930,6 +1018,12 @@ extern "C" {
         response_out: *mut u8,
         response_bytes_per_batch: usize,
         batch_size: usize,
+    );
+
+    fn ypir_word_online_adopt_db(
+        context: *mut std::ffi::c_void,
+        d_db_stacked: *mut u8,
+        d_db_u16: *mut u16,
     );
 
     fn ypir_word_online_free(context: *mut std::ffi::c_void);
@@ -1005,6 +1099,71 @@ impl WordOnlineContext {
         }
 
         Ok(Self { ctx, poly_len, db_cols, num_rlwe_outputs })
+    }
+
+    /// Like `new` but skips DB upload. Call `adopt_db` afterwards with device ptrs.
+    pub fn new_no_db(
+        db_rows: usize,
+        db_rows_padded: usize,
+        db_cols: usize,
+        t_exp_left: usize,
+        rlwe_q_prime_1: u64,
+        rlwe_q_prime_2: u64,
+        params: &spiral_rs::params::Params,
+        max_batch_size: usize,
+        apply_inv_n: bool,
+    ) -> Result<Self, String> {
+        let poly_len = params.poly_len;
+        let crt_count = params.crt_count;
+        let num_rlwe_outputs = db_cols / poly_len;
+        let inv_n = if apply_inv_n {
+            spiral_rs::number_theory::invert_uint_mod(poly_len as u64, params.modulus)
+                .expect("Failed to compute inv_N mod Q")
+        } else {
+            1u64
+        };
+
+        let (forward_table, forward_prime_table, inverse_table, inverse_prime_table) =
+            SPOnlineContext::flatten_ntt_tables(params);
+
+        let ctx = unsafe {
+            ypir_word_online_init(
+                std::ptr::null(),  // null DB → skip upload
+                db_rows,
+                db_rows_padded,
+                db_cols,
+                t_exp_left,
+                rlwe_q_prime_1,
+                rlwe_q_prime_2,
+                poly_len as u32,
+                crt_count as u32,
+                params.moduli.as_ptr(),
+                params.barrett_cr_1.as_ptr(),
+                forward_table.as_ptr(),
+                forward_prime_table.as_ptr(),
+                inverse_table.as_ptr(),
+                inverse_prime_table.as_ptr(),
+                params.mod0_inv_mod1,
+                params.mod1_inv_mod0,
+                params.barrett_cr_0_modulus,
+                params.barrett_cr_1_modulus,
+                max_batch_size,
+                inv_n,
+            )
+        };
+
+        if ctx.is_null() {
+            return Err("Failed to initialize Word online GPU context (no DB)".to_string());
+        }
+
+        Ok(Self { ctx, poly_len, db_cols, num_rlwe_outputs })
+    }
+
+    /// Adopt DB device pointers from offline context (avoids second DB upload).
+    pub fn adopt_db(&self, d_db_stacked: *mut u8, d_db_u16: *mut u16) {
+        unsafe {
+            ypir_word_online_adopt_db(self.ctx, d_db_stacked, d_db_u16);
+        }
     }
 
     pub fn init_packing(
@@ -1144,6 +1303,28 @@ impl WordOnlineContext {
         intermediate
     }
 
+    /// Initialize InspiRING packing from GPU device pointers (zero-copy from precomp).
+    /// The online context adopts ownership of the device pointers.
+    pub fn init_packing_inspir_from_gpu(
+        &self,
+        precomp: &mut InspirPrecompContext,
+        tables: &[u32],
+        num_tables: usize,
+        gen_pows: &[u32],
+    ) {
+        let (d_bt, d_btb, d_bth, d_ah) = precomp.take_device_ptrs();
+        let num_iter = self.poly_len / 2 - 1;
+        unsafe {
+            ypir_word_online_init_packing_inspir_from_gpu(
+                self.ctx,
+                d_bt, d_btb, d_bth, d_ah,
+                num_iter,
+                tables.as_ptr(), num_tables,
+                gen_pows.as_ptr(), gen_pows.len(),
+            );
+        }
+    }
+
     pub fn num_rlwe_outputs(&self) -> usize {
         self.num_rlwe_outputs
     }
@@ -1158,6 +1339,112 @@ impl Drop for WordOnlineContext {
     fn drop(&mut self) {
         if !self.ctx.is_null() {
             unsafe { ypir_word_online_free(self.ctx); }
+        }
+    }
+}
+
+// ==================== InspiRING GPU Precomputation ====================
+
+#[cfg(feature = "cuda")]
+pub struct InspirPrecompContext {
+    ctx: *mut std::ffi::c_void,
+    outputs_taken: bool,
+}
+
+#[cfg(feature = "cuda")]
+unsafe impl Send for InspirPrecompContext {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for InspirPrecompContext {}
+
+#[cfg(feature = "cuda")]
+impl InspirPrecompContext {
+    pub fn new(
+        d_hint_0: *const u64,
+        db_cols: u32,
+        params: &spiral_rs::params::Params,
+        num_outputs: u32,
+        w_mask: &[u64],
+        v_mask: &[u64],
+        mod_inv_poly: &[u64],
+        tables: &[u32],
+        num_tables: u32,
+        gen_pows: &[u32],
+    ) -> Self {
+        let poly_len = params.poly_len as u32;
+        let crt_count = params.crt_count as u32;
+        let t_exp_left = params.t_exp_left as u32;
+
+        let (forward_table, forward_prime_table, inverse_table, inverse_prime_table) =
+            SPOnlineContext::flatten_ntt_tables(params);
+
+        let ctx = unsafe {
+            inspir_precomp_init(
+                d_hint_0,
+                db_cols,
+                poly_len,
+                crt_count,
+                t_exp_left,
+                params.modulus_log2 as u32,
+                params.q2_bits as u32,
+                num_outputs,
+                params.moduli.as_ptr(),
+                params.barrett_cr_1.as_ptr(),
+                forward_table.as_ptr(),
+                forward_prime_table.as_ptr(),
+                inverse_table.as_ptr(),
+                inverse_prime_table.as_ptr(),
+                params.mod0_inv_mod1,
+                params.mod1_inv_mod0,
+                params.barrett_cr_0_modulus,
+                params.barrett_cr_1_modulus,
+                params.modulus,
+                w_mask.as_ptr(),
+                v_mask.as_ptr(),
+                mod_inv_poly.as_ptr(),
+                tables.as_ptr(),
+                num_tables,
+                gen_pows.as_ptr(),
+                gen_pows.len() as u32,
+            )
+        };
+
+        Self { ctx, outputs_taken: false }
+    }
+
+    pub fn compute(&self) {
+        unsafe { inspir_precomp_compute(self.ctx); }
+    }
+
+    /// Take ownership of the output device pointers.
+    /// Returns (d_bold_t, d_bold_t_bar, d_bold_t_hat, d_a_hat).
+    pub fn take_device_ptrs(&mut self) -> (*mut u64, *mut u64, *mut u64, *mut u64) {
+        let mut d_bt: *mut u64 = std::ptr::null_mut();
+        let mut d_btb: *mut u64 = std::ptr::null_mut();
+        let mut d_bth: *mut u64 = std::ptr::null_mut();
+        let mut d_ah: *mut u64 = std::ptr::null_mut();
+        let mut sz1: usize = 0;
+        let mut sz2: usize = 0;
+        let mut sz3: usize = 0;
+        let mut sz4: usize = 0;
+
+        unsafe {
+            inspir_precomp_get_results(
+                self.ctx,
+                &mut d_bt, &mut d_btb, &mut d_bth, &mut d_ah,
+                &mut sz1, &mut sz2, &mut sz3, &mut sz4,
+            );
+        }
+        self.outputs_taken = true;
+        (d_bt, d_btb, d_bth, d_ah)
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for InspirPrecompContext {
+    fn drop(&mut self) {
+        if !self.ctx.is_null() {
+            // If outputs were taken (transferred to online context), don't free them
+            unsafe { inspir_precomp_free(self.ctx, !self.outputs_taken); }
         }
     }
 }

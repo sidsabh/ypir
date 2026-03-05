@@ -34,6 +34,7 @@ fn compile_cuda() {
     println!("cargo:rerun-if-changed=src/cuda/online_kernel_sp.cu");
     println!("cargo:rerun-if-changed=src/cuda/offline_kernel_word.cu");
     println!("cargo:rerun-if-changed=src/cuda/online_kernel_word.cu");
+    println!("cargo:rerun-if-changed=src/cuda/offline_inspir_precomp.cu");
     println!("cargo:rerun-if-changed=src/cuda/ntt.cuh");
 
     let out_dir = env::var("OUT_DIR").unwrap();
@@ -73,6 +74,7 @@ fn compile_cuda() {
     nvcc_args.push("src/cuda/offline_kernel_sp.cu".into());
     nvcc_args.push("src/cuda/offline_kernel_word.cu".into());
     nvcc_args.push("src/cuda/online_kernel_word.cu".into());
+    nvcc_args.push("src/cuda/offline_inspir_precomp.cu".into());
 
     if cutlass_enabled {
         // SimplePIR CUTLASS variant

@@ -422,6 +422,36 @@ int compute_hint_0_word_gpu(void* context, uint64_t* hint_0_out)
     return 0;
 }
 
+// Get device pointer to d_out (hint_0 on GPU) without copying to host.
+// Returns nullptr if context is null.
+uint64_t* ypir_word_offline_get_hint_device_ptr(void* context)
+{
+    WordOfflineContext* ctx = (WordOfflineContext*)context;
+    if (!ctx) return nullptr;
+    return ctx->d_out;
+}
+
+// Transfer ownership of d_out to caller (won't be freed by free_word_offline_context).
+uint64_t* ypir_word_offline_take_hint_device_ptr(void* context)
+{
+    WordOfflineContext* ctx = (WordOfflineContext*)context;
+    if (!ctx) return nullptr;
+    uint64_t* ptr = ctx->d_out;
+    ctx->d_out = nullptr;  // prevent double-free
+    return ptr;
+}
+
+// Transfer ownership of DB device pointers to caller (won't be freed by free_word_offline_context).
+void ypir_word_offline_take_db_device_ptrs(void* context, uint8_t** out_db_stacked, uint16_t** out_db_u16)
+{
+    WordOfflineContext* ctx = (WordOfflineContext*)context;
+    if (!ctx) { *out_db_stacked = nullptr; *out_db_u16 = nullptr; return; }
+    *out_db_stacked = ctx->d_db_stacked;
+    *out_db_u16 = ctx->d_db_u16;
+    ctx->d_db_stacked = nullptr;
+    ctx->d_db_u16 = nullptr;
+}
+
 void free_word_offline_context(void* context)
 {
     WordOfflineContext* ctx = (WordOfflineContext*)context;

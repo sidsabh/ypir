@@ -548,7 +548,7 @@ __global__ void inspir_transpose_bold_t(
 #define FIP_TILE_D 32  // d-values per shared memory tile (16KB smem → 2 blocks/SM)
 #define FIP_TILE_Z 32  // z-values per block (= warp size)
 
-__global__ void
+__global__ void __launch_bounds__(256)
 inspir_fused_expand_ip(
     uint64_t* __restrict__ d_scratch_base,       // contiguous scratch [batch, num_outputs, scratch_per_output]
     const uint64_t* __restrict__ d_bold_t,       // [num_outputs, D, poly_len] — SHARED across all clients
@@ -809,37 +809,60 @@ inspir_fused_multi_output(
     }
 }
 
-// Dispatch helper for multi-output kernel
+// Dispatch helper for multi-output kernel.
+// Queries actual register usage via cudaFuncGetAttributes to compute safe batch_per_block.
 static void launch_multi_output_kernel(
     size_t num_outputs,
-    dim3 grid, dim3 block, cudaStream_t stream,
+    size_t chunk_size,
+    size_t poly_len,
+    cudaStream_t stream,
     uint64_t* scratch, const uint64_t* bold_t, const uint64_t* bold_t_bar,
     const uint64_t* bold_t_hat, const uint64_t* y_body, const uint64_t* z_body,
     const uint32_t* tables, const uint32_t* gen_pows,
-    size_t batch_size, size_t D, size_t poly_len, size_t t_exp_left,
+    size_t batch_size, size_t D, size_t t_exp_left,
     size_t inspir_spo, size_t ybs, size_t zbs, size_t ss, NTTParams params)
 {
-    #define LAUNCH_MO(N) \
+    cudaFuncAttributes attr;
+    size_t batch_per_block;
+
+    #define QUERY_AND_LAUNCH_MO(N) do { \
+        CUDA_ASSERT(cudaFuncGetAttributes(&attr, inspir_fused_multi_output<N>)); \
+        { \
+            int regs = attr.numRegs; \
+            int dev; cudaGetDevice(&dev); \
+            cudaDeviceProp prop; cudaGetDeviceProperties(&prop, dev); \
+            size_t max_threads = (size_t)prop.regsPerBlock / (regs > 0 ? regs : 1); \
+            if (max_threads > (size_t)prop.maxThreadsPerBlock) \
+                max_threads = prop.maxThreadsPerBlock; \
+            batch_per_block = max_threads / 32; \
+            if (batch_per_block > chunk_size) batch_per_block = chunk_size; \
+            if (batch_per_block < 1) batch_per_block = 1; \
+        } \
+        dim3 block(32, batch_per_block); \
+        dim3 grid((poly_len + 31) / 32, \
+                  (chunk_size + batch_per_block - 1) / batch_per_block); \
         inspir_fused_multi_output<N><<<grid, block, 0, stream>>>( \
             scratch, bold_t, bold_t_bar, bold_t_hat, y_body, z_body, \
             tables, gen_pows, batch_size, D, poly_len, t_exp_left, \
-            inspir_spo, ybs, zbs, ss, params)
+            inspir_spo, ybs, zbs, ss, params); \
+    } while(0)
+
     switch (num_outputs) {
-        case 2:  LAUNCH_MO(2);  break;
-        case 3:  LAUNCH_MO(3);  break;
-        case 4:  LAUNCH_MO(4);  break;
-        case 6:  LAUNCH_MO(6);  break;
-        case 8:  LAUNCH_MO(8);  break;
-        case 12: LAUNCH_MO(12); break;
-        case 16: LAUNCH_MO(16); break;
-        case 18: LAUNCH_MO(18); break;
-        case 24: LAUNCH_MO(24); break;
-        case 32: LAUNCH_MO(32); break;
+        case 2:  QUERY_AND_LAUNCH_MO(2);  break;
+        case 3:  QUERY_AND_LAUNCH_MO(3);  break;
+        case 4:  QUERY_AND_LAUNCH_MO(4);  break;
+        case 6:  QUERY_AND_LAUNCH_MO(6);  break;
+        case 8:  QUERY_AND_LAUNCH_MO(8);  break;
+        case 12: QUERY_AND_LAUNCH_MO(12); break;
+        case 16: QUERY_AND_LAUNCH_MO(16); break;
+        case 18: QUERY_AND_LAUNCH_MO(18); break;
+        case 24: QUERY_AND_LAUNCH_MO(24); break;
+        case 32: QUERY_AND_LAUNCH_MO(32); break;
         default:
             fprintf(stderr, "ERROR: unsupported num_outputs=%zu for multi-output kernel\n", num_outputs);
             abort();
     }
-    #undef LAUNCH_MO
+    #undef QUERY_AND_LAUNCH_MO
     CUDA_ASSERT(cudaGetLastError());
 }
 
@@ -1361,19 +1384,22 @@ void* ypir_word_online_init(
     size_t max_N = max_batch_size;
 
     if (ctx->has_tensor_cores) {
-        // Upload + decompose DB to vertically stacked uint8 bytes
-        size_t db_elems = M * db_rows_padded;
-        uint16_t* d_db_raw;
-        CUDA_ALLOC_AND_COPY(d_db_raw, db, db_elems * sizeof(uint16_t));
+        if (db != nullptr) {
+            // Upload + decompose DB to vertically stacked uint8 bytes
+            size_t db_elems = M * db_rows_padded;
+            uint16_t* d_db_raw;
+            CUDA_ALLOC_AND_COPY(d_db_raw, db, db_elems * sizeof(uint16_t));
 
-        CUDA_ASSERT(cudaMalloc(&ctx->d_db_stacked, 2 * db_elems));
-        {
-            int threads = 256;
-            int blocks = (db_elems + threads - 1) / threads;
-            word_decompose_u16_stacked<<<blocks, threads>>>(ctx->d_db_stacked, d_db_raw, db_elems);
-            CUDA_ASSERT(cudaGetLastError());
+            CUDA_ASSERT(cudaMalloc(&ctx->d_db_stacked, 2 * db_elems));
+            {
+                int threads = 256;
+                int blocks = (db_elems + threads - 1) / threads;
+                word_decompose_u16_stacked<<<blocks, threads>>>(ctx->d_db_stacked, d_db_raw, db_elems);
+                CUDA_ASSERT(cudaGetLastError());
+            }
+            CUDA_ASSERT(cudaFree(d_db_raw));
         }
-        CUDA_ASSERT(cudaFree(d_db_raw));
+        // else: DB will be adopted via ypir_word_online_adopt_db
 
         // Packed query byte buffer: K × (8*max_N) contiguous
         CUDA_ASSERT(cudaMalloc(&ctx->d_query_bytes_packed, K * 8 * max_N));
@@ -1382,9 +1408,12 @@ void* ypir_word_online_init(
         CUDA_ASSERT(cudaMalloc(&ctx->d_gemm_out, 2 * M * 8 * max_N * sizeof(int32_t)));
 
     } else {
-        // SIMT: keep DB as u16
-        size_t db_size = M * db_rows_padded * sizeof(uint16_t);
-        CUDA_ALLOC_AND_COPY(ctx->d_db_u16, db, db_size);
+        if (db != nullptr) {
+            // SIMT: keep DB as u16
+            size_t db_size = M * db_rows_padded * sizeof(uint16_t);
+            CUDA_ALLOC_AND_COPY(ctx->d_db_u16, db, db_size);
+        }
+        // else: DB will be adopted via ypir_word_online_adopt_db
 
         // Pre-allocate query + result buffers (full max_batch)
         CUDA_ASSERT(cudaMalloc(&ctx->d_query_buf, max_N * db_rows_padded * sizeof(uint64_t)));
@@ -1552,6 +1581,85 @@ void ypir_word_online_init_packing_inspir(
     for (size_t i = 0; i < num_streams; i++) {
         ctx->d_scratch_batch[i] = ctx->d_scratch_contiguous + i * (scratch_bytes / sizeof(uint64_t));
     }
+
+    CUDA_ASSERT(cudaDeviceSynchronize());
+}
+
+// Variant that takes GPU device pointers directly (from inspir_precomp).
+// No cudaMalloc/cudaMemcpy for bold_t data — pointers are adopted.
+void ypir_word_online_init_packing_inspir_from_gpu(
+    void* context,
+    uint64_t* d_bold_t_condensed,
+    uint64_t* d_bold_t_bar_condensed,
+    uint64_t* d_bold_t_hat_condensed,
+    uint64_t* d_a_hat,
+    size_t num_iter,
+    const uint32_t* tables,     // host
+    size_t num_tables,
+    const uint32_t* gen_pows,   // host
+    size_t num_rotations)
+{
+    WordOnlineContext* ctx = (WordOnlineContext*)context;
+    if (!ctx) return;
+
+    ctx->is_inspir = true;
+    ctx->num_iter = num_iter;
+    size_t poly_len = ctx->ntt_params.poly_len;
+    size_t t_exp = ctx->t_exp_left;
+
+    ctx->bold_t_per_output = num_iter * t_exp * poly_len;
+    ctx->inspir_scratch_per_output = 4 * poly_len;
+    ctx->z_body_per_client = t_exp * poly_len;
+
+    // Adopt device pointers directly (ownership transfers from precomp context)
+    ctx->d_bold_t_condensed = d_bold_t_condensed;
+    ctx->d_bold_t_bar_condensed = d_bold_t_bar_condensed;
+    ctx->d_bold_t_hat_condensed = d_bold_t_hat_condensed;
+    ctx->d_a_hat = d_a_hat;
+
+    printf("InspiRING precomp adopted from GPU (zero-copy)\n");
+
+    // Upload expand tables (from host)
+    ctx->num_tables = num_tables;
+    ctx->num_rotations = num_rotations;
+    CUDA_ALLOC_AND_COPY(ctx->d_tables, tables, num_tables * poly_len * sizeof(uint32_t));
+    CUDA_ALLOC_AND_COPY(ctx->d_gen_pows, gen_pows, num_rotations * sizeof(uint32_t));
+
+    // Allocate per-stream buffers (same as host-upload variant)
+    size_t per_stream_bytes =
+        ctx->z_body_per_client * sizeof(uint64_t) +
+        ctx->z_body_per_client * sizeof(uint64_t) +
+        ctx->num_rlwe_outputs * ctx->inspir_scratch_per_output * sizeof(uint64_t);
+
+    size_t free_mem, total_mem;
+    CUDA_ASSERT(cudaMemGetInfo(&free_mem, &total_mem));
+    size_t usable = (free_mem * 9) / 10;
+
+    size_t num_streams = usable / per_stream_bytes;
+    if (num_streams < 1) {
+        fprintf(stderr, "ERROR: Not enough GPU memory for InspiRING streams\n");
+        abort();
+    }
+    if (num_streams > ctx->max_batch_size) num_streams = ctx->max_batch_size;
+    ctx->num_streams = num_streams;
+
+    printf("InspiRING GPU (from_gpu): using %zu parallel streams\n", num_streams);
+
+    ctx->streams = new cudaStream_t[num_streams];
+    for (size_t i = 0; i < num_streams; i++)
+        CUDA_ASSERT(cudaStreamCreate(&ctx->streams[i]));
+
+    size_t z_body_bytes = ctx->z_body_per_client * sizeof(uint64_t);
+    size_t scratch_bytes = ctx->num_rlwe_outputs * ctx->inspir_scratch_per_output * sizeof(uint64_t);
+
+    CUDA_ASSERT(cudaMalloc(&ctx->d_z_body_streams, num_streams * z_body_bytes));
+    CUDA_ASSERT(cudaMalloc(&ctx->d_y_body_streams, num_streams * z_body_bytes));
+
+    ctx->scratch_bytes_per_stream = scratch_bytes;
+    CUDA_ASSERT(cudaMalloc(&ctx->d_scratch_contiguous, num_streams * scratch_bytes));
+    ctx->d_scratch_batch = new uint64_t*[num_streams];
+    for (size_t i = 0; i < num_streams; i++)
+        ctx->d_scratch_batch[i] = ctx->d_scratch_contiguous + i * (scratch_bytes / sizeof(uint64_t));
 
     CUDA_ASSERT(cudaDeviceSynchronize());
 }
@@ -1988,16 +2096,8 @@ void ypir_word_online_compute_batch_inspir(
         //   → eliminates num_outputs× redundant y_body and table reads
         // Single-output: original fused kernel (bold_t in smem)
         if (num_outputs > 1) {
-            // batch_per_block=16 is the sweet spot: shares bold_t via L2 across clients,
-            // while keeping register pressure manageable (16 × 32 = 512 threads < 65K/94 regs)
-            size_t batch_per_block = chunk_size;
-            if (batch_per_block > 16) batch_per_block = 16;
-            dim3 mo_block(32, batch_per_block);
-            dim3 mo_grid((poly_len + 31) / 32,
-                         (chunk_size + batch_per_block - 1) / batch_per_block);
-
             launch_multi_output_kernel(
-                num_outputs, mo_grid, mo_block, ip_stream,
+                num_outputs, chunk_size, poly_len, ip_stream,
                 ctx->d_scratch_contiguous,
                 ctx->d_bold_t_condensed,
                 ctx->d_bold_t_bar_condensed,
@@ -2006,7 +2106,7 @@ void ypir_word_online_compute_batch_inspir(
                 ctx->d_z_body_streams,
                 ctx->d_tables,
                 ctx->d_gen_pows,
-                chunk_size, D, poly_len, ctx->t_exp_left,
+                chunk_size, D, ctx->t_exp_left,
                 ctx->inspir_scratch_per_output,
                 ctx->z_body_per_client,
                 ctx->z_body_per_client,
@@ -2101,6 +2201,21 @@ void ypir_word_online_compute_batch_inspir(
     CUDA_ASSERT(cudaMemcpy(response_out, ctx->d_all_responses,
                            batch_size * resp_bytes_per_batch,
                            cudaMemcpyDeviceToHost));
+}
+
+// Adopt DB device pointers from offline context (avoids second DB upload).
+// Frees any existing DB allocations in the online context first.
+void ypir_word_online_adopt_db(void* context, uint8_t* d_db_stacked, uint16_t* d_db_u16)
+{
+    WordOnlineContext* ctx = (WordOnlineContext*)context;
+    if (!ctx) return;
+
+    // Free existing DB allocations if any
+    if (ctx->d_db_stacked) { cudaFree(ctx->d_db_stacked); ctx->d_db_stacked = nullptr; }
+    if (ctx->d_db_u16)     { cudaFree(ctx->d_db_u16);     ctx->d_db_u16 = nullptr; }
+
+    ctx->d_db_stacked = d_db_stacked;
+    ctx->d_db_u16 = d_db_u16;
 }
 
 void ypir_word_online_free(void* context)

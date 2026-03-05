@@ -1153,9 +1153,9 @@ where
 
         let simplepir_prep_time_ms: u128;
 
-        // GPU path: hint_0 is computed on GPU (already CRT-packed)
+        // GPU path: hint_0 is computed on GPU
         #[cfg(feature = "cuda")]
-        let hint_0_packed: Vec<u64> = {
+        let (hint_0_packed, gpu_offline_ctx): (Vec<u64>, Option<crate::cuda::WordOfflineContext>) = {
             let init_start = Instant::now();
             let db_rows = 1 << (params.db_dim_1 + params.poly_len_log2);
             let db_rows_padded = self.db_rows_padded();
@@ -1175,12 +1175,14 @@ where
             let init_time = init_start.elapsed();
 
             let compute_start = Instant::now();
-            let result = gpu_ctx.compute_hint_0().expect("Word GPU hint_0 failed");
-            let compute_time = compute_start.elapsed();
-
-            debug!("Word offline GPU init: {:?}, compute: {:?}", init_time, compute_time);
-            simplepir_prep_time_ms = compute_time.as_millis();
-            result
+            {
+                let result = gpu_ctx.compute_hint_0().expect("Word GPU hint_0 failed");
+                let compute_time = compute_start.elapsed();
+                debug!("Word offline GPU init: {:?}, compute: {:?}", init_time, compute_time);
+                simplepir_prep_time_ms = compute_time.as_millis();
+                // Keep gpu_ctx alive: InspiRING needs d_hint_0, and both paths reuse DB
+                (result, Some(gpu_ctx))
+            }
         };
 
         // CPU path: compute hint_0 then CRT-pack
@@ -1206,63 +1208,76 @@ where
 
         // With apply_inv_n=false for InspiRING, the GPU hint already has the correct scaling.
 
-        let now = Instant::now();
+        // For CUDA + InspiRING: PackParams is needed for tables/gen_pows, but prep_pack and
+        // full_packing_with_preprocessing_offline are done on GPU. For CPU or CDKS: do full CPU path.
+        let gamma = params.poly_len;
 
-        let combined = [&hint_0_packed[..], &vec![0u64; db_cols]].concat();
-        assert_eq!(combined.len(), db_cols * (params.poly_len + 1));
-        let prepacked_lwe = prep_pack_many_lwes(&params, &combined, num_rlwe_outputs);
+        #[cfg(feature = "cuda")]
+        let skip_cpu_inspir_precomp = packing == PackingType::InspiRING;
+        #[cfg(not(feature = "cuda"))]
+        let skip_cpu_inspir_precomp = false;
 
-        debug!("Precomp in {} us", now.elapsed().as_micros());
-        let (precomp, y_constants, fake_pack_pub_params) = if packing == PackingType::CDKS {
-            let fake_pack_pub_params = generate_fake_pack_pub_params(&params);
-            let y_constants = generate_y_constants(&params);
-            let mut precomp: Precomp = Vec::new();
-            for i in 0..prepacked_lwe.len() {
-                let tup = precompute_pack(
-                    params,
-                    params.poly_len_log2,
-                    &prepacked_lwe[i],
-                    &fake_pack_pub_params,
-                    &y_constants,
-                );
-                precomp.push(tup);
-            }
-            (precomp, generate_y_constants(&params), fake_pack_pub_params)
+        // prep_pack_many_lwes and CDKS precomp (skip for GPU InspiRING path)
+        let (prepacked_lwe, precomp, y_constants, fake_pack_pub_params) = if skip_cpu_inspir_precomp {
+            // GPU InspiRING: skip CPU prep_pack entirely — GPU does it directly from d_hint_0
+            (vec![], Vec::new(), (Vec::new(), Vec::new()), Vec::new())
         } else {
-            (Vec::new(), (Vec::new(), Vec::new()), Vec::new())
+            let now = Instant::now();
+            let combined = [&hint_0_packed[..], &vec![0u64; db_cols]].concat();
+            assert_eq!(combined.len(), db_cols * (params.poly_len + 1));
+            let prepacked = prep_pack_many_lwes(&params, &combined, num_rlwe_outputs);
+            debug!("Precomp in {} us", now.elapsed().as_micros());
+
+            if packing == PackingType::CDKS {
+                let fake_pp = generate_fake_pack_pub_params(&params);
+                let yc = generate_y_constants(&params);
+                let mut pc: Precomp = Vec::new();
+                for i in 0..prepacked.len() {
+                    let tup = precompute_pack(params, params.poly_len_log2, &prepacked[i], &fake_pp, &yc);
+                    pc.push(tup);
+                }
+                (prepacked, pc, generate_y_constants(&params), fake_pp)
+            } else {
+                (prepacked, Vec::new(), (Vec::new(), Vec::new()), Vec::new())
+            }
         };
 
-        // InspiRING offline precomputation
-        let gamma = params.poly_len;
+        // InspiRING offline precomputation (CPU path only — GPU path runs in CUDA block below)
         let (inspir_packing_params, inspir_precomp_vec) = if packing == PackingType::InspiRING {
             let packing_params = PackParams::new(&params, gamma);
-            let offline_packing_keys = OfflinePackingKeys::init_full(&packing_params, crate::scheme::W_SEED, crate::scheme::V_SEED);
 
-            let now_precomp = Instant::now();
-            let mut precomp_vec = Vec::with_capacity(num_rlwe_outputs);
-            for i in 0..num_rlwe_outputs {
-                let mut a_ct_tilde = Vec::new();
-                for j in 0..gamma {
-                    if j < prepacked_lwe[i].len() {
-                        a_ct_tilde.push(prepacked_lwe[i][j].submatrix(0, 0, 1, 1));
+            if skip_cpu_inspir_precomp {
+                // GPU will do the precomp — just need packing_params for tables
+                (Some(packing_params), None)
+            } else {
+                let offline_packing_keys = OfflinePackingKeys::init_full(&packing_params, crate::scheme::W_SEED, crate::scheme::V_SEED);
+
+                let now_precomp = Instant::now();
+                let mut precomp_vec = Vec::with_capacity(num_rlwe_outputs);
+                for i in 0..num_rlwe_outputs {
+                    let mut a_ct_tilde = Vec::new();
+                    for j in 0..gamma {
+                        if j < prepacked_lwe[i].len() {
+                            a_ct_tilde.push(prepacked_lwe[i][j].submatrix(0, 0, 1, 1));
+                        }
                     }
+
+                    let w_all = offline_packing_keys.w_all.as_ref().unwrap();
+                    let w_bar_all = offline_packing_keys.w_bar_all.as_ref().unwrap();
+                    let v_mask = offline_packing_keys.v_mask.as_ref().unwrap();
+
+                    let precomp_i = crate::packing::full_packing_with_preprocessing_offline(
+                        &packing_params,
+                        w_all,
+                        w_bar_all,
+                        v_mask,
+                        &a_ct_tilde,
+                    );
+                    precomp_vec.push(precomp_i);
                 }
-
-                let w_all = offline_packing_keys.w_all.as_ref().unwrap();
-                let w_bar_all = offline_packing_keys.w_bar_all.as_ref().unwrap();
-                let v_mask = offline_packing_keys.v_mask.as_ref().unwrap();
-
-                let precomp_i = crate::packing::full_packing_with_preprocessing_offline(
-                    &packing_params,
-                    w_all,
-                    w_bar_all,
-                    v_mask,
-                    &a_ct_tilde,
-                );
-                precomp_vec.push(precomp_i);
+                debug!("InspiRING precomp in {} us", now_precomp.elapsed().as_micros());
+                (Some(packing_params), Some(precomp_vec))
             }
-            debug!("InspiRING precomp in {} us", now_precomp.elapsed().as_micros());
-            (Some(packing_params), Some(precomp_vec))
         } else {
             (None, None)
         };
@@ -1291,73 +1306,95 @@ where
             let db_rows_padded = self.db_rows_padded();
 
             // Initialize Word CUDA online context
+            // Reuse DB from offline context if available (avoids second DB upload)
             let word_cuda_context = {
                 debug!("Initializing Word CUDA online context...");
-                match crate::cuda::WordOnlineContext::new(
-                    self.db_u16(),
-                    db_rows,
-                    db_rows_padded,
-                    db_cols,
-                    params.t_exp_left,
-                    params.get_q_prime_1(),
-                    params.get_q_prime_2(),
-                    params,
-                    256, // max_batch_size
-                    packing != PackingType::InspiRING,
-                ) {
+                let has_offline_db = gpu_offline_ctx.is_some();
+                let init_result = if has_offline_db {
+                    crate::cuda::WordOnlineContext::new_no_db(
+                        db_rows,
+                        db_rows_padded,
+                        db_cols,
+                        params.t_exp_left,
+                        params.get_q_prime_1(),
+                        params.get_q_prime_2(),
+                        params,
+                        256,
+                        packing != PackingType::InspiRING,
+                    )
+                } else {
+                    crate::cuda::WordOnlineContext::new(
+                        self.db_u16(),
+                        db_rows,
+                        db_rows_padded,
+                        db_cols,
+                        params.t_exp_left,
+                        params.get_q_prime_1(),
+                        params.get_q_prime_2(),
+                        params,
+                        256,
+                        packing != PackingType::InspiRING,
+                    )
+                };
+                match init_result {
                     Ok(ctx) => {
+                        // Adopt DB device pointers from offline context (avoids second upload)
+                        if has_offline_db {
+                            let (d_db_stacked, d_db_u16) = gpu_offline_ctx.as_ref().unwrap().take_db_device_ptrs();
+                            ctx.adopt_db(d_db_stacked, d_db_u16);
+                            debug!("Online context adopted DB from offline (zero-copy)");
+                        }
+
                         if packing == PackingType::InspiRING {
-                            // InspiRING: upload bold_t, bold_t_bar, bold_t_hat, a_hat
-                            let inspir_vec = inspir_precomp_vec.as_ref().unwrap();
-                            let mut bold_t_flat = Vec::new();
-                            let mut bold_t_bar_flat = Vec::new();
-                            let mut bold_t_hat_flat = Vec::new();
-                            let mut a_hat_flat = Vec::new();
-
-                            for precomp_i in inspir_vec {
-                                for row in 0..precomp_i.bold_t_condensed.rows {
-                                    for col in 0..precomp_i.bold_t_condensed.cols {
-                                        let poly = precomp_i.bold_t_condensed.get_poly(row, col);
-                                        bold_t_flat.extend_from_slice(&poly[..params.poly_len]);
-                                    }
-                                }
-                                for row in 0..precomp_i.bold_t_bar_condensed.rows {
-                                    for col in 0..precomp_i.bold_t_bar_condensed.cols {
-                                        let poly = precomp_i.bold_t_bar_condensed.get_poly(row, col);
-                                        bold_t_bar_flat.extend_from_slice(&poly[..params.poly_len]);
-                                    }
-                                }
-                                for row in 0..precomp_i.bold_t_hat_condensed.rows {
-                                    for col in 0..precomp_i.bold_t_hat_condensed.cols {
-                                        let poly = precomp_i.bold_t_hat_condensed.get_poly(row, col);
-                                        bold_t_hat_flat.extend_from_slice(&poly[..params.poly_len]);
-                                    }
-                                }
-                                a_hat_flat.extend_from_slice(precomp_i.a_hat.get_poly(0, 0));
-                            }
-
-                            let num_iter = params.poly_len / 2 - 1;
-
-                            // Flatten permutation tables and gen_pows for GPU expand
+                            // GPU InspiRING precomputation — runs entirely on GPU
                             let pp = inspir_packing_params.as_ref().unwrap();
+                            let offline_keys = OfflinePackingKeys::init_full(pp, crate::scheme::W_SEED, crate::scheme::V_SEED);
+
+                            // Flatten packing keys for GPU upload
+                            let w_mask_flat: Vec<u64> = offline_keys.w_mask.as_ref().unwrap().as_slice().to_vec();
+                            let v_mask_flat: Vec<u64> = offline_keys.v_mask.as_ref().unwrap().as_slice().to_vec();
+                            let mod_inv_poly_flat: Vec<u64> = pp.mod_inv_poly.as_slice().to_vec();
+
                             let tables_flat: Vec<u32> = pp.tables.iter()
                                 .flat_map(|t| t.iter().map(|&v| v as u32))
                                 .collect();
                             let num_tables = pp.tables.len();
-                            let gen_pows_flat: Vec<u32> = pp.gen_pows[..num_iter]
-                                .iter()
+                            let gen_pows_flat: Vec<u32> = pp.gen_pows.iter()
                                 .map(|&v| v as u32)
                                 .collect();
 
-                            ctx.init_packing_inspir(
-                                &bold_t_flat,
-                                &bold_t_bar_flat,
-                                &bold_t_hat_flat,
-                                &a_hat_flat,
-                                num_iter,
+                            // Get hint_0 device pointer from the offline context
+                            let d_hint_0 = gpu_offline_ctx.as_ref()
+                                .expect("GPU offline context needed for InspiRING GPU precomp")
+                                .get_hint_device_ptr();
+
+                            let now_gpu_precomp = Instant::now();
+                            let mut inspir_gpu = crate::cuda::InspirPrecompContext::new(
+                                d_hint_0 as *const u64,
+                                db_cols as u32,
+                                params,
+                                num_rlwe_outputs as u32,
+                                &w_mask_flat,
+                                &v_mask_flat,
+                                &mod_inv_poly_flat,
+                                &tables_flat,
+                                num_tables as u32,
+                                &gen_pows_flat,
+                            );
+                            inspir_gpu.compute();
+                            debug!("GPU InspiRING precomp in {} us", now_gpu_precomp.elapsed().as_micros());
+
+                            // Transfer GPU results directly to online context (zero-copy)
+                            let num_iter = params.poly_len / 2 - 1;
+                            let gen_pows_for_online: Vec<u32> = pp.gen_pows[..num_iter]
+                                .iter()
+                                .map(|&v| v as u32)
+                                .collect();
+                            ctx.init_packing_inspir_from_gpu(
+                                &mut inspir_gpu,
                                 &tables_flat,
                                 num_tables,
-                                &gen_pows_flat,
+                                &gen_pows_for_online,
                             );
                         } else {
                             // CDKS: flatten packing data (same as SP path)
