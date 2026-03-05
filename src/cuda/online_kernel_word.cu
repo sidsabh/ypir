@@ -686,7 +686,7 @@ inspir_fused_expand_ip(
 // Templated on NUM_OUTPUTS so compiler can keep accumulators in registers.
 
 template <int NUM_OUTPUTS>
-__global__ void
+__global__ void __launch_bounds__(256)
 inspir_fused_multi_output(
     uint64_t* __restrict__ d_scratch_base,
     const uint64_t* __restrict__ d_bold_t,
@@ -822,47 +822,39 @@ static void launch_multi_output_kernel(
     size_t batch_size, size_t D, size_t t_exp_left,
     size_t inspir_spo, size_t ybs, size_t zbs, size_t ss, NTTParams params)
 {
-    cudaFuncAttributes attr;
     size_t batch_per_block;
+    if      (num_outputs <= 4)  batch_per_block = 8;
+    else if (num_outputs <= 8)  batch_per_block = 4;
+    else if (num_outputs <= 16) batch_per_block = 2;
+    else                        batch_per_block = 1;
+    if (batch_per_block > chunk_size) batch_per_block = chunk_size;
 
-    #define QUERY_AND_LAUNCH_MO(N) do { \
-        CUDA_ASSERT(cudaFuncGetAttributes(&attr, inspir_fused_multi_output<N>)); \
-        { \
-            int regs = attr.numRegs; \
-            int dev; cudaGetDevice(&dev); \
-            cudaDeviceProp prop; cudaGetDeviceProperties(&prop, dev); \
-            size_t max_threads = (size_t)prop.regsPerBlock / (regs > 0 ? regs : 1); \
-            if (max_threads > (size_t)prop.maxThreadsPerBlock) \
-                max_threads = prop.maxThreadsPerBlock; \
-            batch_per_block = max_threads / 32; \
-            if (batch_per_block > chunk_size) batch_per_block = chunk_size; \
-            if (batch_per_block < 1) batch_per_block = 1; \
-        } \
-        dim3 block(32, batch_per_block); \
-        dim3 grid((poly_len + 31) / 32, \
-                  (chunk_size + batch_per_block - 1) / batch_per_block); \
+    dim3 block(32, (unsigned)batch_per_block);
+    dim3 grid((poly_len + 31) / 32,
+              (chunk_size + batch_per_block - 1) / batch_per_block);
+
+    #define LAUNCH_MO(N) \
         inspir_fused_multi_output<N><<<grid, block, 0, stream>>>( \
             scratch, bold_t, bold_t_bar, bold_t_hat, y_body, z_body, \
             tables, gen_pows, batch_size, D, poly_len, t_exp_left, \
-            inspir_spo, ybs, zbs, ss, params); \
-    } while(0)
+            inspir_spo, ybs, zbs, ss, params)
 
     switch (num_outputs) {
-        case 2:  QUERY_AND_LAUNCH_MO(2);  break;
-        case 3:  QUERY_AND_LAUNCH_MO(3);  break;
-        case 4:  QUERY_AND_LAUNCH_MO(4);  break;
-        case 6:  QUERY_AND_LAUNCH_MO(6);  break;
-        case 8:  QUERY_AND_LAUNCH_MO(8);  break;
-        case 12: QUERY_AND_LAUNCH_MO(12); break;
-        case 16: QUERY_AND_LAUNCH_MO(16); break;
-        case 18: QUERY_AND_LAUNCH_MO(18); break;
-        case 24: QUERY_AND_LAUNCH_MO(24); break;
-        case 32: QUERY_AND_LAUNCH_MO(32); break;
+        case 2:  LAUNCH_MO(2);  break;
+        case 3:  LAUNCH_MO(3);  break;
+        case 4:  LAUNCH_MO(4);  break;
+        case 6:  LAUNCH_MO(6);  break;
+        case 8:  LAUNCH_MO(8);  break;
+        case 12: LAUNCH_MO(12); break;
+        case 16: LAUNCH_MO(16); break;
+        case 18: LAUNCH_MO(18); break;
+        case 24: LAUNCH_MO(24); break;
+        case 32: LAUNCH_MO(32); break;
         default:
             fprintf(stderr, "ERROR: unsupported num_outputs=%zu for multi-output kernel\n", num_outputs);
             abort();
     }
-    #undef QUERY_AND_LAUNCH_MO
+    #undef LAUNCH_MO
     CUDA_ASSERT(cudaGetLastError());
 }
 
