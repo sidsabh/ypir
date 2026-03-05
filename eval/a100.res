@@ -940,4 +940,3 @@ Result:
     "stdDevServerTimeMs": 0.0
   }
 }
-Word InspiRING Step1(TC)=24.4 ms, total=123.2 ms, packing_overhead=98.8 ms (64 clients, 256 streams)

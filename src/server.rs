@@ -1180,6 +1180,9 @@ where
                 let compute_time = compute_start.elapsed();
                 debug!("Word offline GPU init: {:?}, compute: {:?}", init_time, compute_time);
                 simplepir_prep_time_ms = compute_time.as_millis();
+                // Free GEMM buffers (d_gemm_out, d_A_bytes_packed, d_accum_u64, etc.)
+                // These are ~14 GB on tensor core path and no longer needed after hint computation.
+                gpu_ctx.free_gemm_buffers();
                 // Keep gpu_ctx alive: InspiRING needs d_hint_0, and both paths reuse DB
                 (result, Some(gpu_ctx))
             }

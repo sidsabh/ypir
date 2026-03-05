@@ -784,6 +784,7 @@ extern "C" {
 
     fn compute_hint_0_word_gpu(context: *mut std::ffi::c_void, hint_0_out: *mut u64) -> i32;
 
+    fn ypir_word_offline_free_gemm_buffers(context: *mut std::ffi::c_void);
     fn ypir_word_offline_get_hint_device_ptr(context: *mut std::ffi::c_void) -> *mut u64;
     fn ypir_word_offline_take_hint_device_ptr(context: *mut std::ffi::c_void) -> *mut u64;
     fn ypir_word_offline_take_db_device_ptrs(
@@ -855,6 +856,12 @@ impl WordOfflineContext {
         } else {
             Err("Word GPU hint_0 computation failed".to_string())
         }
+    }
+
+    /// Free GEMM-specific buffers (d_A_bytes_packed, d_gemm_out, d_accum_u64, etc.)
+    /// that are no longer needed after compute_hint_0(). Keeps DB and hint_0 alive.
+    pub fn free_gemm_buffers(&self) {
+        unsafe { ypir_word_offline_free_gemm_buffers(self.ctx) }
     }
 
     /// Get the device pointer to hint_0 (d_out) without D2H copy.

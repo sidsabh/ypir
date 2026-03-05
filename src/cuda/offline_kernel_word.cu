@@ -441,6 +441,24 @@ uint64_t* ypir_word_offline_take_hint_device_ptr(void* context)
     return ptr;
 }
 
+// Free GEMM-specific buffers that are no longer needed after compute_hint_0_word_gpu().
+// Keeps d_db_stacked, d_db_u16, and d_out alive.
+void ypir_word_offline_free_gemm_buffers(void* context)
+{
+    WordOfflineContext* ctx = (WordOfflineContext*)context;
+    if (!ctx) return;
+
+    // Tensor core path
+    if (ctx->d_A_bytes_packed) { cudaFree(ctx->d_A_bytes_packed); ctx->d_A_bytes_packed = nullptr; }
+    if (ctx->d_gemm_out)       { cudaFree(ctx->d_gemm_out);       ctx->d_gemm_out = nullptr; }
+    if (ctx->d_accum_u64)      { cudaFree(ctx->d_accum_u64);      ctx->d_accum_u64 = nullptr; }
+
+    // SIMT path
+    if (ctx->d_A_u64)          { cudaFree(ctx->d_A_u64);          ctx->d_A_u64 = nullptr; }
+    if (ctx->d_result_u64)     { cudaFree(ctx->d_result_u64);     ctx->d_result_u64 = nullptr; }
+    if (ctx->d_gemm_workspace) { cudaFree(ctx->d_gemm_workspace); ctx->d_gemm_workspace = nullptr; }
+}
+
 // Transfer ownership of DB device pointers to caller (won't be freed by free_word_offline_context).
 void ypir_word_offline_take_db_device_ptrs(void* context, uint8_t** out_db_stacked, uint16_t** out_db_u16)
 {
