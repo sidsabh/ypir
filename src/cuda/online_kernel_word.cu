@@ -505,7 +505,428 @@ __global__ void __launch_bounds__(1024) word_pack_lwes_and_mod_switch(
     }
 }
 
-// ---------- InspiRING packing kernel ----------
+// ---------- InspiRING bold_t transpose kernel ----------
+// Transposes bold_t from [num_outputs, D, poly_len] to [num_outputs, poly_len, D]
+// so that consecutive d-values are stride-1 for the inner product kernel.
+__global__ void inspir_transpose_bold_t(
+    uint64_t* __restrict__ dst,        // [num_outputs * poly_len * D]
+    const uint64_t* __restrict__ src,  // [num_outputs * D * poly_len]
+    size_t num_outputs,
+    size_t D,
+    size_t poly_len)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = num_outputs * D * poly_len;
+    if (idx >= total) return;
+
+    size_t o  = idx / (D * poly_len);
+    size_t rem = idx % (D * poly_len);
+    size_t d  = rem / poly_len;
+    size_t z  = rem % poly_len;
+
+    // src[o][d][z] → dst[o][z][d]
+    dst[o * poly_len * D + z * D + d] = src[idx];
+}
+
+// ---------- InspiRING FUSED expand + inner product kernel ----------
+// Eliminates the separate expand phase entirely. Instead of:
+//   expand: write y_all/y_bar_all to global (~96 MB/client)
+//   IP: read y_all/y_bar_all from global (~96 MB/client)
+// This kernel does on-the-fly permutation gather from y_body (48 KB/client, L2-cached).
+// Saves ~192 MB/client of HBM traffic = ~6 GB for 32 clients.
+// Also eliminates ~6.8 GB of GPU memory for y_all/y_bar_all buffers.
+//
+// Block layout: dim3(32, batch_per_block)
+//   threadIdx.x → z offset within tile (warp-aligned for coalescing)
+//   threadIdx.y → client index within block
+//
+// Shared memory: bold_t tile (2 × TILE_D × 32 × 8 bytes)
+// bold_t loaded cooperatively by all threads, shared across all clients.
+// Table lookups cached in L1/L2 (same z across clients).
+// y_body gathered via permutation (48 KB/client, fits in L2).
+
+#define FIP_TILE_D 32  // d-values per shared memory tile (16KB smem → 2 blocks/SM)
+#define FIP_TILE_Z 32  // z-values per block (= warp size)
+
+__global__ void
+inspir_fused_expand_ip(
+    uint64_t* __restrict__ d_scratch_base,       // contiguous scratch [batch, num_outputs, scratch_per_output]
+    const uint64_t* __restrict__ d_bold_t,       // [num_outputs, D, poly_len] — SHARED across all clients
+    const uint64_t* __restrict__ d_bold_t_bar,   // same
+    const uint64_t* __restrict__ d_bold_t_hat,   // [num_outputs * t_exp_left * poly_len]
+    const uint64_t* __restrict__ d_y_body_base,  // [batch, t_exp_left * poly_len] — tiny, L2-cached
+    const uint64_t* __restrict__ d_z_body_base,  // [batch, t_exp_left * poly_len]
+    const uint32_t* __restrict__ d_tables,       // [num_tables * poly_len] permutation tables
+    const uint32_t* __restrict__ d_gen_pows,     // [num_rotations] generator powers
+    size_t actual_batch_size,
+    size_t num_outputs,
+    size_t D,                                     // num_iter * t_exp_left
+    size_t poly_len,
+    size_t t_exp_left,
+    size_t inspir_scratch_per_output,
+    size_t y_body_stride,                         // t_exp_left * poly_len (elements per client)
+    size_t z_body_stride,                         // same
+    size_t scratch_stride,                        // num_outputs * inspir_scratch_per_output
+    NTTParams params)
+{
+    size_t z = blockIdx.x * FIP_TILE_Z + threadIdx.x;
+    if (z >= poly_len) return;
+
+    size_t client = blockIdx.y * blockDim.y + threadIdx.y;
+    if (client >= actual_batch_size) return;
+
+    size_t o = blockIdx.z;  // output index — parallelized across grid
+
+    // Barrett constants
+    uint64_t bcr0 = params.barrett_cr[0];
+    uint64_t bcr1 = params.barrett_cr[1];
+    uint64_t mod0 = params.moduli[0];
+    uint64_t mod1 = params.moduli[1];
+
+    // Per-client data pointers
+    const uint64_t* my_y_body = d_y_body_base + client * y_body_stride;
+    const uint64_t* my_z_body = d_z_body_base + client * z_body_stride;
+    uint64_t* my_scratch      = d_scratch_base + client * scratch_stride;
+
+    // Shared memory: bold_t tile (shared by ALL clients in this block)
+    __shared__ uint64_t s_bt[FIP_TILE_D][FIP_TILE_Z];
+    __shared__ uint64_t s_btbar[FIP_TILE_D][FIP_TILE_Z];
+
+    uint64_t acc_lo = 0, acc_hi = 0;
+
+    for (size_t d_start = 0; d_start < D; d_start += FIP_TILE_D) {
+        size_t tile_len = FIP_TILE_D;
+        if (d_start + tile_len > D) tile_len = D - d_start;
+
+        // Cooperative load of bold_t into shared memory.
+        // All threads participate for balanced loading.
+        {
+            size_t tid = threadIdx.y * FIP_TILE_Z + threadIdx.x;
+            size_t block_threads = blockDim.y * FIP_TILE_Z;
+            for (size_t idx = tid; idx < tile_len * FIP_TILE_Z; idx += block_threads) {
+                size_t dd = idx / FIP_TILE_Z;
+                size_t zz = idx % FIP_TILE_Z;
+                size_t gz = blockIdx.x * FIP_TILE_Z + zz;
+                if (gz < poly_len) {
+                    s_bt[dd][zz]    = __ldg(&d_bold_t[o * D * poly_len + (d_start + dd) * poly_len + gz]);
+                    s_btbar[dd][zz] = __ldg(&d_bold_t_bar[o * D * poly_len + (d_start + dd) * poly_len + gz]);
+                }
+            }
+        }
+        __syncthreads();
+
+        // Each client accumulates against shared bold_t.
+        // On-the-fly expand: gather y_body via permutation tables.
+        // Barrett at tile boundary only (FIP_TILE_D=32, adds 64 products ≤ addition_capacity).
+        {
+            size_t prev_rot = (size_t)-1;
+            uint32_t perm_idx1 = 0, perm_idx2 = 0;
+            for (size_t dd = 0; dd < tile_len; dd++) {
+                size_t d_idx = d_start + dd;
+                size_t rot = d_idx / t_exp_left;
+                size_t k   = d_idx - rot * t_exp_left;
+
+                if (rot != prev_rot) {
+                    uint32_t gen = __ldg(&d_gen_pows[rot]);
+                    uint32_t tidx1 = (gen - 1) / 2;
+                    uint32_t tidx2 = (2 * (uint32_t)poly_len - gen - 1) / 2;
+                    perm_idx1 = __ldg(&d_tables[(size_t)tidx1 * poly_len + z]);
+                    perm_idx2 = __ldg(&d_tables[(size_t)tidx2 * poly_len + z]);
+                    prev_rot = rot;
+                }
+
+                uint64_t y_val  = __ldg(&my_y_body[k * poly_len + perm_idx1]);
+                uint64_t yb_val = __ldg(&my_y_body[k * poly_len + perm_idx2]);
+
+                uint64_t t_val  = s_bt[dd][threadIdx.x];
+                uint64_t tb_val = s_btbar[dd][threadIdx.x];
+
+                acc_lo += (uint64_t)(uint32_t)y_val  * (uint32_t)t_val
+                        + (uint64_t)(uint32_t)yb_val * (uint32_t)tb_val;
+                acc_hi += (uint64_t)(uint32_t)(y_val >> 32)  * (uint32_t)(t_val >> 32)
+                        + (uint64_t)(uint32_t)(yb_val >> 32) * (uint32_t)(tb_val >> 32);
+            }
+        }
+        // Barrett reduce once per tile (branch-free inner loop)
+        acc_lo = barrett_raw_u64(acc_lo, bcr0, mod0);
+        acc_hi = barrett_raw_u64(acc_hi, bcr1, mod1);
+        __syncthreads();
+    }
+
+    // Add z_body × bold_t_hat (t_exp_left terms)
+    uint64_t fin_lo = 0, fin_hi = 0;
+    for (size_t k = 0; k < t_exp_left; k++) {
+        uint64_t z_val  = __ldg(&my_z_body[k * poly_len + z]);
+        uint64_t th_val = __ldg(&d_bold_t_hat[o * t_exp_left * poly_len + k * poly_len + z]);
+        fin_lo += (z_val & 0xFFFFFFFF) * (th_val & 0xFFFFFFFF);
+        fin_hi += (z_val >> 32)         * (th_val >> 32);
+    }
+    fin_lo = barrett_raw_u64(fin_lo, bcr0, mod0);
+    fin_hi = barrett_raw_u64(fin_hi, bcr1, mod1);
+
+    acc_lo += fin_lo;
+    if (acc_lo >= mod0) acc_lo -= mod0;
+    acc_hi += fin_hi;
+    if (acc_hi >= mod1) acc_hi -= mod1;
+
+    // Write CRT halves to this client's scratch
+    uint64_t* temp_ntt = my_scratch + o * inspir_scratch_per_output;
+    temp_ntt[z]            = acc_lo;
+    temp_ntt[poly_len + z] = acc_hi;
+}
+
+// ---------- InspiRING Multi-Output Fused kernel ----------
+// Each thread processes ALL outputs, reading y_body ONCE and reusing across outputs.
+// This eliminates num_outputs× redundant y_body scattered reads and table lookups.
+// bold_t is read from global memory via __ldg (coalesced per output).
+//
+// Block: dim3(32, batch_per_block) — 32 z-values × N clients
+// Grid: dim3(ceil(poly_len/32), ceil(batch/bpb)) — NO output dimension
+// No shared memory needed (bold_t coalesced from global, y_body from L2).
+// Templated on NUM_OUTPUTS so compiler can keep accumulators in registers.
+
+template <int NUM_OUTPUTS>
+__global__ void
+inspir_fused_multi_output(
+    uint64_t* __restrict__ d_scratch_base,
+    const uint64_t* __restrict__ d_bold_t,
+    const uint64_t* __restrict__ d_bold_t_bar,
+    const uint64_t* __restrict__ d_bold_t_hat,
+    const uint64_t* __restrict__ d_y_body_base,
+    const uint64_t* __restrict__ d_z_body_base,
+    const uint32_t* __restrict__ d_tables,
+    const uint32_t* __restrict__ d_gen_pows,
+    size_t batch_size,
+    size_t D,
+    size_t poly_len,
+    size_t t_exp_left,
+    size_t inspir_scratch_per_output,
+    size_t y_body_stride,
+    size_t z_body_stride,
+    size_t scratch_stride,
+    NTTParams params)
+{
+    size_t z = blockIdx.x * 32 + threadIdx.x;
+    if (z >= poly_len) return;
+    size_t client = blockIdx.y * blockDim.y + threadIdx.y;
+    if (client >= batch_size) return;
+
+    uint64_t bcr0 = params.barrett_cr[0];
+    uint64_t bcr1 = params.barrett_cr[1];
+    uint64_t mod0 = params.moduli[0];
+    uint64_t mod1 = params.moduli[1];
+
+    const uint64_t* my_y_body = d_y_body_base + client * y_body_stride;
+    const uint64_t* my_z_body = d_z_body_base + client * z_body_stride;
+    uint64_t* my_scratch      = d_scratch_base + client * scratch_stride;
+
+    // Compile-time sized accumulators → compiler keeps in registers
+    uint64_t acc_lo[NUM_OUTPUTS];
+    uint64_t acc_hi[NUM_OUTPUTS];
+    #pragma unroll
+    for (int o = 0; o < NUM_OUTPUTS; o++) {
+        acc_lo[o] = 0;
+        acc_hi[o] = 0;
+    }
+
+    size_t prev_rot = (size_t)-1;
+    uint32_t perm_idx1 = 0, perm_idx2 = 0;
+    size_t num_added = 0;
+
+    for (size_t d_idx = 0; d_idx < D; d_idx++) {
+        size_t rot = d_idx / t_exp_left;
+        size_t k   = d_idx - rot * t_exp_left;
+
+        if (rot != prev_rot) {
+            uint32_t gen = __ldg(&d_gen_pows[rot]);
+            uint32_t tidx1 = (gen - 1) / 2;
+            uint32_t tidx2 = (2 * (uint32_t)poly_len - gen - 1) / 2;
+            perm_idx1 = __ldg(&d_tables[(size_t)tidx1 * poly_len + z]);
+            perm_idx2 = __ldg(&d_tables[(size_t)tidx2 * poly_len + z]);
+            prev_rot = rot;
+        }
+
+        // Read y_body ONCE — reuse across ALL outputs
+        uint64_t y_val  = __ldg(&my_y_body[k * poly_len + perm_idx1]);
+        uint64_t yb_val = __ldg(&my_y_body[k * poly_len + perm_idx2]);
+        uint32_t y_lo  = (uint32_t)y_val;
+        uint32_t y_hi  = (uint32_t)(y_val >> 32);
+        uint32_t yb_lo = (uint32_t)yb_val;
+        uint32_t yb_hi = (uint32_t)(yb_val >> 32);
+
+        // Accumulate against ALL outputs (bold_t coalesced from global)
+        #pragma unroll
+        for (int o = 0; o < NUM_OUTPUTS; o++) {
+            size_t bt_idx = o * D * poly_len + d_idx * poly_len + z;
+            uint64_t t_val  = __ldg(&d_bold_t[bt_idx]);
+            uint64_t tb_val = __ldg(&d_bold_t_bar[bt_idx]);
+
+            acc_lo[o] += (uint64_t)y_lo  * (uint32_t)t_val
+                       + (uint64_t)yb_lo * (uint32_t)tb_val;
+            acc_hi[o] += (uint64_t)y_hi  * (uint32_t)(t_val >> 32)
+                       + (uint64_t)yb_hi * (uint32_t)(tb_val >> 32);
+        }
+
+        num_added += 2;
+        if (num_added >= 64) {
+            #pragma unroll
+            for (int o = 0; o < NUM_OUTPUTS; o++) {
+                acc_lo[o] = barrett_raw_u64(acc_lo[o], bcr0, mod0);
+                acc_hi[o] = barrett_raw_u64(acc_hi[o], bcr1, mod1);
+            }
+            num_added = 0;
+        }
+    }
+
+    // Final Barrett
+    #pragma unroll
+    for (int o = 0; o < NUM_OUTPUTS; o++) {
+        acc_lo[o] = barrett_raw_u64(acc_lo[o], bcr0, mod0);
+        acc_hi[o] = barrett_raw_u64(acc_hi[o], bcr1, mod1);
+    }
+
+    // Add z_body × bold_t_hat
+    #pragma unroll
+    for (int o = 0; o < NUM_OUTPUTS; o++) {
+        uint64_t fin_lo = 0, fin_hi = 0;
+        for (size_t k = 0; k < t_exp_left; k++) {
+            uint64_t z_val  = __ldg(&my_z_body[k * poly_len + z]);
+            uint64_t th_val = __ldg(&d_bold_t_hat[o * t_exp_left * poly_len + k * poly_len + z]);
+            fin_lo += (z_val & 0xFFFFFFFF) * (th_val & 0xFFFFFFFF);
+            fin_hi += (z_val >> 32)         * (th_val >> 32);
+        }
+        fin_lo = barrett_raw_u64(fin_lo, bcr0, mod0);
+        fin_hi = barrett_raw_u64(fin_hi, bcr1, mod1);
+
+        acc_lo[o] += fin_lo;
+        if (acc_lo[o] >= mod0) acc_lo[o] -= mod0;
+        acc_hi[o] += fin_hi;
+        if (acc_hi[o] >= mod1) acc_hi[o] -= mod1;
+
+        uint64_t* temp_ntt = my_scratch + o * inspir_scratch_per_output;
+        temp_ntt[z]            = acc_lo[o];
+        temp_ntt[poly_len + z] = acc_hi[o];
+    }
+}
+
+// Dispatch helper for multi-output kernel
+static void launch_multi_output_kernel(
+    size_t num_outputs,
+    dim3 grid, dim3 block, cudaStream_t stream,
+    uint64_t* scratch, const uint64_t* bold_t, const uint64_t* bold_t_bar,
+    const uint64_t* bold_t_hat, const uint64_t* y_body, const uint64_t* z_body,
+    const uint32_t* tables, const uint32_t* gen_pows,
+    size_t batch_size, size_t D, size_t poly_len, size_t t_exp_left,
+    size_t inspir_spo, size_t ybs, size_t zbs, size_t ss, NTTParams params)
+{
+    #define LAUNCH_MO(N) \
+        inspir_fused_multi_output<N><<<grid, block, 0, stream>>>( \
+            scratch, bold_t, bold_t_bar, bold_t_hat, y_body, z_body, \
+            tables, gen_pows, batch_size, D, poly_len, t_exp_left, \
+            inspir_spo, ybs, zbs, ss, params)
+    switch (num_outputs) {
+        case 2:  LAUNCH_MO(2);  break;
+        case 3:  LAUNCH_MO(3);  break;
+        case 4:  LAUNCH_MO(4);  break;
+        case 6:  LAUNCH_MO(6);  break;
+        case 8:  LAUNCH_MO(8);  break;
+        case 12: LAUNCH_MO(12); break;
+        case 16: LAUNCH_MO(16); break;
+        case 18: LAUNCH_MO(18); break;
+        case 24: LAUNCH_MO(24); break;
+        case 32: LAUNCH_MO(32); break;
+        default:
+            fprintf(stderr, "ERROR: unsupported num_outputs=%zu for multi-output kernel\n", num_outputs);
+            abort();
+    }
+    #undef LAUNCH_MO
+    CUDA_ASSERT(cudaGetLastError());
+}
+
+
+// ---------- InspiRING post-process kernel ----------
+// INTT + CRT compose + add b_values + modswitch + bitpack.
+// Reads temp_ntt from scratch (written by inspir_inner_product_tiled).
+// Requires b_values from Step1 GEMM (d_intermediate).
+//
+// Grid:  num_outputs blocks
+// Block: 1024 threads (needed for cooperative INTT)
+
+__global__ void __launch_bounds__(1024)
+inspir_post_process(
+    uint8_t* d_response_out,
+    const uint64_t* d_intermediate,     // b_values from Step1
+    const uint64_t* d_a_hat,            // per-output, raw domain
+    uint64_t* d_scratch,                // per-stream scratch (temp_ntt written by inner product)
+    size_t num_outputs,
+    uint64_t rlwe_q_prime_1,
+    uint64_t rlwe_q_prime_2,
+    size_t response_bytes_per_output,
+    size_t inspir_scratch_per_output,
+    NTTParams params)
+{
+    size_t output_idx = blockIdx.x;
+    size_t tid = threadIdx.x;
+    size_t poly_len = params.poly_len;
+    uint64_t modulus = params.modulus;
+
+    size_t crt_count = params.crt_count;
+    size_t threads_per_crt = blockDim.x / crt_count;
+    size_t my_crt = tid / threads_per_crt;
+    size_t local_tid = tid % threads_per_crt;
+
+    uint64_t* my_scratch = d_scratch + output_idx * inspir_scratch_per_output;
+    uint64_t* temp_ntt = my_scratch;
+    uint64_t* temp_raw = temp_ntt + 2 * poly_len;
+
+    const uint64_t* my_a_hat  = d_a_hat + output_idx * poly_len;
+    const uint64_t* b_values  = d_intermediate + output_idx * poly_len;
+    uint8_t* my_response = d_response_out + output_idx * response_bytes_per_output;
+
+    // INTT both CRT components
+    if (my_crt < crt_count)
+        ntt_inverse_kernel_parallel(temp_ntt + my_crt * poly_len, &params, my_crt, local_tid, threads_per_crt);
+    __syncthreads();
+
+    // CRT compose + add b_values → raw domain
+    for (size_t z = tid; z < poly_len; z += blockDim.x) {
+        uint64_t x     = temp_ntt[z];
+        uint64_t y_val = temp_ntt[poly_len + z];
+        uint64_t sum_raw = crt_compose_2(x, y_val, &params);
+
+        uint64_t final_b = sum_raw + b_values[z];
+        final_b -= modulus * (final_b >= modulus);
+
+        temp_raw[poly_len + z] = final_b;
+        temp_raw[z]            = my_a_hat[z];
+    }
+    __syncthreads();
+
+    // Modswitch and bit-pack
+    size_t q_1_bits = word_ceil_log2_u64(rlwe_q_prime_2);
+    size_t q_2_bits = word_ceil_log2_u64(rlwe_q_prime_1);
+
+    for (size_t i = tid; i < response_bytes_per_output; i += blockDim.x)
+        my_response[i] = 0;
+    __syncthreads();
+
+    for (size_t z = tid; z < poly_len; z += blockDim.x) {
+        uint64_t val = temp_raw[z];
+        double d_val = (double)val;
+        uint64_t val_rescaled = (uint64_t)((d_val * (double)rlwe_q_prime_2) / (double)modulus + 0.5);
+        word_write_arbitrary_bits(my_response, val_rescaled, z * q_1_bits, q_1_bits);
+    }
+    __syncthreads();
+
+    for (size_t z = tid; z < poly_len; z += blockDim.x) {
+        uint64_t val = temp_raw[poly_len + z];
+        double d_val = (double)val;
+        uint64_t val_rescaled = (uint64_t)((d_val * (double)rlwe_q_prime_1) / (double)modulus + 0.5);
+        word_write_arbitrary_bits(my_response, val_rescaled, poly_len * q_1_bits + z * q_2_bits, q_2_bits);
+    }
+}
+
+// ---------- InspiRING packing kernel (OLD — kept for reference) ----------
 // Implements full_packing_with_preprocessing_online (with_rotations):
 //   sum = Σ_{i=0..num_iter-1} (y_all[i] · bold_t[i] + y_bar_all[i] · bold_t_bar[i])
 //       + z_body · bold_t_hat
@@ -523,7 +944,6 @@ __global__ void __launch_bounds__(1024) word_pack_lwes_inspir_and_mod_switch(
     const uint64_t* d_y_bar_all,
     const uint64_t* d_z_body,           // per-client
     uint64_t* d_scratch,                // per-stream scratch
-    size_t num_outputs,
     size_t num_iter,                    // poly_len/2 - 1
     size_t t_exp_left,
     uint64_t rlwe_q_prime_1,
@@ -742,12 +1162,11 @@ struct WordOnlineContext {
     size_t num_iter;                   // poly_len/2 - 1
     size_t inspir_scratch_per_output;  // 4 * poly_len (temp_ntt + temp_raw)
 
-    // Per-stream InspiRING client data buffers
-    uint64_t* d_y_all_streams;         // num_streams * y_all_per_client
-    uint64_t* d_y_bar_all_streams;     // same
+    // Per-stream InspiRING client data buffers (contiguous allocations)
     uint64_t* d_z_body_streams;        // num_streams * z_body_per_client
-    size_t y_all_per_client;           // num_iter * t_exp_left * poly_len
+    uint64_t* d_scratch_contiguous;    // num_streams * scratch_bytes (contiguous)
     size_t z_body_per_client;          // t_exp_left * poly_len
+    size_t scratch_bytes_per_stream;   // num_rlwe_outputs * inspir_scratch_per_output * 8
 
     // Expand data (uploaded once during init, used by expand_rotations_double kernel)
     uint32_t* d_tables;                // num_tables * poly_len
@@ -755,11 +1174,15 @@ struct WordOnlineContext {
     size_t num_tables;
     size_t num_rotations;              // poly_len/2 - 1
     uint64_t* d_y_body_streams;        // num_streams * z_body_per_client (expand input)
+
 };
 
-// ---------- Expand rotations kernel ----------
+// ---------- Expand rotations kernel (fused) ----------
 // Generates y_all and y_bar_all from y_body via permutation tables.
-// Each block handles one rotation. Threads loop over poly_len elements.
+// Fuses EXPAND_ROTS rotations per block. y_body[k] is loaded into shared memory
+// once per k-iteration and reused across all rotations — eliminates redundant global reads.
+#define EXPAND_ROTS 8  // rotations per block
+
 __global__ void expand_rotations_double(
     uint64_t* __restrict__ d_y_all,         // [num_rotations * t_exp_left * poly_len]
     uint64_t* __restrict__ d_y_bar_all,     // same
@@ -767,23 +1190,43 @@ __global__ void expand_rotations_double(
     const uint32_t* __restrict__ d_tables,  // [num_tables * poly_len]
     const uint32_t* __restrict__ d_gen_pows,// [num_rotations]
     size_t t_exp_left,
-    size_t poly_len)
+    size_t poly_len,
+    size_t num_rotations)
 {
-    size_t rot = blockIdx.x;
-    uint32_t t = d_gen_pows[rot];
-    uint32_t tidx1 = (t - 1) / 2;
-    uint32_t tidx2 = (2 * (uint32_t)poly_len - t - 1) / 2;
-    const uint32_t* tab1 = d_tables + (size_t)tidx1 * poly_len;
-    const uint32_t* tab2 = d_tables + (size_t)tidx2 * poly_len;
+    extern __shared__ uint64_t s_ybody[];  // poly_len uint64s
+
+    size_t rot_base = blockIdx.x * EXPAND_ROTS;
 
     for (size_t k = 0; k < t_exp_left; k++) {
+        // Load y_body[k] into shared memory (ONE global read, shared across all rotations)
         const uint64_t* src = d_y_body + k * poly_len;
-        uint64_t* dst1 = d_y_all + (rot * t_exp_left + k) * poly_len;
-        uint64_t* dst2 = d_y_bar_all + (rot * t_exp_left + k) * poly_len;
         for (size_t z = threadIdx.x; z < poly_len; z += blockDim.x) {
-            dst1[z] = src[tab1[z]];
-            dst2[z] = src[tab2[z]];
+            s_ybody[z] = src[z];
         }
+        __syncthreads();
+
+        // Process EXPAND_ROTS rotations using shared memory gather
+        for (size_t r = 0; r < EXPAND_ROTS; r++) {
+            size_t rot = rot_base + r;
+            if (rot >= num_rotations) break;
+
+            uint32_t t = d_gen_pows[rot];
+            uint32_t tidx1 = (t - 1) / 2;
+            uint32_t tidx2 = (2 * (uint32_t)poly_len - t - 1) / 2;
+            const uint32_t* tab1 = d_tables + (size_t)tidx1 * poly_len;
+            const uint32_t* tab2 = d_tables + (size_t)tidx2 * poly_len;
+
+            uint64_t* dst1 = d_y_all + (rot * t_exp_left + k) * poly_len;
+            uint64_t* dst2 = d_y_bar_all + (rot * t_exp_left + k) * poly_len;
+
+            for (size_t z = threadIdx.x; z < poly_len; z += blockDim.x) {
+                uint32_t idx1 = __ldg(&tab1[z]);
+                uint32_t idx2 = __ldg(&tab2[z]);
+                dst1[z] = s_ybody[idx1];
+                dst2[z] = s_ybody[idx2];
+            }
+        }
+        __syncthreads();
     }
 }
 
@@ -890,10 +1333,7 @@ void* ypir_word_online_init(
     ctx->bold_t_per_output = 0;
     ctx->num_iter = 0;
     ctx->inspir_scratch_per_output = 0;
-    ctx->d_y_all_streams = nullptr;
-    ctx->d_y_bar_all_streams = nullptr;
     ctx->d_z_body_streams = nullptr;
-    ctx->y_all_per_client = 0;
     ctx->z_body_per_client = 0;
     ctx->d_tables = nullptr;
     ctx->d_gen_pows = nullptr;
@@ -1044,10 +1484,9 @@ void ypir_word_online_init_packing_inspir(
     ctx->inspir_scratch_per_output = 4 * poly_len;  // temp_ntt + temp_raw
 
     // Per-client data sizes
-    ctx->y_all_per_client  = num_iter * t_exp * poly_len;
     ctx->z_body_per_client = t_exp * poly_len;
 
-    // Upload per-output precomp data
+    // Upload per-output precomp data (original layout: [num_outputs, D, poly_len], z stride-1)
     CUDA_ALLOC_AND_COPY(ctx->d_bold_t_condensed,     bold_t_condensed,     bold_t_size);
     CUDA_ALLOC_AND_COPY(ctx->d_bold_t_bar_condensed, bold_t_bar_condensed, bold_t_bar_size);
     CUDA_ALLOC_AND_COPY(ctx->d_bold_t_hat_condensed, bold_t_hat_condensed, bold_t_hat_size);
@@ -1068,13 +1507,11 @@ void ypir_word_online_init_packing_inspir(
         num_rotations, num_rotations * 4 / 1e3);
 
     // ── Determine num_streams based on remaining GPU memory ──
-    // Per-stream: y_all + y_bar_all (generated by expand) + z_body + y_body (expand input) + scratch
+    // Fused expand+IP: no y_all/y_bar_all buffers needed (y_body fits in L2)
 
     size_t per_stream_bytes =
-        ctx->y_all_per_client * sizeof(uint64_t) +       // y_all (generated by expand kernel)
-        ctx->y_all_per_client * sizeof(uint64_t) +       // y_bar_all (generated by expand kernel)
         ctx->z_body_per_client * sizeof(uint64_t) +      // z_body (uploaded)
-        ctx->z_body_per_client * sizeof(uint64_t) +      // y_body (uploaded, expand input)
+        ctx->z_body_per_client * sizeof(uint64_t) +      // y_body (uploaded, used by fused kernel)
         ctx->num_rlwe_outputs * ctx->inspir_scratch_per_output * sizeof(uint64_t);  // scratch
 
     size_t free_mem, total_mem;
@@ -1091,13 +1528,9 @@ void ypir_word_online_init_packing_inspir(
     if (num_streams > ctx->max_batch_size) num_streams = ctx->max_batch_size;
     ctx->num_streams = num_streams;
 
-    printf("InspiRING GPU: %.1f MB free, per-stream %.2f MB (y_all %.2f + y_body %.2f + scratch %.2f), "
-           "using %zu parallel streams (expand on GPU)\n",
-        free_mem / 1e6, per_stream_bytes / 1e6,
-        ctx->y_all_per_client * sizeof(uint64_t) * 2 / 1e6,
-        ctx->z_body_per_client * sizeof(uint64_t) * 2 / 1e6,
-        ctx->num_rlwe_outputs * ctx->inspir_scratch_per_output * sizeof(uint64_t) / 1e6,
-        num_streams);
+    printf("InspiRING GPU: %.1f MB free, per-stream %.2f KB, "
+           "using %zu parallel streams (fused expand+IP)\n",
+        free_mem / 1e6, per_stream_bytes / 1e3, num_streams);
 
     // Create CUDA streams
     ctx->streams = new cudaStream_t[num_streams];
@@ -1105,20 +1538,19 @@ void ypir_word_online_init_packing_inspir(
         CUDA_ASSERT(cudaStreamCreate(&ctx->streams[i]));
     }
 
-    // Per-stream client data buffers
-    size_t y_all_bytes     = ctx->y_all_per_client * sizeof(uint64_t);
+    // Per-stream client data buffers (fused: no y_all/y_bar_all needed)
     size_t z_body_bytes    = ctx->z_body_per_client * sizeof(uint64_t);
     size_t scratch_bytes   = ctx->num_rlwe_outputs * ctx->inspir_scratch_per_output * sizeof(uint64_t);
 
-    CUDA_ASSERT(cudaMalloc(&ctx->d_y_all_streams,     num_streams * y_all_bytes));
-    CUDA_ASSERT(cudaMalloc(&ctx->d_y_bar_all_streams, num_streams * y_all_bytes));
     CUDA_ASSERT(cudaMalloc(&ctx->d_z_body_streams,    num_streams * z_body_bytes));
     CUDA_ASSERT(cudaMalloc(&ctx->d_y_body_streams,    num_streams * z_body_bytes));
 
-    // Per-stream scratch allocations
+    // Contiguous scratch allocation (so batched kernel can index by client)
+    ctx->scratch_bytes_per_stream = scratch_bytes;
+    CUDA_ASSERT(cudaMalloc(&ctx->d_scratch_contiguous, num_streams * scratch_bytes));
     ctx->d_scratch_batch = new uint64_t*[num_streams];
     for (size_t i = 0; i < num_streams; i++) {
-        CUDA_ASSERT(cudaMalloc(&ctx->d_scratch_batch[i], scratch_bytes));
+        ctx->d_scratch_batch[i] = ctx->d_scratch_contiguous + i * (scratch_bytes / sizeof(uint64_t));
     }
 
     CUDA_ASSERT(cudaDeviceSynchronize());
@@ -1424,6 +1856,9 @@ void ypir_word_online_compute_batch_inspir(
 
     // ── Step 1: GEMM (full batch, default stream) ──
 
+    cudaEvent_t step1_start;
+    CUDA_ASSERT(cudaEventCreate(&step1_start));
+    CUDA_ASSERT(cudaEventRecord(step1_start, 0));
     t.tic();
 
     if (ctx->has_tensor_cores) {
@@ -1493,67 +1928,147 @@ void ypir_word_online_compute_batch_inspir(
                                M * N * sizeof(uint64_t), cudaMemcpyDeviceToDevice));
     }
 
-    CUDA_ASSERT(cudaDeviceSynchronize());
-    float ms1 = t.toc_ms();
+    // Record Step1 completion event (don't block — let Step2 overlap)
+    cudaEvent_t step1_done;
+    CUDA_ASSERT(cudaEventCreateWithFlags(&step1_done, cudaEventDisableTiming));
+    CUDA_ASSERT(cudaEventRecord(step1_done, 0));  // default stream
 
-    // ── Step 2: InspiRING packing (chunked by num_streams) ──
+    // Also record a timing event for reporting
+    cudaEvent_t step1_timing_end;
+    CUDA_ASSERT(cudaEventCreate(&step1_timing_end));
+    CUDA_ASSERT(cudaEventRecord(step1_timing_end, 0));
 
-    t.tic();
+    // ── Step 2: InspiRING packing (concurrent with Step1) ──
+    // Phase A: upload y_body + z_body (per-client streams, concurrent with Step1)
+    // Phase B: fused expand+IP (single kernel, on-the-fly permutation, bold_t via smem)
+    // Phase C: wait for Step1 + post-process (per-client streams)
 
     size_t resp_bytes_per_batch = num_outputs * ctx->response_bytes_per_output;
     size_t z_body_bytes = ctx->z_body_per_client * sizeof(uint64_t);
-    int threads_pack = 1024;
+    size_t D = ctx->num_iter * ctx->t_exp_left;
+    // Always use fused kernel — y_body fits in L2, bold_t in smem has much less total traffic
+    // than tiled IP which reads y_all or bold_t redundantly across blocks
 
     for (size_t chunk_start = 0; chunk_start < batch_size; chunk_start += ctx->num_streams) {
         size_t chunk_end = chunk_start + ctx->num_streams;
         if (chunk_end > batch_size) chunk_end = batch_size;
+        size_t chunk_size = chunk_end - chunk_start;
 
+        // Phase A+B: upload + expand + inner product
+        size_t scratch_stride = ctx->num_rlwe_outputs * ctx->inspir_scratch_per_output;
+
+        // Upload y_body + z_body on per-client streams (CONCURRENT with Step1)
         for (size_t i = chunk_start; i < chunk_end; i++) {
             size_t s = i - chunk_start;
             cudaStream_t stream = ctx->streams[s];
 
-            // Per-stream buffer pointers
-            uint64_t* d_y_body_s    = ctx->d_y_body_streams    + s * ctx->z_body_per_client;
-            uint64_t* d_y_all_s     = ctx->d_y_all_streams     + s * ctx->y_all_per_client;
-            uint64_t* d_y_bar_all_s = ctx->d_y_bar_all_streams + s * ctx->y_all_per_client;
-            uint64_t* d_z_body_s    = ctx->d_z_body_streams    + s * ctx->z_body_per_client;
+            uint64_t* d_y_body_s = ctx->d_y_body_streams + s * ctx->z_body_per_client;
+            uint64_t* d_z_body_s = ctx->d_z_body_streams + s * ctx->z_body_per_client;
 
-            // Async upload y_body (tiny, ~48KB) and z_body (~48KB)
             CUDA_ASSERT(cudaMemcpyAsync(d_y_body_s,
                 y_body_condensed + i * ctx->z_body_per_client,
                 z_body_bytes, cudaMemcpyHostToDevice, stream));
             CUDA_ASSERT(cudaMemcpyAsync(d_z_body_s,
                 z_body_condensed + i * ctx->z_body_per_client,
                 z_body_bytes, cudaMemcpyHostToDevice, stream));
+        }
 
-            // Expand y_body → y_all + y_bar_all via permutation tables
-            expand_rotations_double<<<ctx->num_rotations, 256, 0, stream>>>(
-                d_y_all_s, d_y_bar_all_s,
-                d_y_body_s,
-                ctx->d_tables,
-                ctx->d_gen_pows,
-                ctx->t_exp_left,
-                poly_len);
-            CUDA_ASSERT(cudaGetLastError());
+        // Sync all per-client streams to ip_stream
+        cudaStream_t ip_stream = ctx->streams[0];
+        for (size_t s = 0; s < chunk_size; s++) {
+            cudaEvent_t ev;
+            CUDA_ASSERT(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+            CUDA_ASSERT(cudaEventRecord(ev, ctx->streams[s]));
+            CUDA_ASSERT(cudaStreamWaitEvent(ip_stream, ev, 0));
+            CUDA_ASSERT(cudaEventDestroy(ev));
+        }
 
-            // Pointers for this batch item
-            uint8_t* d_resp_i = ctx->d_all_responses + i * resp_bytes_per_batch;
-            const uint64_t* d_inter_i = ctx->d_intermediate + i * M;
+        // Inner product kernel selection:
+        // Multi-output: each thread handles ALL outputs, reads y_body ONCE
+        //   → eliminates num_outputs× redundant y_body and table reads
+        // Single-output: original fused kernel (bold_t in smem)
+        if (num_outputs > 1) {
+            // batch_per_block=16 is the sweet spot: shares bold_t via L2 across clients,
+            // while keeping register pressure manageable (16 × 32 = 512 threads < 65K/94 regs)
+            size_t batch_per_block = chunk_size;
+            if (batch_per_block > 16) batch_per_block = 16;
+            dim3 mo_block(32, batch_per_block);
+            dim3 mo_grid((poly_len + 31) / 32,
+                         (chunk_size + batch_per_block - 1) / batch_per_block);
 
-            word_pack_lwes_inspir_and_mod_switch<<<num_outputs, threads_pack, 0, stream>>>(
-                d_resp_i,
-                d_inter_i,
+            launch_multi_output_kernel(
+                num_outputs, mo_grid, mo_block, ip_stream,
+                ctx->d_scratch_contiguous,
                 ctx->d_bold_t_condensed,
                 ctx->d_bold_t_bar_condensed,
                 ctx->d_bold_t_hat_condensed,
+                ctx->d_y_body_streams,
+                ctx->d_z_body_streams,
+                ctx->d_tables,
+                ctx->d_gen_pows,
+                chunk_size, D, poly_len, ctx->t_exp_left,
+                ctx->inspir_scratch_per_output,
+                ctx->z_body_per_client,
+                ctx->z_body_per_client,
+                scratch_stride,
+                ctx->ntt_params);
+        } else {
+            size_t batch_per_block = chunk_size;
+            if (batch_per_block > 32) batch_per_block = 32;
+            dim3 fip_block(FIP_TILE_Z, batch_per_block);
+            dim3 fip_grid((poly_len + FIP_TILE_Z - 1) / FIP_TILE_Z,
+                           (chunk_size + batch_per_block - 1) / batch_per_block,
+                           num_outputs);
+
+            inspir_fused_expand_ip<<<fip_grid, fip_block, 0, ip_stream>>>(
+                ctx->d_scratch_contiguous,
+                ctx->d_bold_t_condensed,
+                ctx->d_bold_t_bar_condensed,
+                ctx->d_bold_t_hat_condensed,
+                ctx->d_y_body_streams,
+                ctx->d_z_body_streams,
+                ctx->d_tables,
+                ctx->d_gen_pows,
+                chunk_size,
+                num_outputs,
+                D,
+                poly_len,
+                ctx->t_exp_left,
+                ctx->inspir_scratch_per_output,
+                ctx->z_body_per_client,
+                ctx->z_body_per_client,
+                scratch_stride,
+                ctx->ntt_params);
+            CUDA_ASSERT(cudaGetLastError());
+        }
+
+        // Make all per-client streams wait for batched IP to finish
+        {
+            cudaEvent_t ip_done;
+            CUDA_ASSERT(cudaEventCreateWithFlags(&ip_done, cudaEventDisableTiming));
+            CUDA_ASSERT(cudaEventRecord(ip_done, ip_stream));
+            for (size_t s = 0; s < chunk_size; s++) {
+                CUDA_ASSERT(cudaStreamWaitEvent(ctx->streams[s], ip_done, 0));
+            }
+            CUDA_ASSERT(cudaEventDestroy(ip_done));
+        }
+
+        // Phase C: wait for Step1, then post-process on per-client streams
+        for (size_t i = chunk_start; i < chunk_end; i++) {
+            size_t s = i - chunk_start;
+            cudaStream_t stream = ctx->streams[s];
+
+            CUDA_ASSERT(cudaStreamWaitEvent(stream, step1_done, 0));
+
+            uint8_t* d_resp_i = ctx->d_all_responses + i * resp_bytes_per_batch;
+            const uint64_t* d_inter_i = ctx->d_intermediate + i * M;
+
+            inspir_post_process<<<num_outputs, 1024, 0, stream>>>(
+                d_resp_i,
+                d_inter_i,
                 ctx->d_a_hat,
-                d_y_all_s,
-                d_y_bar_all_s,
-                d_z_body_s,
                 ctx->d_scratch_batch[s],
                 num_outputs,
-                ctx->num_iter,
-                ctx->t_exp_left,
                 ctx->rlwe_q_prime_1,
                 ctx->rlwe_q_prime_2,
                 ctx->response_bytes_per_output,
@@ -1562,17 +2077,25 @@ void ypir_word_online_compute_batch_inspir(
             CUDA_ASSERT(cudaGetLastError());
         }
 
-        for (size_t i = chunk_start; i < chunk_end; i++) {
-            size_t s = i - chunk_start;
+        for (size_t s = 0; s < chunk_size; s++) {
             CUDA_ASSERT(cudaStreamSynchronize(ctx->streams[s]));
         }
     }
 
-    float ms2 = t.toc_ms();
+    // Measure total time (from before Step1 to after all packing done)
+    float ms_total = t.toc_ms();
 
-    printf("Word InspiRING Step1(%s) %.3f ms, Step2 (%zu streams, %zu chunks) %.3f ms\n",
-           ctx->has_tensor_cores ? "TC" : "SIMT", ms1,
-           ctx->num_streams, (batch_size + ctx->num_streams - 1) / ctx->num_streams, ms2);
+    // Measure Step1 time separately
+    float ms_step1;
+    CUDA_ASSERT(cudaEventElapsedTime(&ms_step1, step1_start, step1_timing_end));
+
+    printf("Word InspiRING Step1(%s)=%.1f ms, total=%.1f ms, packing_overhead=%.1f ms (%zu clients, %zu streams)\n",
+           ctx->has_tensor_cores ? "TC" : "SIMT", ms_step1, ms_total,
+           ms_total - ms_step1, batch_size, ctx->num_streams);
+
+    CUDA_ASSERT(cudaEventDestroy(step1_start));
+    CUDA_ASSERT(cudaEventDestroy(step1_done));
+    CUDA_ASSERT(cudaEventDestroy(step1_timing_end));
 
     // Download all responses
     CUDA_ASSERT(cudaMemcpy(response_out, ctx->d_all_responses,
@@ -1606,20 +2129,14 @@ void ypir_word_online_free(void* context)
     if (ctx->d_bold_t_bar_condensed) cudaFree(ctx->d_bold_t_bar_condensed);
     if (ctx->d_bold_t_hat_condensed) cudaFree(ctx->d_bold_t_hat_condensed);
     if (ctx->d_a_hat)                cudaFree(ctx->d_a_hat);
-    if (ctx->d_y_all_streams)        cudaFree(ctx->d_y_all_streams);
-    if (ctx->d_y_bar_all_streams)    cudaFree(ctx->d_y_bar_all_streams);
     if (ctx->d_z_body_streams)       cudaFree(ctx->d_z_body_streams);
     if (ctx->d_tables)               cudaFree(ctx->d_tables);
     if (ctx->d_gen_pows)             cudaFree(ctx->d_gen_pows);
     if (ctx->d_y_body_streams)       cudaFree(ctx->d_y_body_streams);
 
-    // Free per-stream scratch and streams
-    if (ctx->d_scratch_batch) {
-        for (size_t i = 0; i < ctx->num_streams; i++) {
-            if (ctx->d_scratch_batch[i]) cudaFree(ctx->d_scratch_batch[i]);
-        }
-        delete[] ctx->d_scratch_batch;
-    }
+    // Free contiguous scratch and pointer array
+    if (ctx->d_scratch_contiguous) cudaFree(ctx->d_scratch_contiguous);
+    if (ctx->d_scratch_batch) delete[] ctx->d_scratch_batch;
     if (ctx->streams) {
         for (size_t i = 0; i < ctx->num_streams; i++) {
             cudaStreamDestroy(ctx->streams[i]);

@@ -1207,26 +1207,30 @@ where
         // With apply_inv_n=false for InspiRING, the GPU hint already has the correct scaling.
 
         let now = Instant::now();
-        let y_constants = generate_y_constants(&params);
 
         let combined = [&hint_0_packed[..], &vec![0u64; db_cols]].concat();
         assert_eq!(combined.len(), db_cols * (params.poly_len + 1));
         let prepacked_lwe = prep_pack_many_lwes(&params, &combined, num_rlwe_outputs);
 
-        let fake_pack_pub_params = generate_fake_pack_pub_params(&params);
-
-        let mut precomp: Precomp = Vec::new();
-        for i in 0..prepacked_lwe.len() {
-            let tup = precompute_pack(
-                params,
-                params.poly_len_log2,
-                &prepacked_lwe[i],
-                &fake_pack_pub_params,
-                &y_constants,
-            );
-            precomp.push(tup);
-        }
         debug!("Precomp in {} us", now.elapsed().as_micros());
+        let (precomp, y_constants, fake_pack_pub_params) = if packing == PackingType::CDKS {
+            let fake_pack_pub_params = generate_fake_pack_pub_params(&params);
+            let y_constants = generate_y_constants(&params);
+            let mut precomp: Precomp = Vec::new();
+            for i in 0..prepacked_lwe.len() {
+                let tup = precompute_pack(
+                    params,
+                    params.poly_len_log2,
+                    &prepacked_lwe[i],
+                    &fake_pack_pub_params,
+                    &y_constants,
+                );
+                precomp.push(tup);
+            }
+            (precomp, generate_y_constants(&params), fake_pack_pub_params)
+        } else {
+            (Vec::new(), (Vec::new(), Vec::new()), Vec::new())
+        };
 
         // InspiRING offline precomputation
         let gamma = params.poly_len;

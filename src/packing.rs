@@ -2273,6 +2273,10 @@ pub fn full_packing_with_preprocessing_offline<'a>(
             let pol2 = a_ct_tilde[j].get_poly(0, 0);
 
             let res_poly = r_pow_i.get_poly_mut(0, 0);
+            // For each component i, we will apply τ_{g^i} at the end.
+            // To place LWE j at slot X^j after rotation, we pre-multiply by X^{j · g^{-i}}
+            // so that τ_{g^i}(X^{j · g^{-i}}) = X^j.
+            // This is an optimization to avoid computing d many MLWEs, instead computing it all at once (only d-1 + 1 automorphs)
             let index = (j * packing_params.gen_pows[(params.poly_len - i) % params.poly_len])
                 % (2 * params.poly_len);
             let pol1 = if index < params.poly_len {
@@ -2324,6 +2328,7 @@ pub fn full_packing_with_preprocessing_offline<'a>(
     let mut bold_t_g = PolyMatrixNTT::zero(&params, num_to_pack_half - 1, params.t_exp_left);
     let mut bold_t_bar_g = PolyMatrixNTT::zero(&params, num_to_pack_half - 1, params.t_exp_left);
 
+    // walk backwards
     for i in (0..num_to_pack_half - 1).rev() {
         let gadget = gadget_invert_transposed_alloc(&r_all[i + 1].raw(), params.t_exp_left).ntt();
         bold_t_g.copy_into(&gadget, i, 0);
@@ -2363,9 +2368,9 @@ pub fn full_packing_with_preprocessing_offline<'a>(
 
     PrecompInsPIR {
         a_hat: r_all[0].raw(),
-        bold_t_condensed: condense_matrix(&params, &bold_t_g),
-        bold_t_bar_condensed: condense_matrix(&params, &bold_t_bar_g),
-        bold_t_hat_condensed: condense_matrix(&params, &bold_t_hat),
+        bold_t_condensed: condense_matrix(&params, &bold_t_g), // first half NTTs
+        bold_t_bar_condensed: condense_matrix(&params, &bold_t_bar_g), // second half NTTs
+        bold_t_hat_condensed: condense_matrix(&params, &bold_t_hat), // final NTT
     }
 }
 
