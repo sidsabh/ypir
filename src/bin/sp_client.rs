@@ -134,7 +134,7 @@ fn main() -> std::io::Result<()> {
     info!("Num embeddings: {}", setup.db_rows / args.embedding_width);
 
     // Local params constructed from setup
-    let params = params_for_scenario_simplepir(setup.num_items, setup.item_size_bits);
+    let params = params_for_scenario_simplepir(setup.num_items, setup.item_size_bits, PackingType::CDKS);
 
     let mut output_file = File::create(&args.output)?;
 

@@ -59,7 +59,7 @@ pub fn run_ypir_batched(
     );
 
     let params = if is_simplepir || word {
-        params_for_scenario_simplepir(num_items, item_size_bits)
+        params_for_scenario_simplepir(num_items, item_size_bits, packing)
     } else {
         assert!(item_size_bits <= 8, "Standard YPIR supports item sizes of 1-8 bits.");
         params_for_scenario(num_items, item_size_bits)

@@ -489,9 +489,8 @@ impl<'p, 'c> YClient<'p, 'c> {
         // CDKS multiplies b-values by N, so N * inv_N = 1 mod Q — noise is NOT amplified.
         let scale: u64 = (1u128 << 64).wrapping_div(self.params.pt_modulus as u128) as u64;
 
-        let dg = DiscreteGaussian::init(self.params.noise_width);
+        let dg = DiscreteGaussian::init(4418.5413158135); // (2^64/q=268369921*249561089) * 6.4 * sqrt(2*pi)
         let mut rng = ChaCha20Rng::from_entropy();
-        let q_to_word: u128 = (1u128 << 64) / q as u128; // floor(2^64 / Q)
 
         let mut query = vec![0u64; db_rows];
         for j in 0..db_rows {
@@ -502,12 +501,7 @@ impl<'p, 'c> YClient<'p, 'c> {
             }
 
             // Add noise: sample in Z_Q, lift to Z_{2^64} preserving sign
-            let e = dg.sample(q, &mut rng);
-            let e_word: u64 = if e <= q / 2 {
-                (e as u128 * q_to_word) as u64
-            } else {
-                0u64.wrapping_sub(((q - e) as u128 * q_to_word) as u64)
-            };
+            let e_word = dg.sample_wordpir(1i128 << 64, &mut rng);
             val = val.wrapping_add(e_word);
 
             // Add indicator

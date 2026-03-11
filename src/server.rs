@@ -2038,7 +2038,7 @@ where
                     }
                     switched
                 },
-                _ => {
+                PackingType::CDKS => {
                     let packed = pack_many_lwes(
                         &params,
                         &prepacked_lwe,
@@ -2056,6 +2056,7 @@ where
                     }
                     switched
                 },
+                _ => panic!("Unsupported packing type for online computation"),
             };
             all_responses.push(packed_mod_switched);
         }

@@ -64,7 +64,7 @@ fn main() -> std::io::Result<()> {
     env_logger::init();
     let args = Args::parse();
 
-    let params_obj = params_for_scenario_simplepir(args.num_items, args.item_size_bits);
+    let params_obj = params_for_scenario_simplepir(args.num_items, args.item_size_bits, ypir::packing::PackingType::CDKS);
     let params: &'static Params = Box::leak(Box::new(params_obj));
 
     let db_rows = 1 << (params.db_dim_1 + params.poly_len_log2);
