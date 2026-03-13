@@ -1,0 +1,99 @@
+/// CUDA FFI bindings for Toeplitz-based offline computation.
+
+#[cfg(all(feature = "cuda", feature = "toeplitz"))]
+extern "C" {
+    fn init_toeplitz_context(
+        db: *const u8,
+        v_nega_perm_a: *const u32,
+        moduli: *const u64,
+        barrett_cr: *const u64,
+        db_rows: u32,
+        db_rows_padded: u32,
+        db_cols: u32,
+        n: u32,
+        crt_count: u32,
+        max_adds: u32,
+        mod0_inv_mod1: u64,
+        mod1_inv_mod0: u64,
+        barrett_cr_0_modulus: u64,
+        barrett_cr_1_modulus: u64,
+    ) -> *mut std::ffi::c_void;
+
+    fn compute_hint_0_toeplitz(context: *mut std::ffi::c_void, hint_0: *mut u64) -> i32;
+
+    fn free_toeplitz_context(context: *mut std::ffi::c_void);
+}
+
+#[cfg(all(feature = "cuda", feature = "toeplitz"))]
+pub struct ToeplitzContext {
+    ctx: *mut std::ffi::c_void,
+    n: u32,
+    db_cols: u32,
+}
+
+#[cfg(all(feature = "cuda", feature = "toeplitz"))]
+impl ToeplitzContext {
+    pub fn new(
+        db_rows: u32,
+        db_rows_padded: u32,
+        db_cols: u32,
+        n: u32,
+        crt_count: u32,
+        max_adds: u32,
+        db: &[u8],
+        v_nega_perm_a: &[u32],
+        moduli: &[u64],
+        barrett_cr: &[u64],
+        mod0_inv_mod1: u64,
+        mod1_inv_mod0: u64,
+        barrett_cr_0_modulus: u64,
+        barrett_cr_1_modulus: u64,
+    ) -> Result<Self, String> {
+        let ctx = unsafe {
+            init_toeplitz_context(
+                db.as_ptr(),
+                v_nega_perm_a.as_ptr(),
+                moduli.as_ptr(),
+                barrett_cr.as_ptr(),
+                db_rows,
+                db_rows_padded,
+                db_cols,
+                n,
+                crt_count,
+                max_adds,
+                mod0_inv_mod1,
+                mod1_inv_mod0,
+                barrett_cr_0_modulus,
+                barrett_cr_1_modulus,
+            )
+        };
+
+        if ctx.is_null() {
+            Err("Failed to initialize Toeplitz GPU context".to_string())
+        } else {
+            Ok(ToeplitzContext { ctx, n, db_cols })
+        }
+    }
+
+    pub fn compute_hint_0(&self) -> Result<Vec<u64>, String> {
+        let hint_size = (self.n * self.db_cols) as usize;
+        let mut hint_0 = vec![0u64; hint_size];
+
+        let result = unsafe { compute_hint_0_toeplitz(self.ctx, hint_0.as_mut_ptr()) };
+
+        if result == 0 {
+            Ok(hint_0)
+        } else {
+            Err("CUDA Toeplitz kernel failed".to_string())
+        }
+    }
+}
+
+#[cfg(all(feature = "cuda", feature = "toeplitz"))]
+impl Drop for ToeplitzContext {
+    fn drop(&mut self) {
+        unsafe {
+            free_toeplitz_context(self.ctx);
+        }
+    }
+}

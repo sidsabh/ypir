@@ -4,6 +4,7 @@ use log::debug;
 
 use spiral_rs::{arith::rescale, client::Client, params::Params, poly::*};
 
+#[allow(unused_imports)]
 use super::{
     lwe::LWEParams,
     packing::PackingType,

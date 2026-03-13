@@ -348,7 +348,7 @@ pub fn precompute_pack<'a>(
                 let ct: &PolyMatrixNTT<'_> = &ct_sum_1; // we want to automorph him
                 let t = (1 << cur_ell) + 1; // tau
                 let t_exp = params.t_exp_left;
-                let (cur_ginv_ct_ntt, cur_ct_auto_1_ntt) = {
+                let (cur_ginv_ct_ntt, _cur_ct_auto_1_ntt) = {
                     let now = Instant::now();
                     // let ct_raw = ct.raw();
 

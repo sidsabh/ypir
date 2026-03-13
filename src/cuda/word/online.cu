@@ -16,7 +16,9 @@
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdint>
-#include "ntt.cuh"
+#include <cstdlib>
+#include "common/ntt.cuh"
+#include "inspiring/tc_packing.cuh"
 
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm.h"
@@ -1190,6 +1192,8 @@ struct WordOnlineContext {
     size_t num_rotations;              // poly_len/2 - 1
     uint64_t* d_y_body_streams;        // num_streams * z_body_per_client (expand input)
 
+    // Alternate packing path (tc_packing)
+    void* tc_packing_ctx;              // TcPackingContext*, nullptr = use SIMT path
 };
 
 // ---------- Expand rotations kernel (fused) ----------
@@ -1273,6 +1277,7 @@ void* ypir_word_online_init(
     uint64_t inv_n)
 {
     WordOnlineContext* ctx = new WordOnlineContext();
+    ctx->tc_packing_ctx  = nullptr;
 
     ctx->db_rows         = db_rows;
     ctx->db_rows_padded  = db_rows_padded;
@@ -1654,6 +1659,33 @@ void ypir_word_online_init_packing_inspir_from_gpu(
         ctx->d_scratch_batch[i] = ctx->d_scratch_contiguous + i * (scratch_bytes / sizeof(uint64_t));
 
     CUDA_ASSERT(cudaDeviceSynchronize());
+
+    // Optionally initialize tc_packing path (env var toggle)
+    const char* tc_env = getenv("YPIR_TC_PACKING");
+    if (tc_env && tc_env[0] == '1') {
+        size_t q_1_bits = word_ceil_log2_u64(ctx->rlwe_q_prime_2);
+        size_t q_2_bits = word_ceil_log2_u64(ctx->rlwe_q_prime_1);
+        size_t resp_bpo = ((q_1_bits + q_2_bits) * poly_len + 7) / 8;
+
+        ctx->tc_packing_ctx = tc_packing_init(
+            ctx->d_bold_t_condensed,
+            ctx->d_bold_t_bar_condensed,
+            ctx->d_bold_t_hat_condensed,
+            ctx->d_a_hat,
+            ctx->d_tables,
+            ctx->d_gen_pows,
+            ctx->num_iter,
+            ctx->t_exp_left,
+            poly_len,
+            ctx->num_rlwe_outputs,
+            ctx->max_batch_size,
+            ctx->rlwe_q_prime_1,
+            ctx->rlwe_q_prime_2,
+            resp_bpo,
+            ctx->ntt_params,
+            ctx->is_sm80 ? 2 : (ctx->has_tensor_cores ? 1 : 0));
+        printf("TcPacking enabled via YPIR_TC_PACKING=1\n");
+    }
 }
 
 void ypir_word_online_compute_batch(
@@ -2028,149 +2060,155 @@ void ypir_word_online_compute_batch_inspir(
                                M * N * sizeof(uint64_t), cudaMemcpyDeviceToDevice));
     }
 
-    // Record Step1 completion event (don't block — let Step2 overlap)
-    cudaEvent_t step1_done;
-    CUDA_ASSERT(cudaEventCreateWithFlags(&step1_done, cudaEventDisableTiming));
-    CUDA_ASSERT(cudaEventRecord(step1_done, 0));  // default stream
+    // Wait for Step1 to complete before packing
+    CUDA_ASSERT(cudaDeviceSynchronize());
 
-    // Also record a timing event for reporting
     cudaEvent_t step1_timing_end;
     CUDA_ASSERT(cudaEventCreate(&step1_timing_end));
     CUDA_ASSERT(cudaEventRecord(step1_timing_end, 0));
 
-    // ── Step 2: InspiRING packing (concurrent with Step1) ──
-    // Phase A: upload y_body + z_body (per-client streams, concurrent with Step1)
-    // Phase B: fused expand+IP (single kernel, on-the-fly permutation, bold_t via smem)
-    // Phase C: wait for Step1 + post-process (per-client streams)
+    // ── Step 2: InspiRING packing ──
 
     size_t resp_bytes_per_batch = num_outputs * ctx->response_bytes_per_output;
-    size_t z_body_bytes = ctx->z_body_per_client * sizeof(uint64_t);
-    size_t D = ctx->num_iter * ctx->t_exp_left;
-    // Always use fused kernel — y_body fits in L2, bold_t in smem has much less total traffic
-    // than tiled IP which reads y_all or bold_t redundantly across blocks
 
-    for (size_t chunk_start = 0; chunk_start < batch_size; chunk_start += ctx->num_streams) {
-        size_t chunk_end = chunk_start + ctx->num_streams;
-        if (chunk_end > batch_size) chunk_end = batch_size;
-        size_t chunk_size = chunk_end - chunk_start;
+    if (ctx->tc_packing_ctx) {
+        // ── TC packing path (Phase 1: SIMT kernels via separate context) ──
+        // Upload y_body + z_body to GPU
+        size_t z_body_bytes = ctx->z_body_per_client * sizeof(uint64_t);
+        CUDA_ASSERT(cudaMemcpy(ctx->d_y_body_streams,
+            y_body_condensed, batch_size * z_body_bytes, cudaMemcpyHostToDevice));
+        CUDA_ASSERT(cudaMemcpy(ctx->d_z_body_streams,
+            z_body_condensed, batch_size * z_body_bytes, cudaMemcpyHostToDevice));
 
-        // Phase A+B: upload + expand + inner product
-        size_t scratch_stride = ctx->num_rlwe_outputs * ctx->inspir_scratch_per_output;
+        tc_packing_run(
+            ctx->tc_packing_ctx,
+            ctx->d_intermediate,
+            ctx->d_y_body_streams,
+            ctx->d_z_body_streams,
+            ctx->d_all_responses,
+            batch_size);
 
-        // Upload y_body + z_body on per-client streams (CONCURRENT with Step1)
-        for (size_t i = chunk_start; i < chunk_end; i++) {
-            size_t s = i - chunk_start;
-            cudaStream_t stream = ctx->streams[s];
+    } else {
+        // ── Original SIMT packing path ──
+        size_t z_body_bytes = ctx->z_body_per_client * sizeof(uint64_t);
+        size_t D = ctx->num_iter * ctx->t_exp_left;
 
-            uint64_t* d_y_body_s = ctx->d_y_body_streams + s * ctx->z_body_per_client;
-            uint64_t* d_z_body_s = ctx->d_z_body_streams + s * ctx->z_body_per_client;
+        for (size_t chunk_start = 0; chunk_start < batch_size; chunk_start += ctx->num_streams) {
+            size_t chunk_end = chunk_start + ctx->num_streams;
+            if (chunk_end > batch_size) chunk_end = batch_size;
+            size_t chunk_size = chunk_end - chunk_start;
 
-            CUDA_ASSERT(cudaMemcpyAsync(d_y_body_s,
-                y_body_condensed + i * ctx->z_body_per_client,
-                z_body_bytes, cudaMemcpyHostToDevice, stream));
-            CUDA_ASSERT(cudaMemcpyAsync(d_z_body_s,
-                z_body_condensed + i * ctx->z_body_per_client,
-                z_body_bytes, cudaMemcpyHostToDevice, stream));
-        }
+            size_t scratch_stride = ctx->num_rlwe_outputs * ctx->inspir_scratch_per_output;
 
-        // Sync all per-client streams to ip_stream
-        cudaStream_t ip_stream = ctx->streams[0];
-        for (size_t s = 0; s < chunk_size; s++) {
-            cudaEvent_t ev;
-            CUDA_ASSERT(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
-            CUDA_ASSERT(cudaEventRecord(ev, ctx->streams[s]));
-            CUDA_ASSERT(cudaStreamWaitEvent(ip_stream, ev, 0));
-            CUDA_ASSERT(cudaEventDestroy(ev));
-        }
+            // Upload y_body + z_body on per-client streams
+            for (size_t i = chunk_start; i < chunk_end; i++) {
+                size_t s = i - chunk_start;
+                cudaStream_t stream = ctx->streams[s];
 
-        // Inner product kernel selection:
-        // Multi-output: each thread handles ALL outputs, reads y_body ONCE
-        //   → eliminates num_outputs× redundant y_body and table reads
-        // Single-output: original fused kernel (bold_t in smem)
-        if (num_outputs > 1) {
-            launch_multi_output_kernel(
-                num_outputs, chunk_size, poly_len, ip_stream,
-                ctx->d_scratch_contiguous,
-                ctx->d_bold_t_condensed,
-                ctx->d_bold_t_bar_condensed,
-                ctx->d_bold_t_hat_condensed,
-                ctx->d_y_body_streams,
-                ctx->d_z_body_streams,
-                ctx->d_tables,
-                ctx->d_gen_pows,
-                chunk_size, D, ctx->t_exp_left,
-                ctx->inspir_scratch_per_output,
-                ctx->z_body_per_client,
-                ctx->z_body_per_client,
-                scratch_stride,
-                ctx->ntt_params);
-        } else {
-            size_t batch_per_block = chunk_size;
-            if (batch_per_block > 32) batch_per_block = 32;
-            dim3 fip_block(FIP_TILE_Z, batch_per_block);
-            dim3 fip_grid((poly_len + FIP_TILE_Z - 1) / FIP_TILE_Z,
-                           (chunk_size + batch_per_block - 1) / batch_per_block,
-                           num_outputs);
+                uint64_t* d_y_body_s = ctx->d_y_body_streams + s * ctx->z_body_per_client;
+                uint64_t* d_z_body_s = ctx->d_z_body_streams + s * ctx->z_body_per_client;
 
-            inspir_fused_expand_ip<<<fip_grid, fip_block, 0, ip_stream>>>(
-                ctx->d_scratch_contiguous,
-                ctx->d_bold_t_condensed,
-                ctx->d_bold_t_bar_condensed,
-                ctx->d_bold_t_hat_condensed,
-                ctx->d_y_body_streams,
-                ctx->d_z_body_streams,
-                ctx->d_tables,
-                ctx->d_gen_pows,
-                chunk_size,
-                num_outputs,
-                D,
-                poly_len,
-                ctx->t_exp_left,
-                ctx->inspir_scratch_per_output,
-                ctx->z_body_per_client,
-                ctx->z_body_per_client,
-                scratch_stride,
-                ctx->ntt_params);
-            CUDA_ASSERT(cudaGetLastError());
-        }
-
-        // Make all per-client streams wait for batched IP to finish
-        {
-            cudaEvent_t ip_done;
-            CUDA_ASSERT(cudaEventCreateWithFlags(&ip_done, cudaEventDisableTiming));
-            CUDA_ASSERT(cudaEventRecord(ip_done, ip_stream));
-            for (size_t s = 0; s < chunk_size; s++) {
-                CUDA_ASSERT(cudaStreamWaitEvent(ctx->streams[s], ip_done, 0));
+                CUDA_ASSERT(cudaMemcpyAsync(d_y_body_s,
+                    y_body_condensed + i * ctx->z_body_per_client,
+                    z_body_bytes, cudaMemcpyHostToDevice, stream));
+                CUDA_ASSERT(cudaMemcpyAsync(d_z_body_s,
+                    z_body_condensed + i * ctx->z_body_per_client,
+                    z_body_bytes, cudaMemcpyHostToDevice, stream));
             }
-            CUDA_ASSERT(cudaEventDestroy(ip_done));
-        }
 
-        // Phase C: wait for Step1, then post-process on per-client streams
-        for (size_t i = chunk_start; i < chunk_end; i++) {
-            size_t s = i - chunk_start;
-            cudaStream_t stream = ctx->streams[s];
+            // Sync all per-client streams to ip_stream
+            cudaStream_t ip_stream = ctx->streams[0];
+            for (size_t s = 0; s < chunk_size; s++) {
+                cudaEvent_t ev;
+                CUDA_ASSERT(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+                CUDA_ASSERT(cudaEventRecord(ev, ctx->streams[s]));
+                CUDA_ASSERT(cudaStreamWaitEvent(ip_stream, ev, 0));
+                CUDA_ASSERT(cudaEventDestroy(ev));
+            }
 
-            CUDA_ASSERT(cudaStreamWaitEvent(stream, step1_done, 0));
+            if (num_outputs > 1) {
+                launch_multi_output_kernel(
+                    num_outputs, chunk_size, poly_len, ip_stream,
+                    ctx->d_scratch_contiguous,
+                    ctx->d_bold_t_condensed,
+                    ctx->d_bold_t_bar_condensed,
+                    ctx->d_bold_t_hat_condensed,
+                    ctx->d_y_body_streams,
+                    ctx->d_z_body_streams,
+                    ctx->d_tables,
+                    ctx->d_gen_pows,
+                    chunk_size, D, ctx->t_exp_left,
+                    ctx->inspir_scratch_per_output,
+                    ctx->z_body_per_client,
+                    ctx->z_body_per_client,
+                    scratch_stride,
+                    ctx->ntt_params);
+            } else {
+                size_t batch_per_block = chunk_size;
+                if (batch_per_block > 32) batch_per_block = 32;
+                dim3 fip_block(FIP_TILE_Z, batch_per_block);
+                dim3 fip_grid((poly_len + FIP_TILE_Z - 1) / FIP_TILE_Z,
+                               (chunk_size + batch_per_block - 1) / batch_per_block,
+                               num_outputs);
 
-            uint8_t* d_resp_i = ctx->d_all_responses + i * resp_bytes_per_batch;
-            const uint64_t* d_inter_i = ctx->d_intermediate + i * M;
+                inspir_fused_expand_ip<<<fip_grid, fip_block, 0, ip_stream>>>(
+                    ctx->d_scratch_contiguous,
+                    ctx->d_bold_t_condensed,
+                    ctx->d_bold_t_bar_condensed,
+                    ctx->d_bold_t_hat_condensed,
+                    ctx->d_y_body_streams,
+                    ctx->d_z_body_streams,
+                    ctx->d_tables,
+                    ctx->d_gen_pows,
+                    chunk_size,
+                    num_outputs,
+                    D,
+                    poly_len,
+                    ctx->t_exp_left,
+                    ctx->inspir_scratch_per_output,
+                    ctx->z_body_per_client,
+                    ctx->z_body_per_client,
+                    scratch_stride,
+                    ctx->ntt_params);
+                CUDA_ASSERT(cudaGetLastError());
+            }
 
-            inspir_post_process<<<num_outputs, 1024, 0, stream>>>(
-                d_resp_i,
-                d_inter_i,
-                ctx->d_a_hat,
-                ctx->d_scratch_batch[s],
-                num_outputs,
-                ctx->rlwe_q_prime_1,
-                ctx->rlwe_q_prime_2,
-                ctx->response_bytes_per_output,
-                ctx->inspir_scratch_per_output,
-                ctx->ntt_params);
-            CUDA_ASSERT(cudaGetLastError());
-        }
+            // Make all per-client streams wait for batched IP to finish
+            {
+                cudaEvent_t ip_done;
+                CUDA_ASSERT(cudaEventCreateWithFlags(&ip_done, cudaEventDisableTiming));
+                CUDA_ASSERT(cudaEventRecord(ip_done, ip_stream));
+                for (size_t s = 0; s < chunk_size; s++) {
+                    CUDA_ASSERT(cudaStreamWaitEvent(ctx->streams[s], ip_done, 0));
+                }
+                CUDA_ASSERT(cudaEventDestroy(ip_done));
+            }
 
-        for (size_t s = 0; s < chunk_size; s++) {
-            CUDA_ASSERT(cudaStreamSynchronize(ctx->streams[s]));
+            // Post-process on per-client streams
+            for (size_t i = chunk_start; i < chunk_end; i++) {
+                size_t s = i - chunk_start;
+                cudaStream_t stream = ctx->streams[s];
+
+                uint8_t* d_resp_i = ctx->d_all_responses + i * resp_bytes_per_batch;
+                const uint64_t* d_inter_i = ctx->d_intermediate + i * M;
+
+                inspir_post_process<<<num_outputs, 1024, 0, stream>>>(
+                    d_resp_i,
+                    d_inter_i,
+                    ctx->d_a_hat,
+                    ctx->d_scratch_batch[s],
+                    num_outputs,
+                    ctx->rlwe_q_prime_1,
+                    ctx->rlwe_q_prime_2,
+                    ctx->response_bytes_per_output,
+                    ctx->inspir_scratch_per_output,
+                    ctx->ntt_params);
+                CUDA_ASSERT(cudaGetLastError());
+            }
+
+            for (size_t s = 0; s < chunk_size; s++) {
+                CUDA_ASSERT(cudaStreamSynchronize(ctx->streams[s]));
+            }
         }
     }
 
@@ -2181,12 +2219,12 @@ void ypir_word_online_compute_batch_inspir(
     float ms_step1;
     CUDA_ASSERT(cudaEventElapsedTime(&ms_step1, step1_start, step1_timing_end));
 
-    printf("Word InspiRING Step1(%s)=%.1f ms, total=%.1f ms, packing_overhead=%.1f ms (%zu clients, %zu streams)\n",
+    printf("Word InspiRING Step1(%s)=%.1f ms, total=%.1f ms, packing_overhead=%.1f ms (%zu clients, %s)\n",
            ctx->has_tensor_cores ? "TC" : "SIMT", ms_step1, ms_total,
-           ms_total - ms_step1, batch_size, ctx->num_streams);
+           ms_total - ms_step1, batch_size,
+           ctx->tc_packing_ctx ? "tc_packing" : "simt");
 
     CUDA_ASSERT(cudaEventDestroy(step1_start));
-    CUDA_ASSERT(cudaEventDestroy(step1_done));
     CUDA_ASSERT(cudaEventDestroy(step1_timing_end));
 
     // Download all responses
@@ -2240,6 +2278,9 @@ void ypir_word_online_free(void* context)
     if (ctx->d_tables)               cudaFree(ctx->d_tables);
     if (ctx->d_gen_pows)             cudaFree(ctx->d_gen_pows);
     if (ctx->d_y_body_streams)       cudaFree(ctx->d_y_body_streams);
+
+    // Free tc_packing context if initialized
+    if (ctx->tc_packing_ctx) tc_packing_free(ctx->tc_packing_ctx);
 
     // Free contiguous scratch and pointer array
     if (ctx->d_scratch_contiguous) cudaFree(ctx->d_scratch_contiguous);

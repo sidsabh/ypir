@@ -1,7 +1,7 @@
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdint>
-#include "ntt.cuh"
+#include "common/ntt.cuh"
 
 #define CUDA_ASSERT(stmt) do { \
     cudaError_t err = (stmt);  \

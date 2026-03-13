@@ -4,3 +4,18 @@
 *.bin
 **/build
 InsPIRe
+
+# LaTeX build artifacts
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+
+# Claude Code
+.claude/
+
+# Notes and images (not source)
+*.png
+mod_switch.md

@@ -28,14 +28,18 @@ fn main() {
 }
 
 fn compile_cuda() {
-    println!("cargo:rerun-if-changed=src/cuda/offline_kernel.cu");
-    println!("cargo:rerun-if-changed=src/cuda/online_kernel.cu");
-    println!("cargo:rerun-if-changed=src/cuda/offline_kernel_sp.cu");
-    println!("cargo:rerun-if-changed=src/cuda/online_kernel_sp.cu");
-    println!("cargo:rerun-if-changed=src/cuda/offline_kernel_word.cu");
-    println!("cargo:rerun-if-changed=src/cuda/online_kernel_word.cu");
-    println!("cargo:rerun-if-changed=src/cuda/offline_inspir_precomp.cu");
-    println!("cargo:rerun-if-changed=src/cuda/ntt.cuh");
+    // Track all CUDA source files for rebuild detection
+    println!("cargo:rerun-if-changed=src/cuda/doublepir/offline.cu");
+    println!("cargo:rerun-if-changed=src/cuda/doublepir/online.cu");
+    println!("cargo:rerun-if-changed=src/cuda/simplepir/offline.cu");
+    println!("cargo:rerun-if-changed=src/cuda/simplepir/online.cu");
+    println!("cargo:rerun-if-changed=src/cuda/word/offline.cu");
+    println!("cargo:rerun-if-changed=src/cuda/word/online.cu");
+    println!("cargo:rerun-if-changed=src/cuda/inspiring/precomp.cu");
+    println!("cargo:rerun-if-changed=src/cuda/inspiring/packing.cuh");
+    println!("cargo:rerun-if-changed=src/cuda/inspiring/tc_packing.cu");
+    println!("cargo:rerun-if-changed=src/cuda/inspiring/tc_packing.cuh");
+    println!("cargo:rerun-if-changed=src/cuda/common/ntt.cuh");
 
     let out_dir = env::var("OUT_DIR").unwrap();
     let lib_path = PathBuf::from(&out_dir).join("libypir_cuda.so");
@@ -51,7 +55,7 @@ fn compile_cuda() {
 
     let arch_flag = format!("-arch={}", arch);
 
-    // CUTLASS is always needed (online_kernel.cu uses it for DoublePIR Step 1)
+    // CUTLASS is always needed (doublepir/online.cu uses it for DoublePIR Step 1)
     let cutlass_dir = find_cutlass_dir();
     let cutlass_include = format!("-I{}/include", cutlass_dir);
     let cutlass_tools  = format!("-I{}/tools/util/include", cutlass_dir);
@@ -63,35 +67,38 @@ fn compile_cuda() {
         "-shared".into(),
         "-std=c++17".into(),
         "--expt-relaxed-constexpr".into(),
+        // Include path for shared headers (ntt.cuh, packing.cuh)
+        "-Isrc/cuda".into(),
         cutlass_include,
         cutlass_tools,
         "-lcublas".into(),
     ];
 
-    // Common kernels
-    nvcc_args.push("src/cuda/offline_kernel.cu".into());
-    nvcc_args.push("src/cuda/online_kernel.cu".into());
-    nvcc_args.push("src/cuda/offline_kernel_sp.cu".into());
-    nvcc_args.push("src/cuda/offline_kernel_word.cu".into());
-    nvcc_args.push("src/cuda/online_kernel_word.cu".into());
-    nvcc_args.push("src/cuda/offline_inspir_precomp.cu".into());
+    // Core kernels (always compiled)
+    nvcc_args.push("src/cuda/doublepir/offline.cu".into());
+    nvcc_args.push("src/cuda/doublepir/online.cu".into());
+    nvcc_args.push("src/cuda/simplepir/offline.cu".into());
+    nvcc_args.push("src/cuda/word/offline.cu".into());
+    nvcc_args.push("src/cuda/word/online.cu".into());
+    nvcc_args.push("src/cuda/inspiring/precomp.cu".into());
+    nvcc_args.push("src/cuda/inspiring/tc_packing.cu".into());
 
     if cutlass_enabled {
         // SimplePIR CUTLASS variant
-        println!("cargo:rerun-if-changed=src/cuda/online_kernel_sp_cutlass.cu");
-        println!("cargo:warning=CUTLASS feature enabled — using online_kernel_sp_cutlass.cu");
-        nvcc_args.push("src/cuda/online_kernel_sp_cutlass.cu".into());
+        println!("cargo:rerun-if-changed=src/cuda/simplepir/online_cutlass.cu");
+        println!("cargo:warning=CUTLASS feature enabled — using simplepir/online_cutlass.cu");
+        nvcc_args.push("src/cuda/simplepir/online_cutlass.cu".into());
     } else {
-        nvcc_args.push("src/cuda/online_kernel_sp.cu".into());
+        nvcc_args.push("src/cuda/simplepir/online.cu".into());
     }
 
-    // Add toeplitz kernel - check CRT first since it implies toeplitz
+    // Toeplitz kernel (optional) - check CRT first since it implies toeplitz
     if toeplitz_crt_enabled {
-        println!("cargo:rerun-if-changed=src/cuda/offline_toeplitz_kernel_crt.cu");
-        nvcc_args.push("src/cuda/offline_toeplitz_kernel_crt.cu".into());
+        println!("cargo:rerun-if-changed=src/cuda/toeplitz/offline_crt.cu");
+        nvcc_args.push("src/cuda/toeplitz/offline_crt.cu".into());
     } else if toeplitz_enabled {
-        println!("cargo:rerun-if-changed=src/cuda/offline_toeplitz_kernel.cu");
-        nvcc_args.push("src/cuda/offline_toeplitz_kernel.cu".into());
+        println!("cargo:rerun-if-changed=src/cuda/toeplitz/offline.cu");
+        nvcc_args.push("src/cuda/toeplitz/offline.cu".into());
     }
 
     nvcc_args.push("-o".into());

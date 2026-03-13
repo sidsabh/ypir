@@ -18,7 +18,7 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdint.h>
-#include "ntt.cuh"
+#include "common/ntt.cuh"
 
 // ============================================================================
 // Context

@@ -489,7 +489,10 @@ impl<'p, 'c> YClient<'p, 'c> {
         // CDKS multiplies b-values by N, so N * inv_N = 1 mod Q — noise is NOT amplified.
         let scale: u64 = (1u128 << 64).wrapping_div(self.params.pt_modulus as u128) as u64;
 
-        let dg = DiscreteGaussian::init(4418.5413158135); // (2^64/q=268369921*249561089) * 6.4 * sqrt(2*pi)
+        // this is correct, but too slow right now (we getting lit soon)
+        // let dg = DiscreteGaussian::init(4418.5413158135); // (2^64/q=268369921*249561089) * 6.4 * sqrt(2*pi)
+        let dg = DiscreteGaussian::init(self.params.noise_width);
+
         let mut rng = ChaCha20Rng::from_entropy();
 
         let mut query = vec![0u64; db_rows];

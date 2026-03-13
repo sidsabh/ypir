@@ -3,7 +3,7 @@
 #include <cstdint>
 
 // Include shared NTT infrastructure
-#include "ntt.cuh"
+#include "common/ntt.cuh"
 
 
 // SimplePIR offline context

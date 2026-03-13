@@ -15,6 +15,8 @@ pub mod packing;
 pub mod params;
 pub mod scheme;
 pub mod server;
+#[cfg(feature = "cuda")]
+pub mod server_gpu;
 pub mod transpose;
 pub mod util;
 pub mod api;

@@ -1,4 +1,4 @@
-#include "ntt.cuh"
+#include "common/ntt.cuh"
 #include <cuda_runtime.h>
 
 extern "C" {

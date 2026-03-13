@@ -13,7 +13,7 @@ use crate::bits::{read_bits, u64s_to_contiguous_bytes};
 use crate::modulus_switch::ModulusSwitch;
 use crate::noise_analysis::YPIRSchemeParams;
 use crate::packing::{
-    condense_matrix, PackingKeys, PackingType,
+    condense_matrix, PackParams, PackingKeys, PackingType,
 };
 
 use super::{client::*, lwe::LWEParams, measurement::*, params::*, server::*};
@@ -109,6 +109,65 @@ impl Sample for u16 {
     }
 }
 
+fn generate_packing_keys<'a>(
+    packing: PackingType,
+    params: &'a Params,
+    sk_reg: &PolyMatrixRaw<'a>,
+    offline_packing_params: Option<&PackParams<'a>>,
+) -> (usize, PackingKeys<'a>) {
+    match packing {
+        PackingType::InspiRING => {
+            let pp = offline_packing_params.unwrap();
+            let packing_keys = PackingKeys::init_full(pp, sk_reg, W_SEED, V_SEED);
+            let size = packing_keys.get_size_bytes();
+            debug!("InspiRING packing key size: {} bytes", size);
+            (size, packing_keys)
+        },
+        _ => {
+            let pack_pub_params = raw_generate_expansion_params(
+                params,
+                sk_reg,
+                params.poly_len_log2,
+                params.t_exp_left,
+                &mut ChaCha20Rng::from_entropy(),
+                &mut ChaCha20Rng::from_seed(STATIC_SEED_2),
+            );
+            let mut pack_pub_params_row_1s = pack_pub_params.to_vec();
+            for i in 0..pack_pub_params.len() {
+                pack_pub_params_row_1s[i] =
+                    pack_pub_params[i].submatrix(1, 0, 1, pack_pub_params[i].cols);
+                pack_pub_params_row_1s[i] = condense_matrix(params, &pack_pub_params_row_1s[i]);
+            }
+            let size = get_vec_pm_size_bytes(&pack_pub_params_row_1s);
+            debug!("pub params size: {} bytes", size);
+            let packing_keys = PackingKeys::init_cdks_from_keys(params.clone(), pack_pub_params_row_1s);
+            (size, packing_keys)
+        },
+    }
+}
+
+fn finalize_measurements(measurements: &mut Vec<Measurement>, trials: usize) -> Measurement {
+    if trials > 1 {
+        measurements[1].offline = measurements[0].offline.clone();
+        measurements.remove(0);
+    }
+    let mut final_measurement = measurements[0].clone();
+    final_measurement.online.server_time_ms = mean(
+        &measurements
+            .iter()
+            .map(|m| m.online.server_time_ms)
+            .collect::<Vec<_>>(),
+    )
+    .round() as usize;
+    final_measurement.online.all_server_times_ms = measurements
+        .iter()
+        .map(|m| m.online.server_time_ms)
+        .collect::<Vec<_>>();
+    final_measurement.online.std_dev_server_time_ms =
+        std_dev(&final_measurement.online.all_server_times_ms);
+    final_measurement
+}
+
 pub fn run_simple_ypir_on_params<const K: usize>(params: Params, word: bool, trials: usize, packing: PackingType) -> Measurement {
 
     let is_simplepir = true;
@@ -123,8 +182,6 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, word: bool, tri
     let rlwe_q_prime_2 = params.get_q_prime_2();
 
     let num_rlwe_outputs = db_cols / params.poly_len;
-    let gamma = params.poly_len; // always full packing for InspiRING
-
     // --
 
     let now = Instant::now();
@@ -185,35 +242,9 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, word: bool, tri
             client.generate_secret_keys();
             let sk_reg = &client.get_sk_reg();
 
-            let (pub_params_size, pk) = match packing {
-                PackingType::InspiRING => {
-                    let pp = offline_values.packing_params.as_ref().unwrap();
-                    let packing_keys = PackingKeys::init_full(pp, sk_reg, W_SEED, V_SEED);
-                    let size = packing_keys.get_size_bytes();
-                    debug!("InspiRING packing key size: {} bytes", size);
-                    (size, packing_keys)
-                },
-                _ => {
-                    let pack_pub_params = raw_generate_expansion_params(
-                        &params,
-                        &sk_reg,
-                        params.poly_len_log2,
-                        params.t_exp_left,
-                        &mut ChaCha20Rng::from_entropy(),
-                        &mut ChaCha20Rng::from_seed(STATIC_SEED_2),
-                    );
-                    let mut pack_pub_params_row_1s = pack_pub_params.to_vec();
-                    for i in 0..pack_pub_params.len() {
-                        pack_pub_params_row_1s[i] =
-                            pack_pub_params[i].submatrix(1, 0, 1, pack_pub_params[i].cols);
-                        pack_pub_params_row_1s[i] = condense_matrix(&params, &pack_pub_params_row_1s[i]);
-                    }
-                    let size = get_vec_pm_size_bytes(&pack_pub_params_row_1s);
-                    debug!("pub params size: {} bytes", size);
-                    let packing_keys = PackingKeys::init_cdks_from_keys(params.clone(), pack_pub_params_row_1s);
-                    (size, packing_keys)
-                },
-            };
+            let (pub_params_size, pk) = generate_packing_keys(
+                packing, &params, sk_reg, offline_values.packing_params.as_ref(),
+            );
 
             let y_client = YClient::new(client, &params);
 
@@ -341,29 +372,7 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, word: bool, tri
         measurement.online.server_time_ms = online_server_time_ms as usize;
     }
 
-    // discard the first measurement (if there were multiple trials)
-    // copy offline values from the first measurement to the second measurement
-    if trials > 1 {
-        measurements[1].offline = measurements[0].offline.clone();
-        measurements.remove(0);
-    }
-
-    let mut final_measurement = measurements[0].clone();
-    final_measurement.online.server_time_ms = mean(
-        &measurements
-            .iter()
-            .map(|m| m.online.server_time_ms)
-            .collect::<Vec<_>>(),
-    )
-    .round() as usize;
-    final_measurement.online.all_server_times_ms = measurements
-        .iter()
-        .map(|m| m.online.server_time_ms)
-        .collect::<Vec<_>>();
-    final_measurement.online.std_dev_server_time_ms =
-        std_dev(&final_measurement.online.all_server_times_ms);
-
-    final_measurement
+    finalize_measurements(&mut measurements, trials)
 }
 
 pub fn run_ypir_on_params<const K: usize>(
@@ -395,8 +404,6 @@ pub fn run_ypir_on_params<const K: usize>(
 
     // The number of bits represented by a plaintext RLWE coefficient
     let pt_bits = (params.pt_modulus as f64).log2().floor() as usize;
-    // assert_eq!(pt_bits, 16);
-
     // The factor by which ciphertext values are bigger than plaintext values
     let blowup_factor = lwe_q_prime_bits as f64 / pt_bits as f64;
     debug!("blowup_factor: {}", blowup_factor);
@@ -479,7 +486,6 @@ pub fn run_ypir_on_params<const K: usize>(
     let offline_server_time_ms = start_offline_comp.elapsed().as_millis();
 
     let packed_query_row_sz = params.db_rows_padded();
-    // let mut all_queries_packed = AlignedMemory64::new(K * packed_query_row_sz);
 
     for trial in 0..trials + 1 {
         let mut measurement = &mut measurements[trial];
@@ -516,35 +522,9 @@ pub fn run_ypir_on_params<const K: usize>(
             client.generate_secret_keys();
             let sk_reg = &client.get_sk_reg();
 
-            let (pub_params_size, pk) = match packing {
-                PackingType::InspiRING => {
-                    let pp = offline_values.packing_params.as_ref().unwrap();
-                    let packing_keys = PackingKeys::init_full(pp, sk_reg, W_SEED, V_SEED);
-                    let size = packing_keys.get_size_bytes();
-                    debug!("InspiRING packing key size: {} bytes", size);
-                    (size, packing_keys)
-                },
-                _ => {
-                    let pack_pub_params = raw_generate_expansion_params(
-                        &params,
-                        &sk_reg,
-                        params.poly_len_log2,
-                        params.t_exp_left,
-                        &mut ChaCha20Rng::from_entropy(),
-                        &mut ChaCha20Rng::from_seed(STATIC_SEED_2),
-                    );
-                    let mut pack_pub_params_row_1s = pack_pub_params.to_vec();
-                    for i in 0..pack_pub_params.len() {
-                        pack_pub_params_row_1s[i] =
-                            pack_pub_params[i].submatrix(1, 0, 1, pack_pub_params[i].cols);
-                        pack_pub_params_row_1s[i] = condense_matrix(&params, &pack_pub_params_row_1s[i]);
-                    }
-                    let size = get_vec_pm_size_bytes(&pack_pub_params_row_1s);
-                    debug!("pub params size: {} bytes", size);
-                    let packing_keys = PackingKeys::init_cdks_from_keys(params.clone(), pack_pub_params_row_1s);
-                    (size, packing_keys)
-                },
-            };
+            let (pub_params_size, pk) = generate_packing_keys(
+                packing, &params, sk_reg, offline_values.packing_params.as_ref(),
+            );
 
             let y_client = YClient::new(client, &params);
             let query_row = y_client.generate_query(SEED_0, params.db_dim_1, PackingType::NoPacking, target_row, None, None);
@@ -689,8 +669,6 @@ pub fn run_ypir_on_params<const K: usize>(
             inner_ct.data[lwe_params.n] = rescale(val, lwe_q_prime, lwe_params.modulus);
 
             debug!("decrypting inner ct...");
-            // let plaintext = decrypt_ct_reg_measured(y_client.client(), &params, &inner_ct.ntt(), 1);
-            // let final_result = plaintext.data[0];
             let inner_ct_as_u32 = inner_ct
                 .as_slice()
                 .iter()
@@ -703,7 +681,6 @@ pub fn run_ypir_on_params<const K: usize>(
             measurement.online.client_decode_time_ms = start_decode.elapsed().as_millis() as usize;
 
             debug!("got {}, expected {}", final_result, corr_result);
-            // debug!("was correct? {}", final_result == corr_result);
             assert_eq!(final_result, corr_result);
         }
 
@@ -713,32 +690,8 @@ pub fn run_ypir_on_params<const K: usize>(
         measurement.online.sqrt_n_bytes = sqrt_n_bytes;
     }
 
-    // discard the first measurement (if there were multiple trials)
-    // copy offline values from the first measurement to the second measurement
-    if trials > 1 {
-        measurements[1].offline = measurements[0].offline.clone();
-        measurements.remove(0);
-    }
-
-    let mut final_measurement = measurements[0].clone();
-    final_measurement.online.server_time_ms = mean(
-        &measurements
-            .iter()
-            .map(|m| m.online.server_time_ms)
-            .collect::<Vec<_>>(),
-    )
-    .round() as usize;
-    final_measurement.online.all_server_times_ms = measurements
-        .iter()
-        .map(|m| m.online.server_time_ms)
-        .collect::<Vec<_>>();
-    final_measurement.online.std_dev_server_time_ms =
-        std_dev(&final_measurement.online.all_server_times_ms);
-
-    final_measurement
+    finalize_measurements(&mut measurements, trials)
 }
-
-
 
 fn mean(xs: &[usize]) -> f64 {
     xs.iter().map(|x| *x as f64).sum::<f64>() / xs.len() as f64

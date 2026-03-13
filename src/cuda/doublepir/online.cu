@@ -2,7 +2,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
-#include "ntt.cuh"
+#include "common/ntt.cuh"
 
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm.h"
