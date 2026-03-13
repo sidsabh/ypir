@@ -495,6 +495,9 @@ impl<'p, 'c> YClient<'p, 'c> {
 
         let mut rng = ChaCha20Rng::from_entropy();
 
+        let q_to_word: u128 = (1u128 << 64) / q as u128; // floor(2^64 / Q)
+
+
         let mut query = vec![0u64; db_rows];
         for j in 0..db_rows {
             // q[j] = -sum_i(s[i] * A[i*db_rows+j]) + e + δ·scale
@@ -503,8 +506,15 @@ impl<'p, 'c> YClient<'p, 'c> {
                 val = val.wrapping_sub((s[i] as u64).wrapping_mul(a[i * db_rows + j]));
             }
 
+            // this is correct, but too slow right now (we getting lit soon)
+            // let e_word = dg.sample_wordpir(1i128 << 64, &mut rng);
             // Add noise: sample in Z_Q, lift to Z_{2^64} preserving sign
-            let e_word = dg.sample_wordpir(1i128 << 64, &mut rng);
+             let e = dg.sample(q, &mut rng);
+            let e_word: u64 = if e <= q / 2 {
+                (e as u128 * q_to_word) as u64
+            } else {
+                0u64.wrapping_sub(((q - e) as u128 * q_to_word) as u64)
+            };
             val = val.wrapping_add(e_word);
 
             // Add indicator
