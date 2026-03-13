@@ -1685,6 +1685,10 @@ void ypir_word_online_init_packing_inspir_from_gpu(
             ctx->ntt_params,
             ctx->is_sm80 ? 2 : (ctx->has_tensor_cores ? 1 : 0));
         printf("TcPacking enabled via YPIR_TC_PACKING=1\n");
+
+        // tc_packing_init took ownership and freed bold_t/bold_t_bar — null our pointers
+        ctx->d_bold_t_condensed = nullptr;
+        ctx->d_bold_t_bar_condensed = nullptr;
     }
 }
 

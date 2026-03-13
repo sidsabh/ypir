@@ -73,11 +73,13 @@ extern "C" {
 /**
  * Initialize tensor core packing context.
  * Builds M_combined from bold_t/bold_t_bar + permutation tables on GPU.
- * All input device pointers are borrowed (not freed).
+ * Takes OWNERSHIP of d_bold_t and d_bold_t_bar — frees them after M build
+ * to reduce peak memory (their data is fully absorbed into M).
+ * Other input device pointers are borrowed (not freed).
  */
 void* tc_packing_init(
-    const uint64_t* d_bold_t_condensed,
-    const uint64_t* d_bold_t_bar_condensed,
+    uint64_t* d_bold_t_condensed,
+    uint64_t* d_bold_t_bar_condensed,
     const uint64_t* d_bold_t_hat_condensed,
     const uint64_t* d_a_hat,
     const uint32_t* d_tables,

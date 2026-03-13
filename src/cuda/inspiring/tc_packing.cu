@@ -117,68 +117,45 @@ static cutlass::Status run_tc_gemm(int gpu_tier,
 // ═══════════════════════════════════════════════════════════════
 
 /**
- * Build M_combined from bold_t, bold_t_bar, tables, gen_pows.
- *
- * For each (k, o, z): loop over R rotations i, accumulate:
- *   M[k*N + σ_i(z),  o*N + z] += T_o[it+k, z]      (Term 1)
- *   M[k*N + σ̄_i(z), o*N + z] += T̄_o[it+k, z]      (Term 2)
- *
- * Outputs two separate CRT arrays (NOT condensed) to avoid carry corruption.
- * Each is ColumnMajor [K_gemm × N_gemm] uint64, ldb = K_gemm.
- * After build, values are Barrett-reduced mod q0/q1.
+ * Build full M_combined from bold_t, bold_t_bar (fast path, needs 2×K×N uint64 temp).
  * Grid: (ceil(N/256), ρ, t)
  */
 __global__ void build_M_combined_kernel(
-    uint64_t* __restrict__ d_M_crt0,                // [K_gemm × N_gemm] ColMaj, zero-initialized
-    uint64_t* __restrict__ d_M_crt1,                // [K_gemm × N_gemm] ColMaj, zero-initialized
-    const uint64_t* __restrict__ d_bold_t,          // [ρ × D × N] condensed
-    const uint64_t* __restrict__ d_bold_t_bar,      // [ρ × D × N] condensed
-    const uint32_t* __restrict__ d_tables,          // [num_tables × N]
-    const uint32_t* __restrict__ d_gen_pows,        // [R]
-    size_t num_iter,        // R
-    size_t t_exp_left,      // t
-    size_t poly_len,        // N
-    size_t num_outputs,     // ρ
-    size_t K_gemm,          // t × N
-    uint64_t mod0,
-    uint64_t mod1,
-    uint64_t barrett_cr0,
-    uint64_t barrett_cr1)
+    uint64_t* __restrict__ d_M_crt0,
+    uint64_t* __restrict__ d_M_crt1,
+    const uint64_t* __restrict__ d_bold_t,
+    const uint64_t* __restrict__ d_bold_t_bar,
+    const uint32_t* __restrict__ d_tables,
+    const uint32_t* __restrict__ d_gen_pows,
+    size_t num_iter, size_t t_exp_left, size_t poly_len,
+    size_t num_outputs, size_t K_gemm)
 {
     size_t z = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (z >= poly_len) return;
 
-    size_t o = blockIdx.y;      // output index
-    size_t k = blockIdx.z;      // gadget index
-
+    size_t o = blockIdx.y;
+    size_t k = blockIdx.z;
     size_t D = num_iter * t_exp_left;
-    size_t col = o * poly_len + z;  // column in M (ColumnMajor)
+    size_t col = o * poly_len + z;
 
     for (size_t i = 0; i < num_iter; i++) {
         uint32_t gp = d_gen_pows[i];
-        uint32_t tidx_sigma     = (gp - 1) / 2;
-        uint32_t tidx_sigma_bar = (2 * (uint32_t)poly_len - gp - 1) / 2;
-
-        uint32_t z_prime     = d_tables[tidx_sigma     * poly_len + z];  // σ_i(z)
-        uint32_t z_prime_bar = d_tables[tidx_sigma_bar * poly_len + z];  // σ̄_i(z)
+        uint32_t z_prime     = d_tables[((gp - 1) / 2) * poly_len + z];
+        uint32_t z_prime_bar = d_tables[((2 * (uint32_t)poly_len - gp - 1) / 2) * poly_len + z];
 
         size_t bold_t_idx = o * D * poly_len + (i * t_exp_left + k) * poly_len + z;
         uint64_t t_val     = d_bold_t[bold_t_idx];
         uint64_t t_bar_val = d_bold_t_bar[bold_t_idx];
 
-        uint32_t t0 = (uint32_t)(t_val & 0xFFFFFFFF);
-        uint32_t t1 = (uint32_t)(t_val >> 32);
+        uint32_t t0  = (uint32_t)(t_val & 0xFFFFFFFF);
+        uint32_t t1  = (uint32_t)(t_val >> 32);
         uint32_t tb0 = (uint32_t)(t_bar_val & 0xFFFFFFFF);
         uint32_t tb1 = (uint32_t)(t_bar_val >> 32);
 
-        // Term 1: M[k*N + σ_i(z), col]
-        // Use atomicAdd: different blocks can be at different loop iterations,
-        // so σ_i(z₁) from one block may equal σ_j(z₂) from another.
         size_t idx1 = (k * poly_len + z_prime) + col * K_gemm;
         atomicAdd((unsigned long long*)&d_M_crt0[idx1], (unsigned long long)t0);
         atomicAdd((unsigned long long*)&d_M_crt1[idx1], (unsigned long long)t1);
 
-        // Term 2: M[k*N + σ̄_i(z), col]
         size_t idx2 = (k * poly_len + z_prime_bar) + col * K_gemm;
         atomicAdd((unsigned long long*)&d_M_crt0[idx2], (unsigned long long)tb0);
         atomicAdd((unsigned long long*)&d_M_crt1[idx2], (unsigned long long)tb1);
@@ -186,11 +163,10 @@ __global__ void build_M_combined_kernel(
 }
 
 /**
- * Barrett-reduce and byte-decompose a CRT array in-place.
- * Input: uint64 unreduced values. Output: 4 × [count] uint8 byte slices.
+ * Barrett-reduce and byte-decompose a full CRT array.
  */
 __global__ void reduce_and_byte_decompose_kernel(
-    uint8_t* __restrict__ out,      // [4 × count] contiguous
+    uint8_t* __restrict__ out,
     const uint64_t* __restrict__ in,
     size_t count,
     uint64_t mod,
@@ -206,6 +182,89 @@ __global__ void reduce_and_byte_decompose_kernel(
     out[1 * count + idx] = (uint8_t)((v >> 8) & 0xFF);
     out[2 * count + idx] = (uint8_t)((v >> 16) & 0xFF);
     out[3 * count + idx] = (uint8_t)((v >> 24) & 0xFF);
+}
+
+/**
+ * Build one tile of M_combined: single CRT component, single output.
+ *
+ * For output o, CRT component crt_idx, gadget k:
+ *   tile[k*N + σ_i(z), z] += T_o[it+k, z]_{crt}     (Term 1)
+ *   tile[k*N + σ̄_i(z), z] += T̄_o[it+k, z]_{crt}    (Term 2)
+ *
+ * Tile is ColumnMajor [K_gemm × N] uint64, ldb = K_gemm.
+ * Grid: (ceil(N/256), 1, t)
+ */
+__global__ void build_M_tile_kernel(
+    uint64_t* __restrict__ d_tile,                  // [K_gemm × N] ColMaj, zero-initialized
+    const uint64_t* __restrict__ d_bold_t,          // [ρ × D × N] condensed
+    const uint64_t* __restrict__ d_bold_t_bar,      // [ρ × D × N] condensed
+    const uint32_t* __restrict__ d_tables,          // [num_tables × N]
+    const uint32_t* __restrict__ d_gen_pows,        // [R]
+    size_t num_iter,        // R
+    size_t t_exp_left,      // t
+    size_t poly_len,        // N
+    size_t output_idx,      // which output o
+    size_t K_gemm,          // t × N
+    int crt_idx)            // 0 = low 32 bits, 1 = high 32 bits
+{
+    size_t z = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (z >= poly_len) return;
+
+    size_t k = blockIdx.z;      // gadget index
+    size_t o = output_idx;
+    size_t D = num_iter * t_exp_left;
+
+    for (size_t i = 0; i < num_iter; i++) {
+        uint32_t gp = d_gen_pows[i];
+        uint32_t tidx_sigma     = (gp - 1) / 2;
+        uint32_t tidx_sigma_bar = (2 * (uint32_t)poly_len - gp - 1) / 2;
+
+        uint32_t z_prime     = d_tables[tidx_sigma     * poly_len + z];
+        uint32_t z_prime_bar = d_tables[tidx_sigma_bar * poly_len + z];
+
+        size_t bold_t_idx = o * D * poly_len + (i * t_exp_left + k) * poly_len + z;
+        uint64_t t_val     = d_bold_t[bold_t_idx];
+        uint64_t t_bar_val = d_bold_t_bar[bold_t_idx];
+
+        uint32_t t_crt  = (crt_idx == 0) ? (uint32_t)(t_val & 0xFFFFFFFF)     : (uint32_t)(t_val >> 32);
+        uint32_t tb_crt = (crt_idx == 0) ? (uint32_t)(t_bar_val & 0xFFFFFFFF) : (uint32_t)(t_bar_val >> 32);
+
+        // Term 1: tile[k*N + σ_i(z), z]
+        size_t idx1 = (k * poly_len + z_prime) + z * K_gemm;
+        atomicAdd((unsigned long long*)&d_tile[idx1], (unsigned long long)t_crt);
+
+        // Term 2: tile[k*N + σ̄_i(z), z]
+        size_t idx2 = (k * poly_len + z_prime_bar) + z * K_gemm;
+        atomicAdd((unsigned long long*)&d_tile[idx2], (unsigned long long)tb_crt);
+    }
+}
+
+/**
+ * Barrett-reduce and byte-decompose a tile into the full M byte-slice array.
+ *
+ * Reads from tile [K × N] uint64, writes 4 byte slices into the correct
+ * offset of the full [K × N_gemm] byte-slice allocation.
+ */
+__global__ void reduce_and_byte_decompose_tile_kernel(
+    uint8_t* __restrict__ out,      // base of full [4 × K × N_gemm] byte-slice allocation
+    const uint64_t* __restrict__ in,
+    size_t tile_elems,              // K × N (elements in this tile)
+    size_t full_elems,              // K × N_gemm (elements in full M)
+    size_t tile_offset,             // o × N × K (column offset in ColumnMajor)
+    uint64_t mod,
+    uint64_t barrett_cr)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= tile_elems) return;
+
+    uint64_t val = barrett_raw_u64(in[idx], barrett_cr, mod);
+    uint32_t v = (uint32_t)val;
+
+    size_t out_idx = tile_offset + idx;
+    out[0 * full_elems + out_idx] = (uint8_t)(v & 0xFF);
+    out[1 * full_elems + out_idx] = (uint8_t)((v >> 8) & 0xFF);
+    out[2 * full_elems + out_idx] = (uint8_t)((v >> 16) & 0xFF);
+    out[3 * full_elems + out_idx] = (uint8_t)((v >> 24) & 0xFF);
 }
 
 /**
@@ -352,8 +411,8 @@ static const int SHIFT_START[8] = {0, 1, 3, 6, 10, 13, 15, 16};
 extern "C" {
 
 void* tc_packing_init(
-    const uint64_t* d_bold_t_condensed,
-    const uint64_t* d_bold_t_bar_condensed,
+    uint64_t* d_bold_t_condensed,
+    uint64_t* d_bold_t_bar_condensed,
     const uint64_t* d_bold_t_hat_condensed,
     const uint64_t* d_a_hat,
     const uint32_t* d_tables,
@@ -394,65 +453,115 @@ void* tc_packing_init(
     size_t N = ctx->N_gemm;
     size_t M_elems = K * N;  // total elements in M
 
-    printf("TcPacking init: building M_combined [%zu × %zu] = %.1f MB per CRT\n",
-           K, N, M_elems * 8.0 / 1e6);
+    size_t tile_elems = K * poly_len;  // elements per tile (one output)
+
+    // Check available VRAM to decide between fast (full alloc) and tiled (low-memory) paths.
+    // Fast path needs: 2 × M_elems × 8 (d_M_crt0/crt1) + 2 × 4 × M_elems (byte slices)
+    // Tiled path needs: tile_elems × 8 (one tile) + 2 × 4 × M_elems (byte slices)
+    size_t fast_path_temp = 2 * M_elems * sizeof(uint64_t);  // d_M_crt0 + d_M_crt1
+    size_t free_mem, total_mem;
+    CUDA_ASSERT(cudaMemGetInfo(&free_mem, &total_mem));
+    bool use_tiled = (free_mem < fast_path_temp + 8 * M_elems + (256ULL << 20));  // need temp + bytes + 256MB headroom
+
+    printf("TcPacking init: building M_combined [%zu × %zu] = %.1f MB per CRT (%s path, %.1f MB free)\n",
+           K, N, M_elems * 8.0 / 1e6, use_tiled ? "tiled" : "fast", free_mem / 1e6);
 
     GpuTimer timer;
     timer.tic();
 
-    // ── Step 1: Build M_combined on GPU (separate CRT arrays to avoid carry corruption) ──
-
-    uint64_t* d_M_crt0;
-    uint64_t* d_M_crt1;
-    CUDA_ASSERT(cudaMalloc(&d_M_crt0, M_elems * sizeof(uint64_t)));
-    CUDA_ASSERT(cudaMalloc(&d_M_crt1, M_elems * sizeof(uint64_t)));
-    CUDA_ASSERT(cudaMemset(d_M_crt0, 0, M_elems * sizeof(uint64_t)));
-    CUDA_ASSERT(cudaMemset(d_M_crt1, 0, M_elems * sizeof(uint64_t)));
-
-    {
-        int threads = 256;
-        int blocks_z = ((int)poly_len + threads - 1) / threads;
-        dim3 grid(blocks_z, (int)num_outputs, (int)t_exp_left);
-
-        build_M_combined_kernel<<<grid, threads>>>(
-            d_M_crt0, d_M_crt1,
-            d_bold_t_condensed,
-            d_bold_t_bar_condensed,
-            d_tables,
-            d_gen_pows,
-            num_iter, t_exp_left, poly_len, num_outputs, K,
-            ctx->mod0, ctx->mod1, ctx->barrett_cr0, ctx->barrett_cr1);
-        CUDA_ASSERT(cudaGetLastError());
-        CUDA_ASSERT(cudaDeviceSynchronize());
-    }
-
-    // ── Step 2: Barrett-reduce and byte-decompose each CRT array ──
-    // 4 byte-slices per CRT = 8 total: [8 × M_elems] uint8
+    // ── Allocate final M byte-slices (persistent, both paths) ──
 
     uint8_t* d_M_bytes_crt0;
     uint8_t* d_M_bytes_crt1;
     CUDA_ASSERT(cudaMalloc(&d_M_bytes_crt0, 4 * M_elems));
     CUDA_ASSERT(cudaMalloc(&d_M_bytes_crt1, 4 * M_elems));
 
-    {
+    if (use_tiled) {
+        // ── Tiled path: one CRT × one output at a time ──
+        // Peak = d_M_bytes + bold_t + tile (~100 MB). Fits on 16 GB GPUs.
+
+        uint64_t* d_tile;
+        CUDA_ASSERT(cudaMalloc(&d_tile, tile_elems * sizeof(uint64_t)));
+
         int threads = 256;
-        int blocks = ((int)M_elems + threads - 1) / threads;
-        reduce_and_byte_decompose_kernel<<<blocks, threads>>>(
-            d_M_bytes_crt0, d_M_crt0, M_elems, ctx->mod0, ctx->barrett_cr0);
-        reduce_and_byte_decompose_kernel<<<blocks, threads>>>(
-            d_M_bytes_crt1, d_M_crt1, M_elems, ctx->mod1, ctx->barrett_cr1);
-        CUDA_ASSERT(cudaGetLastError());
+        int blocks_z = ((int)poly_len + threads - 1) / threads;
+        dim3 build_grid(blocks_z, 1, (int)t_exp_left);
+        int decomp_blocks = ((int)tile_elems + threads - 1) / threads;
+
+        for (int crt = 0; crt < 2; crt++) {
+            uint8_t* d_M_bytes_crt = (crt == 0) ? d_M_bytes_crt0 : d_M_bytes_crt1;
+            uint64_t mod       = (crt == 0) ? ctx->mod0       : ctx->mod1;
+            uint64_t barrett_cr = (crt == 0) ? ctx->barrett_cr0 : ctx->barrett_cr1;
+
+            for (size_t o = 0; o < num_outputs; o++) {
+                CUDA_ASSERT(cudaMemset(d_tile, 0, tile_elems * sizeof(uint64_t)));
+
+                build_M_tile_kernel<<<build_grid, threads>>>(
+                    d_tile,
+                    d_bold_t_condensed,
+                    d_bold_t_bar_condensed,
+                    d_tables, d_gen_pows,
+                    num_iter, t_exp_left, poly_len, o, K, crt);
+                CUDA_ASSERT(cudaGetLastError());
+
+                size_t tile_offset = o * poly_len * K;
+                reduce_and_byte_decompose_tile_kernel<<<decomp_blocks, threads>>>(
+                    d_M_bytes_crt, d_tile, tile_elems, M_elems, tile_offset,
+                    mod, barrett_cr);
+                CUDA_ASSERT(cudaGetLastError());
+            }
+        }
+
+        CUDA_ASSERT(cudaDeviceSynchronize());
+        CUDA_ASSERT(cudaFree(d_tile));
+
+    } else {
+        // ── Fast path: build both CRTs at once, then byte-decompose ──
+
+        uint64_t* d_M_crt0;
+        uint64_t* d_M_crt1;
+        CUDA_ASSERT(cudaMalloc(&d_M_crt0, M_elems * sizeof(uint64_t)));
+        CUDA_ASSERT(cudaMalloc(&d_M_crt1, M_elems * sizeof(uint64_t)));
+        CUDA_ASSERT(cudaMemset(d_M_crt0, 0, M_elems * sizeof(uint64_t)));
+        CUDA_ASSERT(cudaMemset(d_M_crt1, 0, M_elems * sizeof(uint64_t)));
+
+        {
+            int threads = 256;
+            int blocks_z = ((int)poly_len + threads - 1) / threads;
+            dim3 grid(blocks_z, (int)num_outputs, (int)t_exp_left);
+
+            build_M_combined_kernel<<<grid, threads>>>(
+                d_M_crt0, d_M_crt1,
+                d_bold_t_condensed, d_bold_t_bar_condensed,
+                d_tables, d_gen_pows,
+                num_iter, t_exp_left, poly_len, num_outputs, K);
+            CUDA_ASSERT(cudaGetLastError());
+            CUDA_ASSERT(cudaDeviceSynchronize());
+        }
+
+        {
+            int threads = 256;
+            int blocks = ((int)M_elems + threads - 1) / threads;
+            reduce_and_byte_decompose_kernel<<<blocks, threads>>>(
+                d_M_bytes_crt0, d_M_crt0, M_elems, ctx->mod0, ctx->barrett_cr0);
+            reduce_and_byte_decompose_kernel<<<blocks, threads>>>(
+                d_M_bytes_crt1, d_M_crt1, M_elems, ctx->mod1, ctx->barrett_cr1);
+            CUDA_ASSERT(cudaGetLastError());
+        }
+
+        CUDA_ASSERT(cudaFree(d_M_crt0));
+        CUDA_ASSERT(cudaFree(d_M_crt1));
     }
+
+    // bold_t and bold_t_bar are fully absorbed into M — free to reduce memory
+    if (d_bold_t_condensed)     { CUDA_ASSERT(cudaFree(d_bold_t_condensed)); }
+    if (d_bold_t_bar_condensed) { CUDA_ASSERT(cudaFree(d_bold_t_bar_condensed)); }
 
     // Set up pointer array: d_M_bytes[crt][byte_idx]
     for (int b = 0; b < 4; b++) {
         ctx->d_M_bytes[0][b] = d_M_bytes_crt0 + (size_t)b * M_elems;
         ctx->d_M_bytes[1][b] = d_M_bytes_crt1 + (size_t)b * M_elems;
     }
-
-    // Free unreduced M arrays
-    CUDA_ASSERT(cudaFree(d_M_crt0));
-    CUDA_ASSERT(cudaFree(d_M_crt1));
 
     // ── Step 3: Copy T̂ and â (small, keep as condensed) ──
 
