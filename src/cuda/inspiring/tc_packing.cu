@@ -172,14 +172,16 @@ __global__ void build_M_combined_kernel(
         uint32_t tb1 = (uint32_t)(t_bar_val >> 32);
 
         // Term 1: M[k*N + σ_i(z), col]
+        // Use atomicAdd: different blocks can be at different loop iterations,
+        // so σ_i(z₁) from one block may equal σ_j(z₂) from another.
         size_t idx1 = (k * poly_len + z_prime) + col * K_gemm;
-        d_M_crt0[idx1] += t0;
-        d_M_crt1[idx1] += t1;
+        atomicAdd((unsigned long long*)&d_M_crt0[idx1], (unsigned long long)t0);
+        atomicAdd((unsigned long long*)&d_M_crt1[idx1], (unsigned long long)t1);
 
         // Term 2: M[k*N + σ̄_i(z), col]
         size_t idx2 = (k * poly_len + z_prime_bar) + col * K_gemm;
-        d_M_crt0[idx2] += tb0;
-        d_M_crt1[idx2] += tb1;
+        atomicAdd((unsigned long long*)&d_M_crt0[idx2], (unsigned long long)tb0);
+        atomicAdd((unsigned long long*)&d_M_crt1[idx2], (unsigned long long)tb1);
     }
 }
 

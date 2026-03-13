@@ -940,3 +940,44 @@ Result:
     "stdDevServerTimeMs": 0.0
   }
 }
+
+
+
+# GEMM InsPIRing
+Hint Prep. Throughput 7.98 GB/sec
+Throughput: 5294.12 GB/sec
+TcPacking run: 25.5 ms (64 clients, 23 outputs, GEMM [64 × 6144 × 47104])
+Word InspiRING Step1(TC)=27.0 ms, total=53.1 ms, packing_overhead=26.1 ms (64 clients, tc_packing)
+[2026-03-13T10:08:55Z DEBUG ypir::server_gpu] Word GPU InspiRING online time: 63 ms
+Measurement completed. See the README for details on what the following fields mean.
+Result:
+{
+  "offline": {
+    "uploadBytes": 0,
+    "downloadBytes": 0,
+    "serverTimeMs": 10191,
+    "clientTimeMs": 0,
+    "simplepirPrepTimeMs": 705,
+    "simplepirHintBytes": 0,
+    "doublepirHintBytes": 0
+  },
+  "online": {
+    "uploadBytes": 610304,
+    "downloadBytes": 18087936,
+    "simplepirQueryBytes": 0,
+    "doublepirQueryBytes": 0,
+    "simplepirRespBytes": 0,
+    "doublepirRespBytes": 0,
+    "serverTimeMs": 68,
+    "clientQueryGenTimeMs": 1015,
+    "clientDecodeTimeMs": 12,
+    "firstPassTimeMs": 63,
+    "secondPassTimeMs": 0,
+    "ringPackingTimeMs": 0,
+    "sqrtNBytes": 0,
+    "allServerTimesMs": [
+      68
+    ],
+    "stdDevServerTimeMs": 0.0
+  }
+}
