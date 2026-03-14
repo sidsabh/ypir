@@ -121,6 +121,37 @@ __global__ void decompose_u16_stacked(
     }
 }
 
+// Two-pass in-place decomposition:
+// Pass 1 (high bytes): read uint16 from buf, write high byte to buf[count + idx]
+//   Safe because uint16 input lives in [0, 2*count) bytes and high output in [count, 2*count).
+//   For idx < count/2, reads from [2*idx, 2*idx+2) and writes to [count+idx] — no overlap.
+//   For idx >= count/2, reads from [2*idx, 2*idx+2) which is in [count, 2*count),
+//     but writes to [count+idx] which is >= 1.5*count — past the read region. Safe.
+__global__ void decompose_u16_extract_high(
+    uint8_t* buf,       // 2*count bytes, first count*sizeof(uint16_t) = 2*count bytes hold uint16 data
+    size_t count)       // M * K_padded
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count) {
+        uint16_t v = ((const uint16_t*)buf)[idx];
+        buf[count + idx] = (uint8_t)((v >> 8) & 0xFF);
+    }
+}
+
+// Pass 2 (low bytes): read uint16 from buf, write low byte to buf[idx]
+//   After pass 1, high bytes are safely stored in [count, 2*count).
+//   This pass overwrites [0, count) which destroys the original uint16 data, but we only need the low byte.
+__global__ void decompose_u16_extract_low(
+    uint8_t* buf,
+    size_t count)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count) {
+        uint16_t v = ((const uint16_t*)buf)[idx];
+        buf[idx] = (uint8_t)(v & 0xFF);
+    }
+}
+
 // Decompose u64 → 8 uint8 byte slices, packed contiguously.
 // Input: K × N column-major. Output: K × (8*N) column-major with stride K.
 __global__ void decompose_u64_bytes_packed(
@@ -141,9 +172,9 @@ __global__ void decompose_u64_bytes_packed(
     out[idx + 7*K*N] = (uint8_t)((v >> 56) & 0xFF);
 }
 
-// ---------- Fused stacked accumulate kernel ----------
+// ---------- Fused stacked accumulate kernels ----------
 
-// Accumulate stacked GEMM output (2M)×(8N) → M×N uint64.
+// Accumulate stacked GEMM output (2M)×(8N) → M×N uint64. (used when full GEMM fits in memory)
 // gemm_out is col-major (2M)×(8N), stride 2M.
 // Rows [0,M) = db_b0 products, rows [M,2M) = db_b1 products.
 // db_b0: 8 terms (shifts 0,8,...,56), db_b1: 7 terms (shifts 8,...,56).
@@ -165,6 +196,32 @@ __global__ void accumulate_db16_stacked(
     for (int q = 0; q < 7; q++)
         acc += (uint64_t)(uint32_t)gemm_out[M + m + (q*N+n)*stride] << (8*(q+1));
     accum[idx] = acc;
+}
+
+// Tiled accumulate: one A-byte slice at a time.
+// gemm_out is col-major (2M)×N, stride 2M. a_byte_idx is which A byte (0..7).
+// db_b0 contributes shift = 8*a_byte_idx, db_b1 contributes shift = 8*(a_byte_idx+1).
+// If is_first, writes to accum; otherwise adds to existing accum.
+__global__ void accumulate_db16_one_byte(
+    uint64_t* __restrict__ accum,          // M × N col-major
+    const int32_t* __restrict__ gemm_out,  // (2M) × N col-major, stride 2M
+    size_t M, size_t N,
+    int a_byte_idx, bool is_first)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * N) return;
+    size_t m = idx % M;
+    size_t n = idx / M;
+    size_t stride = 2 * M;
+    // db_b0 (low byte of DB) × A_byte[a_byte_idx] → shift by 8*a_byte_idx
+    uint64_t acc = (uint64_t)(uint32_t)gemm_out[m + n * stride] << (8 * a_byte_idx);
+    // db_b1 (high byte of DB) × A_byte[a_byte_idx] → shift by 8*(a_byte_idx+1)
+    if (a_byte_idx < 7)  // db_b1 doesn't contribute at a_byte_idx=7 (would shift by 64)
+        acc += (uint64_t)(uint32_t)gemm_out[M + m + n * stride] << (8 * (a_byte_idx + 1));
+    if (is_first)
+        accum[idx] = acc;
+    else
+        accum[idx] += acc;
 }
 
 // ---------- Modswitch u64 → Z_Q with col-major to row-major transpose ----------
@@ -283,20 +340,23 @@ void* init_word_offline_context(
     CUDA_CHECK(cudaMalloc(&ctx->d_out, M * N * sizeof(uint64_t)));
 
     if (ctx->has_tensor_cores) {
-        // Upload DB, decompose to vertically stacked uint8 bytes
-        uint16_t* d_db_raw;
-        CUDA_CHECK(cudaMalloc(&d_db_raw, M * db_rows_padded * sizeof(uint16_t)));
-        CUDA_CHECK(cudaMemcpy(d_db_raw, db, M * db_rows_padded * sizeof(uint16_t), cudaMemcpyHostToDevice));
-
+        // Upload DB and decompose to vertically stacked uint8 bytes — in-place
+        // d_db_stacked is 2*db_elems bytes; raw uint16 data is also 2*db_elems bytes.
+        // Upload raw data into d_db_stacked, then two-pass decompose in-place (no extra alloc).
         size_t db_elems = M * db_rows_padded;
         CUDA_CHECK(cudaMalloc(&ctx->d_db_stacked, 2 * db_elems));
+        CUDA_CHECK(cudaMemcpy(ctx->d_db_stacked, db, M * db_rows_padded * sizeof(uint16_t), cudaMemcpyHostToDevice));
         {
             int threads = 256;
             int blocks = (db_elems + threads - 1) / threads;
-            decompose_u16_stacked<<<blocks, threads>>>(ctx->d_db_stacked, d_db_raw, db_elems);
+            // Pass 1: extract high bytes to second half (doesn't destroy uint16 data)
+            decompose_u16_extract_high<<<blocks, threads>>>(ctx->d_db_stacked, db_elems);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            // Pass 2: extract low bytes, overwriting first half
+            decompose_u16_extract_low<<<blocks, threads>>>(ctx->d_db_stacked, db_elems);
             CUDA_CHECK(cudaGetLastError());
         }
-        CUDA_CHECK(cudaFree(d_db_raw));
 
         // Upload A, decompose to packed uint8 bytes: K × (8*N)
         size_t A_elems = N * K;
@@ -313,9 +373,8 @@ void* init_word_offline_context(
         }
         CUDA_CHECK(cudaFree(d_A_raw));
 
-        // Allocate stacked GEMM output and uint64 accumulator
-        CUDA_CHECK(cudaMalloc(&ctx->d_gemm_out, 2 * M * 8 * N * sizeof(int32_t)));
-        CUDA_CHECK(cudaMalloc(&ctx->d_accum_u64, M * N * sizeof(uint64_t)));
+        // d_gemm_out and d_accum_u64 are allocated lazily in compute_hint_0_word_gpu
+        // to avoid peak memory spike during init.
 
     } else {
         // SIMT path: keep DB as u16, A as u64
@@ -358,17 +417,53 @@ int compute_hint_0_word_gpu(void* context, uint64_t* hint_0_out)
     size_t total = M * N;
 
     if (ctx->has_tensor_cores) {
-        // Stacked GEMM: (2M) × K × K × (8N) → (2M) × (8N)
-        {
+        // Lazily allocate accumulator
+        if (!ctx->d_accum_u64)
+            CUDA_CHECK(cudaMalloc(&ctx->d_accum_u64, M * N * sizeof(uint64_t)));
+
+        // Check if we can fit the full stacked GEMM output
+        size_t full_gemm_bytes = 2 * M * 8 * N * sizeof(int32_t);
+        size_t tiled_gemm_bytes = 2 * M * N * sizeof(int32_t);  // one A-byte at a time
+        size_t free_mem, total_mem;
+        CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
+
+        bool use_tiled_gemm = (free_mem < full_gemm_bytes + (256ULL << 20));
+
+        if (use_tiled_gemm) {
+            // Tiled path: 8 GEMMs, one per A-byte slice, d_gemm_out = (2M)×N
+            printf("Word offline GEMM: tiled path (%.1f MB free, need %.1f MB full)\n",
+                   free_mem / 1e6, full_gemm_bytes / 1e6);
+            if (!ctx->d_gemm_out)
+                CUDA_CHECK(cudaMalloc(&ctx->d_gemm_out, tiled_gemm_bytes));
+            for (int q = 0; q < 8; q++) {
+                // B pointer: q-th byte slice of A, starting at offset q*K*N in d_A_bytes_packed
+                const uint8_t* A_byte_q = ctx->d_A_bytes_packed + (size_t)q * K * N;
+                auto status = run_u8tc_gemm(ctx->is_sm80, 2*M, N, K,
+                    ctx->d_db_stacked, (int)ctx->db_rows_padded,
+                    A_byte_q, (int)K,
+                    ctx->d_gemm_out, (int)(2*M));
+                if (status != cutlass::Status::kSuccess) {
+                    fprintf(stderr, "CUTLASS TC tiled GEMM (byte %d) failed\n", q);
+                    return -1;
+                }
+                int threads = 256, blocks = (total + threads - 1) / threads;
+                accumulate_db16_one_byte<<<blocks, threads>>>(
+                    ctx->d_accum_u64, ctx->d_gemm_out, M, N, q, (q == 0));
+                CUDA_CHECK(cudaGetLastError());
+            }
+        } else {
+            // Fast path: single stacked GEMM, (2M) × (8N) output
+            if (!ctx->d_gemm_out)
+                CUDA_CHECK(cudaMalloc(&ctx->d_gemm_out, full_gemm_bytes));
             auto status = run_u8tc_gemm(ctx->is_sm80, 2*M, 8*N, K,
                 ctx->d_db_stacked, (int)ctx->db_rows_padded,
                 ctx->d_A_bytes_packed, (int)K,
                 ctx->d_gemm_out, (int)(2*M));
             if (status != cutlass::Status::kSuccess) { fprintf(stderr, "CUTLASS TC stacked GEMM failed\n"); return -1; }
+            int threads = 256, blocks = (total + threads - 1) / threads;
+            accumulate_db16_stacked<<<blocks, threads>>>(ctx->d_accum_u64, ctx->d_gemm_out, M, N);
+            CUDA_CHECK(cudaGetLastError());
         }
-        { int threads = 256, blocks = (total + threads - 1) / threads;
-          accumulate_db16_stacked<<<blocks, threads>>>(ctx->d_accum_u64, ctx->d_gemm_out, M, N);
-          CUDA_CHECK(cudaGetLastError()); }
 
         // Modswitch + transpose: col-major M×N → row-major N×M
         {
