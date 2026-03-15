@@ -523,29 +523,6 @@ __global__ void __launch_bounds__(1024) word_pack_lwes_and_mod_switch(
     }
 }
 
-// ---------- InspiRING bold_t transpose kernel ----------
-// Transposes bold_t from [num_outputs, D, poly_len] to [num_outputs, poly_len, D]
-// so that consecutive d-values are stride-1 for the inner product kernel.
-__global__ void inspir_transpose_bold_t(
-    uint64_t* __restrict__ dst,        // [num_outputs * poly_len * D]
-    const uint64_t* __restrict__ src,  // [num_outputs * D * poly_len]
-    size_t num_outputs,
-    size_t D,
-    size_t poly_len)
-{
-    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    size_t total = num_outputs * D * poly_len;
-    if (idx >= total) return;
-
-    size_t o  = idx / (D * poly_len);
-    size_t rem = idx % (D * poly_len);
-    size_t d  = rem / poly_len;
-    size_t z  = rem % poly_len;
-
-    // src[o][d][z] → dst[o][z][d]
-    dst[o * poly_len * D + z * D + d] = src[idx];
-}
-
 // ---------- InspiRING FUSED expand + inner product kernel ----------
 // Eliminates the separate expand phase entirely. Instead of:
 //   expand: write y_all/y_bar_all to global (~96 MB/client)
@@ -959,178 +936,6 @@ inspir_post_process(
     }
 }
 
-// ---------- InspiRING packing kernel (OLD — kept for reference) ----------
-// Implements full_packing_with_preprocessing_online (with_rotations):
-//   sum = Σ_{i=0..num_iter-1} (y_all[i] · bold_t[i] + y_bar_all[i] · bold_t_bar[i])
-//       + z_body · bold_t_hat
-//   final_b = INTT(CRT_compose(sum)) + b_values   (no N multiplication)
-//   output  = modswitch([a_hat; final_b])
-
-__global__ void __launch_bounds__(1024) word_pack_lwes_inspir_and_mod_switch(
-    uint8_t* d_response_out,
-    const uint64_t* d_intermediate,     // b_values (Z_Q, one per coefficient per output)
-    const uint64_t* d_bold_t,           // per-output precomp, dense condensed
-    const uint64_t* d_bold_t_bar,
-    const uint64_t* d_bold_t_hat,
-    const uint64_t* d_a_hat,            // per-output, raw domain (Z_Q)
-    const uint64_t* d_y_all,            // per-client, dense condensed
-    const uint64_t* d_y_bar_all,
-    const uint64_t* d_z_body,           // per-client
-    uint64_t* d_scratch,                // per-stream scratch
-    size_t num_iter,                    // poly_len/2 - 1
-    size_t t_exp_left,
-    uint64_t rlwe_q_prime_1,
-    uint64_t rlwe_q_prime_2,
-    size_t response_bytes_per_output,
-    size_t inspir_scratch_per_output,
-    NTTParams params)
-{
-    size_t output_idx = blockIdx.x;
-    size_t tid = threadIdx.x;
-    size_t poly_len = params.poly_len;
-    uint64_t modulus = params.modulus;
-
-    // Cooperative NTT decomposition
-    size_t crt_count = params.crt_count;
-    size_t threads_per_crt = blockDim.x / crt_count;
-    size_t my_crt = tid / threads_per_crt;
-    size_t local_tid = tid % threads_per_crt;
-
-    // Scratch: temp_ntt (2 * poly_len) + temp_raw (2 * poly_len)
-    uint64_t* my_scratch = d_scratch + output_idx * inspir_scratch_per_output;
-    uint64_t* temp_ntt = my_scratch;
-    uint64_t* temp_raw = temp_ntt + 2 * poly_len;
-
-    // Per-output precomp pointers (dense condensed, stride = poly_len)
-    size_t bold_t_per_output = num_iter * t_exp_left * poly_len;
-    const uint64_t* my_bold_t     = d_bold_t     + output_idx * bold_t_per_output;
-    const uint64_t* my_bold_t_bar = d_bold_t_bar + output_idx * bold_t_per_output;
-    const uint64_t* my_bold_t_hat = d_bold_t_hat + output_idx * t_exp_left * poly_len;
-    const uint64_t* my_a_hat      = d_a_hat      + output_idx * poly_len;
-
-    // b_values from GEMM intermediate (Z_Q values, inv_N=1)
-    const uint64_t* b_values = d_intermediate + output_idx * poly_len;
-
-    uint8_t* my_response = d_response_out + output_idx * response_bytes_per_output;
-
-    // Load Barrett constants (will be cached in L1)
-    uint64_t bcr0 = params.barrett_cr[0];
-    uint64_t bcr1 = params.barrett_cr[1];
-    uint64_t mod0 = params.moduli[0];
-    uint64_t mod1 = params.moduli[1];
-
-    // Compute addition capacity (match Rust: 1 << (64 - 2*q2_bits - 1))
-    size_t q2_bits_0 = word_ceil_log2_u64(mod0);
-    size_t q2_bits_1 = word_ceil_log2_u64(mod1);
-    size_t max_q2_bits = q2_bits_0 > q2_bits_1 ? q2_bits_0 : q2_bits_1;
-    size_t addition_capacity = (size_t)1 << (64 - 2 * max_q2_bits - 1);
-
-    // ── Main loop: inner products in condensed NTT domain ──
-    for (size_t z = tid; z < poly_len; z += blockDim.x) {
-        uint64_t acc_lo = 0, acc_hi = 0;
-        size_t num_added = 0;
-
-        for (size_t i = 0; i < num_iter; i++) {
-            size_t base = i * t_exp_left * poly_len;
-
-            // y_all × bold_t inner product (t_exp_left terms)
-            for (size_t k = 0; k < t_exp_left; k++) {
-                uint64_t y_val = d_y_all[base + k * poly_len + z];
-                uint64_t t_val = my_bold_t[base + k * poly_len + z];
-                acc_lo += (y_val & 0xFFFFFFFF) * (t_val & 0xFFFFFFFF);
-                acc_hi += (y_val >> 32)         * (t_val >> 32);
-            }
-            num_added += t_exp_left;
-
-            // y_bar_all × bold_t_bar inner product (t_exp_left terms)
-            for (size_t k = 0; k < t_exp_left; k++) {
-                uint64_t yb_val = d_y_bar_all[base + k * poly_len + z];
-                uint64_t tb_val = my_bold_t_bar[base + k * poly_len + z];
-                acc_lo += (yb_val & 0xFFFFFFFF) * (tb_val & 0xFFFFFFFF);
-                acc_hi += (yb_val >> 32)         * (tb_val >> 32);
-            }
-            num_added += t_exp_left;
-
-            // Periodic Barrett reduction (match Rust reduction schedule)
-            if (num_added >= addition_capacity || i == num_iter - 1) {
-                acc_lo = barrett_raw_u64(acc_lo, bcr0, mod0);
-                acc_hi = barrett_raw_u64(acc_hi, bcr1, mod1);
-                num_added = 0;
-            }
-        }
-
-        // Final term: z_body × bold_t_hat (t_exp_left terms)
-        {
-            uint64_t fin_lo = 0, fin_hi = 0;
-            for (size_t k = 0; k < t_exp_left; k++) {
-                uint64_t z_val  = d_z_body[k * poly_len + z];
-                uint64_t th_val = my_bold_t_hat[k * poly_len + z];
-                fin_lo += (z_val & 0xFFFFFFFF) * (th_val & 0xFFFFFFFF);
-                fin_hi += (z_val >> 32)         * (th_val >> 32);
-            }
-            fin_lo = barrett_raw_u64(fin_lo, bcr0, mod0);
-            fin_hi = barrett_raw_u64(fin_hi, bcr1, mod1);
-
-            // Add final term with Barrett (matches fast_add_into with reduce)
-            acc_lo = acc_lo + fin_lo;
-            if (acc_lo >= mod0) acc_lo -= mod0;
-            acc_hi = acc_hi + fin_hi;
-            if (acc_hi >= mod1) acc_hi -= mod1;
-        }
-
-        // Store CRT components for INTT
-        temp_ntt[z]            = acc_lo;
-        temp_ntt[poly_len + z] = acc_hi;
-    }
-    __syncthreads();
-
-    // ── INTT both CRT components ──
-    if (my_crt < crt_count)
-        ntt_inverse_kernel_parallel(temp_ntt + my_crt * poly_len, &params, my_crt, local_tid, threads_per_crt);
-    __syncthreads();
-
-    // ── CRT compose + add b_values → raw domain ──
-    for (size_t z = tid; z < poly_len; z += blockDim.x) {
-        uint64_t x     = temp_ntt[z];
-        uint64_t y_val = temp_ntt[poly_len + z];
-        uint64_t sum_raw = crt_compose_2(x, y_val, &params);
-
-        // final_b = sum_raw + b_values[z] (mod Q, no N multiplication)
-        uint64_t final_b = sum_raw + b_values[z];
-        final_b -= modulus * (final_b >= modulus);
-
-        temp_raw[poly_len + z] = final_b;   // body (row 1)
-        temp_raw[z]            = my_a_hat[z]; // mask (row 0, a_hat already raw)
-    }
-    __syncthreads();
-
-    // ── Modswitch and bit-pack (same format as CDKS) ──
-    size_t q_1_bits = word_ceil_log2_u64(rlwe_q_prime_2);
-    size_t q_2_bits = word_ceil_log2_u64(rlwe_q_prime_1);
-
-    // Zero response bytes
-    for (size_t i = tid; i < response_bytes_per_output; i += blockDim.x)
-        my_response[i] = 0;
-    __syncthreads();
-
-    // Row 0 (mask/a_hat): rescale Q → q_prime_2
-    for (size_t z = tid; z < poly_len; z += blockDim.x) {
-        uint64_t val = temp_raw[z];
-        double d_val = (double)val;
-        uint64_t val_rescaled = (uint64_t)((d_val * (double)rlwe_q_prime_2) / (double)modulus + 0.5);
-        word_write_arbitrary_bits(my_response, val_rescaled, z * q_1_bits, q_1_bits);
-    }
-    __syncthreads();
-
-    // Row 1 (body/final_b): rescale Q → q_prime_1
-    for (size_t z = tid; z < poly_len; z += blockDim.x) {
-        uint64_t val = temp_raw[poly_len + z];
-        double d_val = (double)val;
-        uint64_t val_rescaled = (uint64_t)((d_val * (double)rlwe_q_prime_1) / (double)modulus + 0.5);
-        word_write_arbitrary_bits(my_response, val_rescaled, poly_len * q_1_bits + z * q_2_bits, q_2_bits);
-    }
-}
-
 // ---------- Context ----------
 
 struct WordOnlineContext {
@@ -1446,12 +1251,6 @@ void* ypir_word_online_init(
 
     // Streaming scratch will be allocated in init_packing, after packing data is uploaded
 
-    {
-        size_t free_mem, total_mem;
-        cudaMemGetInfo(&free_mem, &total_mem);
-        printf("Online context init (no DB): %.1f MB free / %.1f MB total\n",
-               free_mem / 1e6, total_mem / 1e6);
-    }
     CUDA_ASSERT(cudaDeviceSynchronize());
     return ctx;
 }
@@ -1602,6 +1401,45 @@ void ypir_word_online_init_packing_inspir(
     }
 
     CUDA_ASSERT(cudaDeviceSynchronize());
+
+    // GEMM-based packing is the default for InspiRING on all GPUs.
+    bool use_legacy_packing = false;
+    const char* simt_env = getenv("YPIR_SIMT_PACKING");
+    if (simt_env && simt_env[0] == '1') {
+        use_legacy_packing = true;
+        printf("Legacy SIMT packing forced via YPIR_SIMT_PACKING=1\n");
+    }
+
+    if (!use_legacy_packing) {
+        int gpu_tier = ctx->is_sm80 ? 2 : (ctx->has_tensor_cores ? 1 : 0);
+
+        size_t q_1_bits = word_ceil_log2_u64(ctx->rlwe_q_prime_2);
+        size_t q_2_bits = word_ceil_log2_u64(ctx->rlwe_q_prime_1);
+        size_t resp_bpo = ((q_1_bits + q_2_bits) * poly_len + 7) / 8;
+
+        ctx->tc_packing_ctx = tc_packing_init(
+            ctx->d_bold_t_condensed,
+            ctx->d_bold_t_bar_condensed,
+            ctx->d_bold_t_hat_condensed,
+            ctx->d_a_hat,
+            ctx->d_tables,
+            ctx->d_gen_pows,
+            ctx->num_iter,
+            ctx->t_exp_left,
+            poly_len,
+            ctx->num_rlwe_outputs,
+            ctx->max_batch_size,
+            ctx->rlwe_q_prime_1,
+            ctx->rlwe_q_prime_2,
+            resp_bpo,
+            ctx->ntt_params,
+            gpu_tier);
+        const char* tier_name = gpu_tier == 2 ? "TC SM80" : (gpu_tier == 1 ? "TC SM75" : "SIMT");
+        printf("GEMM packing enabled (%s)\n", tier_name);
+
+        ctx->d_bold_t_condensed = nullptr;
+        ctx->d_bold_t_bar_condensed = nullptr;
+    }
 }
 
 // Variant that takes GPU device pointers directly (from inspir_precomp).
@@ -1682,9 +1520,19 @@ void ypir_word_online_init_packing_inspir_from_gpu(
 
     CUDA_ASSERT(cudaDeviceSynchronize());
 
-    // Optionally initialize tc_packing path (env var toggle)
-    const char* tc_env = getenv("YPIR_TC_PACKING");
-    if (tc_env && tc_env[0] == '1') {
+    // GEMM-based packing is the default for InspiRING on all GPUs.
+    // Uses tensor cores on SM>=75, CUTLASS SIMT on older GPUs.
+    // Set YPIR_SIMT_PACKING=1 to force the legacy fused-kernel fallback.
+    bool use_legacy_packing = false;
+    const char* simt_env = getenv("YPIR_SIMT_PACKING");
+    if (simt_env && simt_env[0] == '1') {
+        use_legacy_packing = true;
+        printf("Legacy SIMT packing forced via YPIR_SIMT_PACKING=1\n");
+    }
+
+    if (!use_legacy_packing) {
+        int gpu_tier = ctx->is_sm80 ? 2 : (ctx->has_tensor_cores ? 1 : 0);
+
         size_t q_1_bits = word_ceil_log2_u64(ctx->rlwe_q_prime_2);
         size_t q_2_bits = word_ceil_log2_u64(ctx->rlwe_q_prime_1);
         size_t resp_bpo = ((q_1_bits + q_2_bits) * poly_len + 7) / 8;
@@ -1705,8 +1553,9 @@ void ypir_word_online_init_packing_inspir_from_gpu(
             ctx->rlwe_q_prime_2,
             resp_bpo,
             ctx->ntt_params,
-            ctx->is_sm80 ? 2 : (ctx->has_tensor_cores ? 1 : 0));
-        printf("TcPacking enabled via YPIR_TC_PACKING=1\n");
+            gpu_tier);
+        const char* tier_name = gpu_tier == 2 ? "TC SM80" : (gpu_tier == 1 ? "TC SM75" : "SIMT");
+        printf("GEMM packing enabled (%s)\n", tier_name);
 
         // tc_packing_init took ownership and freed bold_t/bold_t_bar — null our pointers
         ctx->d_bold_t_condensed = nullptr;
@@ -2291,13 +2140,10 @@ void ypir_word_online_upload_db(void* context, const uint16_t* db)
         // TC path: upload + decompose to stacked uint8
         size_t raw_size = db_elems * sizeof(uint16_t);
         size_t stacked_size = 2 * db_elems;
-        size_t free_mem, total_mem;
-        cudaMemGetInfo(&free_mem, &total_mem);
-        printf("upload_db: need %.1f MB stacked, %.1f MB free / %.1f MB total\n",
-               stacked_size / 1e6, free_mem / 1e6, total_mem / 1e6);
         CUDA_ASSERT(cudaMalloc(&ctx->d_db_stacked, stacked_size));
 
-        // Re-check free memory after stacked alloc
+        // Check free memory to decide fast vs chunked upload
+        size_t free_mem, total_mem;
         cudaMemGetInfo(&free_mem, &total_mem);
 
         if (free_mem >= raw_size + (128ULL << 20)) {

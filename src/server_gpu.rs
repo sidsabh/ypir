@@ -285,6 +285,8 @@ where
         let ctx = offline_vals.word_cuda_context.as_ref()
             .expect("Word CUDA context not initialized");
 
+        let online_start = Instant::now();
+
         // Flatten queries: batch_size * db_rows
         let db_rows = 1 << (params.db_dim_1 + params.poly_len_log2);
         let mut queries_flat: Vec<u64> = Vec::with_capacity(batch_size * db_rows);
@@ -292,85 +294,49 @@ where
             queries_flat.extend_from_slice(query);
         }
 
-        if offline_vals.packing_type == PackingType::InspiRING {
-            // InspiRING: GEMM + packing all on GPU
-            let online_start = Instant::now();
+        let q_1_bits = (params.get_q_prime_2() as f64).log2().ceil() as usize;
+        let q_2_bits = (params.get_q_prime_1() as f64).log2().ceil() as usize;
+        let response_bytes_per_output = ((q_1_bits + q_2_bits) * params.poly_len + 7) / 8;
 
-            let q_1_bits = (params.get_q_prime_2() as f64).log2().ceil() as usize;
-            let q_2_bits = (params.get_q_prime_1() as f64).log2().ceil() as usize;
-            let response_bytes_per_output = ((q_1_bits + q_2_bits) * params.poly_len + 7) / 8;
+        // Flatten y_body and z_body (tiny, ~48KB each per client)
+        let y_body_per_client = params.t_exp_left * params.poly_len;
+        let z_body_per_client = params.t_exp_left * params.poly_len;
 
-            // Flatten y_body and z_body (tiny, ~48KB each per client)
-            // GPU will expand y_body → y_all + y_bar_all via permutation tables
-            let y_body_per_client = params.t_exp_left * params.poly_len;
-            let z_body_per_client = params.t_exp_left * params.poly_len;
+        let mut y_body_flat: Vec<u64> = Vec::with_capacity(batch_size * y_body_per_client);
+        let mut z_body_flat: Vec<u64> = Vec::with_capacity(batch_size * z_body_per_client);
 
-            let mut y_body_flat: Vec<u64> = Vec::with_capacity(batch_size * y_body_per_client);
-            let mut z_body_flat: Vec<u64> = Vec::with_capacity(batch_size * z_body_per_client);
+        for pk in packing_keys.iter() {
+            let y_body = pk.y_body_condensed.as_ref().unwrap();
+            let z_body = pk.z_body_condensed.as_ref().unwrap();
 
-            for pk in packing_keys.iter() {
-                let y_body = pk.y_body_condensed.as_ref().unwrap();
-                let z_body = pk.z_body_condensed.as_ref().unwrap();
-
-                for row in 0..y_body.rows {
-                    for col in 0..y_body.cols {
-                        y_body_flat.extend_from_slice(&y_body.get_poly(row, col)[..params.poly_len]);
-                    }
-                }
-                for row in 0..z_body.rows {
-                    for col in 0..z_body.cols {
-                        z_body_flat.extend_from_slice(&z_body.get_poly(row, col)[..params.poly_len]);
-                    }
+            for row in 0..y_body.rows {
+                for col in 0..y_body.cols {
+                    y_body_flat.extend_from_slice(&y_body.get_poly(row, col)[..params.poly_len]);
                 }
             }
-
-            let result = ctx.compute_batch_inspir(
-                &queries_flat,
-                &y_body_flat,
-                &z_body_flat,
-                response_bytes_per_output,
-                batch_size,
-            );
-
-            let online_time_ms = online_start.elapsed().as_millis();
-            debug!("Word GPU InspiRING online time: {} ms", online_time_ms);
-
-            if let Some(ref mut m) = measurement {
-                m.online.first_pass_time_ms = online_time_ms as usize;
-            }
-
-            result
-        } else {
-            // CDKS: full GPU path (matmul + packing on GPU)
-            let online_start = Instant::now();
-
-            // Flatten CDKS pack_pub_params_row_1s
-            let mut pub_params_flat: Vec<u64> = Vec::new();
-            for pk in packing_keys.iter() {
-                for key in pk.pack_pub_params_row_1s.iter() {
-                    let slc = key.as_slice();
-                    for col in 0..params.t_exp_left {
-                        let start = col * 2 * params.poly_len;
-                        pub_params_flat.extend_from_slice(&slc[start..start + params.poly_len]);
-                    }
+            for row in 0..z_body.rows {
+                for col in 0..z_body.cols {
+                    z_body_flat.extend_from_slice(&z_body.get_poly(row, col)[..params.poly_len]);
                 }
             }
-
-            let q_1_bits = (params.get_q_prime_2() as f64).log2().ceil() as usize;
-            let q_2_bits = (params.get_q_prime_1() as f64).log2().ceil() as usize;
-            let response_bytes_per_output = ((q_1_bits + q_2_bits) * params.poly_len + 7) / 8;
-
-            let result = ctx.compute_batch(&queries_flat, &pub_params_flat, response_bytes_per_output, batch_size);
-
-            let online_time_ms = online_start.elapsed().as_millis();
-            debug!("Word GPU online time: {} ms", online_time_ms);
-
-            if let Some(ref mut m) = measurement {
-                m.online.first_pass_time_ms = online_time_ms as usize;
-            }
-
-            result
         }
+
+        let result = ctx.compute_batch_inspir(
+            &queries_flat,
+            &y_body_flat,
+            &z_body_flat,
+            response_bytes_per_output,
+            batch_size,
+        );
+
+        let online_time_ms = online_start.elapsed().as_millis();
+        debug!("Word GPU online time: {} ms", online_time_ms);
+
+        if let Some(ref mut m) = measurement {
+            m.online.first_pass_time_ms = online_time_ms as usize;
+        }
+
+        result
     }
 
     /// CUDA-accelerated online computation

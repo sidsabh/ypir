@@ -577,18 +577,24 @@ void* tc_packing_init(
 
     // ── Step 4: Allocate online scratch ──
 
-    // A byte-slices: 8 × [max_B × K_gemm] uint8
-    size_t A_slice_size = max_batch_size * K;
+    // Pad max_batch_size to match M_dim alignment at runtime.
+    // TC epilogue requires ldc to be a multiple of 4 (SM>=75), so all
+    // batch-dimensioned buffers must be allocated with padded size.
+    int align = (gpu_tier >= 1) ? 4 : 1;
+    size_t padded_batch = ((max_batch_size + align - 1) / align) * align;
+
+    // A byte-slices: 8 × [padded_B × K_gemm] uint8
+    size_t A_slice_size = padded_batch * K;
     CUDA_ASSERT(cudaMalloc(&ctx->d_A_bytes_buf, 8 * A_slice_size));
 
-    // Shift accumulator: [max_B × N_gemm] int32
-    CUDA_ASSERT(cudaMalloc(&ctx->d_G, max_batch_size * N * sizeof(int32_t)));
+    // Shift accumulator: [padded_B × N_gemm] int32
+    CUDA_ASSERT(cudaMalloc(&ctx->d_G, padded_batch * N * sizeof(int32_t)));
 
-    // CRT running totals: [max_B × N_gemm] uint64 each
-    CUDA_ASSERT(cudaMalloc(&ctx->d_result_crt0, max_batch_size * N * sizeof(uint64_t)));
-    CUDA_ASSERT(cudaMalloc(&ctx->d_result_crt1, max_batch_size * N * sizeof(uint64_t)));
+    // CRT running totals: [padded_B × N_gemm] uint64 each
+    CUDA_ASSERT(cudaMalloc(&ctx->d_result_crt0, padded_batch * N * sizeof(uint64_t)));
+    CUDA_ASSERT(cudaMalloc(&ctx->d_result_crt1, padded_batch * N * sizeof(uint64_t)));
 
-    // Post-process scratch: [max_B × ρ × 4N] uint64
+    // Post-process scratch: [max_B × ρ × 4N] uint64 (no padding needed, indexed by actual batch)
     size_t inspir_spo = 4 * poly_len;
     size_t scratch_total = max_batch_size * num_outputs * inspir_spo;
     CUDA_ASSERT(cudaMalloc(&ctx->d_scratch, scratch_total * sizeof(uint64_t)));

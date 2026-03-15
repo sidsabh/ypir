@@ -1209,7 +1209,7 @@ where
                     params.get_q_prime_2(),
                     params,
                     max_batch_size,
-                    packing != PackingType::InspiRING,
+                    false, // InspiRING: no inv_N scaling
                 );
                 match init_result {
                     Ok(ctx) => {
@@ -1223,40 +1223,6 @@ where
                                 &tables_flat,
                                 num_tables,
                                 &gen_pows_for_online,
-                            );
-                        } else if packing == PackingType::CDKS {
-                            // CDKS: flatten packing data (same as SP path)
-                            let mut y_constants_flat = Vec::new();
-                            for m in &y_constants.0 { y_constants_flat.extend_from_slice(m.as_slice()); }
-                            for m in &y_constants.1 { y_constants_flat.extend_from_slice(m.as_slice()); }
-
-                            let mut precomp_res_flat = Vec::new();
-                            let mut precomp_vals_flat = Vec::new();
-                            let mut precomp_tables_flat = Vec::new();
-
-                            for (res, vals, tables) in &precomp {
-                                precomp_res_flat.extend_from_slice(res.as_slice());
-                                for v in vals {
-                                    let condensed = condense_matrix(params, v);
-                                    for row in 0..v.rows {
-                                        let poly = condensed.get_poly(row, 0);
-                                        precomp_vals_flat.extend_from_slice(&poly[..params.poly_len]);
-                                    }
-                                }
-                                for cur_ell in (1..=params.poly_len_log2).rev() {
-                                    let t = (1 << cur_ell) + 1;
-                                    let full_table_idx = (t - 1) / 2;
-                                    for &val in &tables[full_table_idx] {
-                                        precomp_tables_flat.push(val as u64);
-                                    }
-                                }
-                            }
-
-                            ctx.init_packing(
-                                &y_constants_flat,
-                                &precomp_res_flat,
-                                &precomp_vals_flat,
-                                &precomp_tables_flat,
                             );
                         }
 

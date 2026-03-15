@@ -166,23 +166,6 @@ extern "C" {
         inv_n: u64,
     ) -> *mut std::ffi::c_void;
 
-    fn ypir_word_online_init_packing(
-        context: *mut std::ffi::c_void,
-        y_constants: *const u64, y_constants_size: usize,
-        precomp_res: *const u64, precomp_res_size: usize,
-        precomp_vals: *const u64, precomp_vals_size: usize,
-        precomp_tables: *const u64, precomp_tables_size: usize,
-    );
-
-    fn ypir_word_online_compute_batch(
-        context: *mut std::ffi::c_void,
-        queries: *const u64,
-        pack_pub_params_row_1s: *const u64,
-        response_out: *mut u8,
-        response_bytes_per_batch: usize,
-        batch_size: usize,
-    );
-
     fn ypir_word_online_compute_matmul_only(
         context: *mut std::ffi::c_void,
         queries: *const u64,
@@ -378,59 +361,6 @@ impl WordOnlineContext {
         unsafe {
             ypir_word_online_upload_db(self.ctx, db.as_ptr());
         }
-    }
-
-    pub fn init_packing(
-        &self,
-        y_constants: &[u64],
-        precomp_res: &[u64],
-        precomp_vals: &[u64],
-        precomp_tables: &[u64],
-    ) {
-        unsafe {
-            ypir_word_online_init_packing(
-                self.ctx,
-                y_constants.as_ptr(), y_constants.len() * std::mem::size_of::<u64>(),
-                precomp_res.as_ptr(), precomp_res.len() * std::mem::size_of::<u64>(),
-                precomp_vals.as_ptr(), precomp_vals.len() * std::mem::size_of::<u64>(),
-                precomp_tables.as_ptr(), precomp_tables.len() * std::mem::size_of::<u64>(),
-            );
-        }
-    }
-
-    pub fn compute_batch(
-        &self,
-        queries: &[u64],
-        pack_pub_params_row_1s: &[u64],
-        response_bytes_per_output: usize,
-        batch_size: usize,
-    ) -> Vec<Vec<Vec<u8>>> {
-        let response_bytes_per_batch = self.num_rlwe_outputs * response_bytes_per_output;
-        let mut response_flat = vec![0u8; batch_size * response_bytes_per_batch];
-
-        unsafe {
-            ypir_word_online_compute_batch(
-                self.ctx,
-                queries.as_ptr(),
-                pack_pub_params_row_1s.as_ptr(),
-                response_flat.as_mut_ptr(),
-                response_bytes_per_batch,
-                batch_size,
-            );
-        }
-
-        let mut result = Vec::with_capacity(batch_size);
-        for b in 0..batch_size {
-            let batch_start = b * response_bytes_per_batch;
-            let mut outputs = Vec::with_capacity(self.num_rlwe_outputs);
-            for o in 0..self.num_rlwe_outputs {
-                let output_start = batch_start + o * response_bytes_per_output;
-                let output_end = output_start + response_bytes_per_output;
-                outputs.push(response_flat[output_start..output_end].to_vec());
-            }
-            result.push(outputs);
-        }
-        result
     }
 
     pub fn init_packing_inspir(
