@@ -329,7 +329,7 @@ __global__ void finalize_to_scratch_kernel(
     const uint64_t* __restrict__ d_result_crt1,
     const uint64_t* __restrict__ d_bold_t_hat,    // [ρ × t × N] condensed
     const uint64_t* __restrict__ d_z_body,        // [B × t × N] condensed
-    size_t batch_size,
+    size_t result_stride,       // column-major stride of d_result (may be padded)
     size_t num_outputs,
     size_t poly_len,
     size_t t_exp_left,
@@ -348,8 +348,8 @@ __global__ void finalize_to_scratch_kernel(
     size_t o = blockIdx.y;
     size_t c = blockIdx.z;
 
-    // Read GEMM result (ColumnMajor: ldc = B, so index = c + col * B)
-    size_t gemm_idx = c + (o * poly_len + z) * batch_size;
+    // Read GEMM result (ColumnMajor: stride = result_stride, index = c + col * stride)
+    size_t gemm_idx = c + (o * poly_len + z) * result_stride;
     uint64_t acc0 = d_result_crt0[gemm_idx];
     uint64_t acc1 = d_result_crt1[gemm_idx];
 
@@ -646,10 +646,14 @@ void tc_packing_run(
     // GEMM shape: [B × K] × [K × Ng] → [B × Ng]
     // A: RowMajor, lda = K.  M: ColumnMajor, ldb = K.  C: ColumnMajor, ldc = B.
 
-    int M_dim = (int)B;
+    // CUTLASS epilogue does vectorized int32 stores (width 4 for TC, 1 for SIMT).
+    // ldc must be a multiple of this width, otherwise we get misaligned address errors.
+    // Round M up to next multiple of 4 when using tensor cores.
+    int align = (ctx->gpu_tier >= 1) ? 4 : 1;
+    int M_dim = ((int)B + align - 1) / align * align;
     int K_dim = (int)K;
     int N_dim = (int)Ng;
-    size_t BN = B * Ng;  // elements in result/G
+    size_t BN = (size_t)M_dim * Ng;  // padded batch × Ng for GEMM output/G/result
 
     uint64_t mod0 = ctx->mod0;
     uint64_t mod1 = ctx->mod1;
@@ -719,7 +723,7 @@ void tc_packing_run(
             ctx->d_result_crt1,
             ctx->d_bold_t_hat_condensed,
             d_z_body_condensed,
-            B, rho, N, t, Ng,
+            (size_t)M_dim, rho, N, t, Ng,
             scratch_stride, inspir_spo,
             mod0, mod1,
             ctx->barrett_cr0,

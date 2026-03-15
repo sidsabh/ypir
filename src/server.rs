@@ -1115,98 +1115,115 @@ where
             let db_rows = 1 << (params.db_dim_1 + params.poly_len_log2);
             let db_rows_padded = self.db_rows_padded();
 
+            // Run InspiRING GPU precomputation BEFORE creating the online context,
+            // so precomp temporaries (~3 GB) don't overlap with online buffers (~1.5 GB).
+            // This is critical for fitting in T4's 16 GB VRAM.
+            let inspir_gpu_results = if packing == PackingType::InspiRING {
+                let pp = inspir_packing_params.as_ref().unwrap();
+                let offline_keys = OfflinePackingKeys::init_full(pp, crate::scheme::W_SEED, crate::scheme::V_SEED);
+
+                let w_mask_flat: Vec<u64> = offline_keys.w_mask.as_ref().unwrap().as_slice().to_vec();
+                let v_mask_flat: Vec<u64> = offline_keys.v_mask.as_ref().unwrap().as_slice().to_vec();
+                let mod_inv_poly_flat: Vec<u64> = pp.mod_inv_poly.as_slice().to_vec();
+
+                let tables_flat: Vec<u32> = pp.tables.iter()
+                    .flat_map(|t| t.iter().map(|&v| v as u32))
+                    .collect();
+                let num_tables = pp.tables.len();
+                let gen_pows_flat: Vec<u32> = pp.gen_pows.iter()
+                    .map(|&v| v as u32)
+                    .collect();
+
+                // Estimate precomp GPU memory need. If DB + hint + precomp won't fit,
+                // free the DB now — the online context will re-upload it from host later.
+                let num_iter = params.poly_len / 2 - 1;
+                let cpn = 2 * params.poly_len;
+                let precomp_bytes_est =
+                    2 * num_iter * params.t_exp_left * cpn * 8     // w_mask + v_mask
+                    + 2 * params.poly_len * cpn * 8                // monomials
+                    + num_rlwe_outputs * params.poly_len * cpn * 8 // a_ct_tilde
+                    + 2 * num_iter * params.t_exp_left * cpn * 8   // w_all + w_bar_all
+                    + 2 * num_rlwe_outputs * num_iter * cpn * 8    // r_all + r_bar_all
+                    + 2 * num_rlwe_outputs * num_iter * params.t_exp_left * params.poly_len * 8; // bold_t
+                let db_bytes = db_cols * self.db_rows_padded() * 2; // d_db_u16 or d_db_stacked
+                let hint_bytes = params.poly_len * db_cols * 8;     // d_out
+
+                if let Some(ref offline_ctx) = gpu_offline_ctx {
+                    // If DB + hint + precomp exceeds a reasonable threshold, free DB
+                    let total_est = db_bytes + hint_bytes + precomp_bytes_est;
+                    if total_est > 7 * (1 << 30) { // > 7 GB likely tight
+                        debug!("Freeing offline DB ({:.1} MB) to make room for precomp ({:.1} MB)",
+                               db_bytes as f64 / 1e6, precomp_bytes_est as f64 / 1e6);
+                        offline_ctx.free_db();
+                    }
+                }
+
+                let d_hint_0 = gpu_offline_ctx.as_ref()
+                    .expect("GPU offline context needed for InspiRING GPU precomp")
+                    .get_hint_device_ptr();
+
+                let now_gpu_precomp = Instant::now();
+                let inspir_gpu = crate::cuda::InspirPrecompContext::new(
+                    d_hint_0 as *const u64,
+                    db_cols as u32,
+                    params,
+                    num_rlwe_outputs as u32,
+                    &w_mask_flat,
+                    &v_mask_flat,
+                    &mod_inv_poly_flat,
+                    &tables_flat,
+                    num_tables as u32,
+                    &gen_pows_flat,
+                );
+                inspir_gpu.compute();
+                debug!("GPU InspiRING precomp in {} us", now_gpu_precomp.elapsed().as_micros());
+
+                Some((inspir_gpu, tables_flat, num_tables, gen_pows_flat))
+            } else {
+                None
+            };
+
             // Initialize Word CUDA online context
-            // Reuse DB from offline context if available (avoids second DB upload)
+            // Always create without DB first. Then init packing (TC packing builds M,
+            // frees bold_t). Finally adopt or upload DB — this ordering minimizes peak
+            // GPU memory on small GPUs.
             let word_cuda_context = {
-                debug!("Initializing Word CUDA online context...");
-                let has_offline_db = gpu_offline_ctx.is_some();
-                let init_result = if has_offline_db {
-                    crate::cuda::WordOnlineContext::new_no_db(
-                        db_rows,
-                        db_rows_padded,
-                        db_cols,
-                        params.t_exp_left,
-                        params.get_q_prime_1(),
-                        params.get_q_prime_2(),
-                        params,
-                        256,
-                        packing != PackingType::InspiRING,
-                    )
+                debug!("Initializing Word CUDA online context (no DB)...");
+                // Take DB device pointers from offline context if still available
+                let offline_db_ptrs = if let Some(ref offline_ctx) = gpu_offline_ctx {
+                    let (stacked, u16_ptr) = offline_ctx.take_db_device_ptrs();
+                    let has = !stacked.is_null() || !u16_ptr.is_null();
+                    Some((stacked, u16_ptr, has))
                 } else {
-                    crate::cuda::WordOnlineContext::new(
-                        self.db_u16(),
-                        db_rows,
-                        db_rows_padded,
-                        db_cols,
-                        params.t_exp_left,
-                        params.get_q_prime_1(),
-                        params.get_q_prime_2(),
-                        params,
-                        256,
-                        packing != PackingType::InspiRING,
-                    )
+                    None
                 };
+                let has_offline_db = offline_db_ptrs.as_ref().map_or(false, |x| x.2);
+
+                let init_result = crate::cuda::WordOnlineContext::new_no_db(
+                    db_rows,
+                    db_rows_padded,
+                    db_cols,
+                    params.t_exp_left,
+                    params.get_q_prime_1(),
+                    params.get_q_prime_2(),
+                    params,
+                    256,
+                    packing != PackingType::InspiRING,
+                );
                 match init_result {
                     Ok(ctx) => {
-                        // Adopt DB device pointers from offline context (avoids second upload)
-                        if has_offline_db {
-                            let (d_db_stacked, d_db_u16) = gpu_offline_ctx.as_ref().unwrap().take_db_device_ptrs();
-                            ctx.adopt_db(d_db_stacked, d_db_u16);
-                            debug!("Online context adopted DB from offline (zero-copy)");
-                        }
-
-                        if packing == PackingType::InspiRING {
-                            // GPU InspiRING precomputation — runs entirely on GPU
-                            let pp = inspir_packing_params.as_ref().unwrap();
-                            let offline_keys = OfflinePackingKeys::init_full(pp, crate::scheme::W_SEED, crate::scheme::V_SEED);
-
-                            // Flatten packing keys for GPU upload
-                            let w_mask_flat: Vec<u64> = offline_keys.w_mask.as_ref().unwrap().as_slice().to_vec();
-                            let v_mask_flat: Vec<u64> = offline_keys.v_mask.as_ref().unwrap().as_slice().to_vec();
-                            let mod_inv_poly_flat: Vec<u64> = pp.mod_inv_poly.as_slice().to_vec();
-
-                            let tables_flat: Vec<u32> = pp.tables.iter()
-                                .flat_map(|t| t.iter().map(|&v| v as u32))
-                                .collect();
-                            let num_tables = pp.tables.len();
-                            let gen_pows_flat: Vec<u32> = pp.gen_pows.iter()
-                                .map(|&v| v as u32)
-                                .collect();
-
-                            // Get hint_0 device pointer from the offline context
-                            let d_hint_0 = gpu_offline_ctx.as_ref()
-                                .expect("GPU offline context needed for InspiRING GPU precomp")
-                                .get_hint_device_ptr();
-
-                            let now_gpu_precomp = Instant::now();
-                            let mut inspir_gpu = crate::cuda::InspirPrecompContext::new(
-                                d_hint_0 as *const u64,
-                                db_cols as u32,
-                                params,
-                                num_rlwe_outputs as u32,
-                                &w_mask_flat,
-                                &v_mask_flat,
-                                &mod_inv_poly_flat,
-                                &tables_flat,
-                                num_tables as u32,
-                                &gen_pows_flat,
-                            );
-                            inspir_gpu.compute();
-                            debug!("GPU InspiRING precomp in {} us", now_gpu_precomp.elapsed().as_micros());
-
-                            // Transfer GPU results directly to online context (zero-copy)
+                        // Step 1: Init packing FIRST (before DB upload)
+                        // For InspiRING: TC packing builds M matrix here, frees bold_t
+                        if let Some((mut inspir_gpu, tables_flat, num_tables, gen_pows_flat)) = inspir_gpu_results {
                             let num_iter = params.poly_len / 2 - 1;
-                            let gen_pows_for_online: Vec<u32> = pp.gen_pows[..num_iter]
-                                .iter()
-                                .map(|&v| v as u32)
-                                .collect();
+                            let gen_pows_for_online: Vec<u32> = gen_pows_flat[..num_iter].to_vec();
                             ctx.init_packing_inspir_from_gpu(
                                 &mut inspir_gpu,
                                 &tables_flat,
                                 num_tables,
                                 &gen_pows_for_online,
                             );
-                        } else {
+                        } else if packing == PackingType::CDKS {
                             // CDKS: flatten packing data (same as SP path)
                             let mut y_constants_flat = Vec::new();
                             for m in &y_constants.0 { y_constants_flat.extend_from_slice(m.as_slice()); }
@@ -1225,8 +1242,6 @@ where
                                         precomp_vals_flat.extend_from_slice(&poly[..params.poly_len]);
                                     }
                                 }
-                                // Extract CDKS tables in the order CUDA expects:
-                                // table[0] → t=(1<<ell)+1, table[1] → t=(1<<(ell-1))+1, ..., table[ell-1] → t=3
                                 for cur_ell in (1..=params.poly_len_log2).rev() {
                                     let t = (1 << cur_ell) + 1;
                                     let full_table_idx = (t - 1) / 2;
@@ -1242,6 +1257,16 @@ where
                                 &precomp_vals_flat,
                                 &precomp_tables_flat,
                             );
+                        }
+
+                        // Step 2: Now get DB onto GPU (after packing init freed bold_t)
+                        if has_offline_db {
+                            let (stacked, u16_ptr, _) = offline_db_ptrs.unwrap();
+                            ctx.adopt_db(stacked, u16_ptr);
+                            debug!("Online context adopted DB from offline (zero-copy)");
+                        } else {
+                            debug!("Re-uploading DB to GPU for online context");
+                            ctx.upload_db(self.db_u16());
                         }
 
                         debug!("Word CUDA online context initialized");

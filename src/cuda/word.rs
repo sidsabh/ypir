@@ -30,6 +30,7 @@ extern "C" {
         out_db_u16: *mut *mut u16,
     );
 
+    fn ypir_word_offline_free_db(context: *mut std::ffi::c_void);
     fn free_word_offline_context(context: *mut std::ffi::c_void);
 }
 
@@ -119,6 +120,12 @@ impl WordOfflineContext {
             ypir_word_offline_take_db_device_ptrs(self.ctx, &mut stacked, &mut u16_ptr);
         }
         (stacked, u16_ptr)
+    }
+
+    /// Free DB device memory to make room for other GPU allocations.
+    /// After this call, the online context must re-upload the DB from host.
+    pub fn free_db(&self) {
+        unsafe { ypir_word_offline_free_db(self.ctx) }
     }
 }
 
@@ -219,6 +226,11 @@ extern "C" {
         context: *mut std::ffi::c_void,
         d_db_stacked: *mut u8,
         d_db_u16: *mut u16,
+    );
+
+    fn ypir_word_online_upload_db(
+        context: *mut std::ffi::c_void,
+        db: *const u16,
     );
 
     fn ypir_word_online_free(context: *mut std::ffi::c_void);
@@ -358,6 +370,13 @@ impl WordOnlineContext {
     pub fn adopt_db(&self, d_db_stacked: *mut u8, d_db_u16: *mut u16) {
         unsafe {
             ypir_word_online_adopt_db(self.ctx, d_db_stacked, d_db_u16);
+        }
+    }
+
+    /// Upload DB from host memory (used when DB was freed to make room for precomp/packing).
+    pub fn upload_db(&self, db: &[u16]) {
+        unsafe {
+            ypir_word_online_upload_db(self.ctx, db.as_ptr());
         }
     }
 

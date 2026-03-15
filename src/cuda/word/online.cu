@@ -130,6 +130,22 @@ __global__ void word_decompose_u16_stacked(
     }
 }
 
+// Chunked variant: decompose a chunk of uint16 data at a given offset within the stacked output
+__global__ void word_decompose_u16_stacked_chunk(
+    uint8_t* __restrict__ out,          // full (2*total) stacked output
+    const uint16_t* __restrict__ data,  // chunk of uint16 data
+    size_t count,                       // elements in this chunk
+    size_t offset,                      // global offset of this chunk
+    size_t total)                       // total db_elems
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count) {
+        uint16_t v = data[idx];
+        out[offset + idx]         = (uint8_t)(v & 0xFF);
+        out[total + offset + idx] = (uint8_t)((v >> 8) & 0xFF);
+    }
+}
+
 // Query u64 → 8 uint8 byte slices, packed contiguously for wide GEMM.
 // Output layout: K × (8*N) column-major with stride K.
 // Byte slice i occupies columns [i*N, (i+1)*N).
@@ -2250,6 +2266,65 @@ void ypir_word_online_adopt_db(void* context, uint8_t* d_db_stacked, uint16_t* d
 
     ctx->d_db_stacked = d_db_stacked;
     ctx->d_db_u16 = d_db_u16;
+}
+
+// Upload DB from host memory (used when DB was freed to make room for precomp/packing).
+// Handles both TC (decompose to stacked uint8) and SIMT (keep as u16) paths.
+void ypir_word_online_upload_db(void* context, const uint16_t* db)
+{
+    WordOnlineContext* ctx = (WordOnlineContext*)context;
+    if (!ctx || !db) return;
+
+    size_t db_elems = ctx->db_cols * ctx->db_rows_padded;
+
+    // Free any existing DB
+    if (ctx->d_db_stacked) { cudaFree(ctx->d_db_stacked); ctx->d_db_stacked = nullptr; }
+    if (ctx->d_db_u16)     { cudaFree(ctx->d_db_u16);     ctx->d_db_u16 = nullptr; }
+
+    if (ctx->has_tensor_cores) {
+        // TC path: upload + decompose to stacked uint8
+        size_t raw_size = db_elems * sizeof(uint16_t);
+        CUDA_ASSERT(cudaMalloc(&ctx->d_db_stacked, 2 * db_elems));
+
+        // Check if we can upload all at once or need chunked path
+        size_t free_mem, total_mem;
+        cudaMemGetInfo(&free_mem, &total_mem);
+
+        if (free_mem >= raw_size + (128ULL << 20)) {
+            // Fast path: upload all at once
+            uint16_t* d_db_raw;
+            CUDA_ASSERT(cudaMalloc(&d_db_raw, raw_size));
+            CUDA_ASSERT(cudaMemcpy(d_db_raw, db, raw_size, cudaMemcpyHostToDevice));
+            int threads = 256;
+            int blocks = (db_elems + threads - 1) / threads;
+            word_decompose_u16_stacked<<<blocks, threads>>>(ctx->d_db_stacked, d_db_raw, db_elems);
+            CUDA_ASSERT(cudaGetLastError());
+            CUDA_ASSERT(cudaFree(d_db_raw));
+        } else {
+            // Chunked path
+            size_t chunk_elems = 1ULL << 24; // 16M elements = 32 MB
+            uint16_t* d_chunk;
+            CUDA_ASSERT(cudaMalloc(&d_chunk, chunk_elems * sizeof(uint16_t)));
+            for (size_t offset = 0; offset < db_elems; offset += chunk_elems) {
+                size_t count = (offset + chunk_elems <= db_elems) ? chunk_elems : (db_elems - offset);
+                CUDA_ASSERT(cudaMemcpy(d_chunk, db + offset, count * sizeof(uint16_t), cudaMemcpyHostToDevice));
+                int threads = 256;
+                int blocks = (count + threads - 1) / threads;
+                word_decompose_u16_stacked_chunk<<<blocks, threads>>>(ctx->d_db_stacked, d_chunk, count, offset, db_elems);
+                CUDA_ASSERT(cudaGetLastError());
+            }
+            CUDA_ASSERT(cudaFree(d_chunk));
+        }
+        CUDA_ASSERT(cudaDeviceSynchronize());
+        printf("Online context: uploaded + decomposed DB (%zu elems, %.1f MB stacked)\n",
+               db_elems, 2.0 * db_elems / 1e6);
+    } else {
+        // SIMT path: keep as u16
+        size_t db_size = db_elems * sizeof(uint16_t);
+        CUDA_ALLOC_AND_COPY(ctx->d_db_u16, db, db_size);
+        printf("Online context: uploaded DB (%zu elems, %.1f MB u16)\n",
+               db_elems, db_size / 1e6);
+    }
 }
 
 void ypir_word_online_free(void* context)

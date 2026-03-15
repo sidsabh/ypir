@@ -121,6 +121,23 @@ __global__ void decompose_u16_stacked(
     }
 }
 
+// Chunked decomposition: decompose a slice of uint16 data into the global stacked output.
+// Writes low byte to out[offset + idx], high byte to out[total + offset + idx].
+__global__ void decompose_u16_stacked_chunk(
+    uint8_t* __restrict__ out,          // full (2*total) stacked output
+    const uint16_t* __restrict__ data,  // chunk of uint16 data
+    size_t count,                       // elements in this chunk
+    size_t offset,                      // global offset of this chunk
+    size_t total)                       // total db_elems
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count) {
+        uint16_t v = data[idx];
+        out[offset + idx]         = (uint8_t)(v & 0xFF);
+        out[total + offset + idx] = (uint8_t)((v >> 8) & 0xFF);
+    }
+}
+
 // Two-pass in-place decomposition:
 // Pass 1 (high bytes): read uint16 from buf, write high byte to buf[count + idx]
 //   Safe because uint16 input lives in [0, 2*count) bytes and high output in [count, 2*count).
@@ -340,22 +357,45 @@ void* init_word_offline_context(
     CUDA_CHECK(cudaMalloc(&ctx->d_out, M * N * sizeof(uint64_t)));
 
     if (ctx->has_tensor_cores) {
-        // Upload DB and decompose to vertically stacked uint8 bytes — in-place
-        // d_db_stacked is 2*db_elems bytes; raw uint16 data is also 2*db_elems bytes.
-        // Upload raw data into d_db_stacked, then two-pass decompose in-place (no extra alloc).
+        // Upload DB and decompose to vertically stacked uint8 bytes.
+        // Chunked: allocate d_db_stacked (same size as raw), then upload+decompose
+        // in chunks using a small temp buffer to avoid 2× peak GPU memory.
         size_t db_elems = M * db_rows_padded;
         CUDA_CHECK(cudaMalloc(&ctx->d_db_stacked, 2 * db_elems));
-        CUDA_CHECK(cudaMemcpy(ctx->d_db_stacked, db, M * db_rows_padded * sizeof(uint16_t), cudaMemcpyHostToDevice));
-        {
+
+        // Check if we can fit the full raw DB alongside d_db_stacked
+        size_t free_mem, total_mem;
+        CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
+        size_t raw_size = db_elems * sizeof(uint16_t);
+
+        if (free_mem >= raw_size + (128ULL << 20)) {
+            // Fast path: upload all at once
+            uint16_t* d_db_raw;
+            CUDA_CHECK(cudaMalloc(&d_db_raw, raw_size));
+            CUDA_CHECK(cudaMemcpy(d_db_raw, db, raw_size, cudaMemcpyHostToDevice));
             int threads = 256;
             int blocks = (db_elems + threads - 1) / threads;
-            // Pass 1: extract high bytes to second half (doesn't destroy uint16 data)
-            decompose_u16_extract_high<<<blocks, threads>>>(ctx->d_db_stacked, db_elems);
+            decompose_u16_stacked<<<blocks, threads>>>(ctx->d_db_stacked, d_db_raw, db_elems);
             CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
-            // Pass 2: extract low bytes, overwriting first half
-            decompose_u16_extract_low<<<blocks, threads>>>(ctx->d_db_stacked, db_elems);
-            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaFree(d_db_raw));
+        } else {
+            // Chunked path: process in pieces to avoid 2× peak memory.
+            // Each chunk: upload slice of raw u16 → temp, decompose into d_db_stacked, reuse temp.
+            size_t chunk_elems = 1ULL << 24;  // 16M elements = 32 MB temp
+            uint16_t* d_chunk;
+            CUDA_CHECK(cudaMalloc(&d_chunk, chunk_elems * sizeof(uint16_t)));
+            for (size_t offset = 0; offset < db_elems; offset += chunk_elems) {
+                size_t count = (offset + chunk_elems <= db_elems) ? chunk_elems : (db_elems - offset);
+                CUDA_CHECK(cudaMemcpy(d_chunk, db + offset, count * sizeof(uint16_t), cudaMemcpyHostToDevice));
+                int threads = 256;
+                int blocks = (count + threads - 1) / threads;
+                // decompose_u16_stacked writes low bytes to out[idx] and high to out[count_total + idx].
+                // We need a variant that writes to the correct global offset.
+                decompose_u16_stacked_chunk<<<blocks, threads>>>(
+                    ctx->d_db_stacked, d_chunk, count, offset, db_elems);
+                CUDA_CHECK(cudaGetLastError());
+            }
+            CUDA_CHECK(cudaFree(d_chunk));
         }
 
         // Upload A, decompose to packed uint8 bytes: K × (8*N)
@@ -534,6 +574,16 @@ uint64_t* ypir_word_offline_take_hint_device_ptr(void* context)
     uint64_t* ptr = ctx->d_out;
     ctx->d_out = nullptr;  // prevent double-free
     return ptr;
+}
+
+// Free DB device memory to make room for other GPU work (e.g., precomp).
+// The online context will re-upload the DB from host if needed.
+void ypir_word_offline_free_db(void* context)
+{
+    WordOfflineContext* ctx = (WordOfflineContext*)context;
+    if (!ctx) return;
+    if (ctx->d_db_stacked) { cudaFree(ctx->d_db_stacked); ctx->d_db_stacked = nullptr; }
+    if (ctx->d_db_u16)     { cudaFree(ctx->d_db_u16);     ctx->d_db_u16 = nullptr; }
 }
 
 // Free GEMM-specific buffers that are no longer needed after compute_hint_0_word_gpu().
