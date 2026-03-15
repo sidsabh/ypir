@@ -203,7 +203,7 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, word: bool, tri
     let start_offline_comp = Instant::now();
 
     let offline_values = if word {
-        y_server.perform_offline_precomputation_simplepir_word(Some(&mut measurements[0]), packing)
+        y_server.perform_offline_precomputation_simplepir_word(Some(&mut measurements[0]), packing, K)
     } else {
         y_server.perform_offline_precomputation_simplepir(Some(&mut measurements[0]), packing)
     };

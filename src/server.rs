@@ -951,6 +951,7 @@ where
         &self,
         measurement: Option<&mut Measurement>,
         packing: PackingType,
+        max_batch_size: usize,
     ) -> OfflinePrecomputedValues {
         let params = self.params;
         assert!(self.ypir_params.is_simplepir);
@@ -1207,7 +1208,7 @@ where
                     params.get_q_prime_1(),
                     params.get_q_prime_2(),
                     params,
-                    256,
+                    max_batch_size,
                     packing != PackingType::InspiRING,
                 );
                 match init_result {

@@ -1446,6 +1446,12 @@ void* ypir_word_online_init(
 
     // Streaming scratch will be allocated in init_packing, after packing data is uploaded
 
+    {
+        size_t free_mem, total_mem;
+        cudaMemGetInfo(&free_mem, &total_mem);
+        printf("Online context init (no DB): %.1f MB free / %.1f MB total\n",
+               free_mem / 1e6, total_mem / 1e6);
+    }
     CUDA_ASSERT(cudaDeviceSynchronize());
     return ctx;
 }
@@ -2284,10 +2290,14 @@ void ypir_word_online_upload_db(void* context, const uint16_t* db)
     if (ctx->has_tensor_cores) {
         // TC path: upload + decompose to stacked uint8
         size_t raw_size = db_elems * sizeof(uint16_t);
-        CUDA_ASSERT(cudaMalloc(&ctx->d_db_stacked, 2 * db_elems));
-
-        // Check if we can upload all at once or need chunked path
+        size_t stacked_size = 2 * db_elems;
         size_t free_mem, total_mem;
+        cudaMemGetInfo(&free_mem, &total_mem);
+        printf("upload_db: need %.1f MB stacked, %.1f MB free / %.1f MB total\n",
+               stacked_size / 1e6, free_mem / 1e6, total_mem / 1e6);
+        CUDA_ASSERT(cudaMalloc(&ctx->d_db_stacked, stacked_size));
+
+        // Re-check free memory after stacked alloc
         cudaMemGetInfo(&free_mem, &total_mem);
 
         if (free_mem >= raw_size + (128ULL << 20)) {
